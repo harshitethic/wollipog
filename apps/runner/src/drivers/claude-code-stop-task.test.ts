@@ -349,3 +349,95 @@ test("only a task the live process launched can be stopped (#1780)", async () =>
   assert.deepEqual(await oneShot.driver.stopBackgroundJob("one-shot-task"), { status: "refused", reason: "no_live_process" });
   oneShot.driver.dispose();
 });
+
+test("a job Claude stops on its own ends as killed and no longer holds its sibling's barrier", async () => {
+  const h = harness();
+  const child = await launchTwoTasks(h);
+
+  // The frame order Claude Code 2.1.283 produced when the model called its own TaskStop tool: the
+  // same `killed` patch and `stopped` notification as a runner stop, with no Wollipog request.
+  const turn = h.driver.prompt("stop the monitor");
+  await nextTask();
+  frame(child, { type: "assistant", message: { content: [
+    { type: "tool_use", id: "toolu_stop", name: "TaskStop", input: { task_id: "monitor-1" } },
+  ] } });
+  killedReport(child, "monitor-1", "toolu_monitor");
+  frame(child, { type: "user", message: { content: [{
+    type: "tool_result", tool_use_id: "toolu_stop",
+    content: JSON.stringify({ message: "Successfully stopped task: monitor-1", task_id: "monitor-1" }),
+  }] } });
+  frame(child, { type: "result", subtype: "success" });
+  assert.equal(await turn, "end_turn");
+
+  assert.equal(h.background.at(-1)?.state, "running");
+  assert.deepEqual(h.background.at(-1)?.pendingTaskIds, ["shell-2"], "the stopped job is no longer running");
+  const ended = h.background.flatMap((update) => update.terminalJobs ?? []);
+  assert.deepEqual(ended.map((job) => [job.id, job.status, job.endedByRunner]), [["monitor-1", "killed", undefined]]);
+  assert.equal(h.frames.some((value) => value.type === "control_request"), false, "Wollipog asked for nothing");
+
+  // Claude may repeat its report; the ended job is not revived, and its sibling still completes.
+  frame(child, { type: "system", subtype: "task_notification", task_id: "monitor-1", status: "stopped" });
+  frame(child, { type: "system", subtype: "task_notification", task_id: "shell-2", tool_use_id: "toolu_shell", status: "completed" });
+  await nextTask();
+  assert.equal(h.background.at(-1)?.state, null);
+  assert.deepEqual(h.background.at(-1)?.pendingTaskIds, []);
+  assert.equal(h.background.flatMap((update) => update.terminalJobs ?? []).length, 2, "each job ends once");
+  h.driver.dispose();
+});
+
+test("a job Claude kills because its stdin closed is left for orphan recovery, not ended", async () => {
+  // Claude Code 2.1.283 kills every running task when its stdin closes and reports each one with
+  // the same `killed` patch and `stopped` notification. A one-shot turn always closes stdin.
+  const h = harness({ env: { [CLAUDE_PERSISTENT_FLAG]: "0" } });
+  const turn = h.driver.prompt("launch and finish");
+  await nextTask();
+  const child = h.spawned[0];
+  taskStarted(child, "shell-1", "toolu_shell");
+  frame(child, { type: "result", subtype: "success" });
+  killedReport(child, "shell-1", "toolu_shell");
+  await nextTask();
+  child.emit("close", 0);
+  await turn;
+
+  assert.equal(h.background.some((update) => update.terminalJobs?.length), false, "no job was reported ended");
+  assert.equal(h.background.at(-1)?.state, "orphaned");
+  assert.deepEqual(h.background.at(-1)?.pendingTaskIds, ["shell-1"]);
+  h.driver.dispose();
+});
+
+test("only a report inside the model's own stop call ends the job it named", async () => {
+  const h = harness();
+  const child = await launchTwoTasks(h);
+  const turn = h.driver.prompt("stop the monitor");
+  await nextTask();
+  frame(child, { type: "assistant", message: { content: [
+    { type: "tool_use", id: "toolu_stop", name: "TaskStop", input: { task_id: "monitor-1" } },
+  ] } });
+  // A report for a task the call did not name is not proof that the model stopped it.
+  killedReport(child, "shell-2", "toolu_shell");
+  await nextTask();
+  assert.deepEqual(h.background.at(-1)?.pendingTaskIds, ["monitor-1", "shell-2"]);
+  // Nor is a report that arrives after the call returned.
+  frame(child, { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_stop", content: "No task found", is_error: true }] } });
+  killedReport(child, "monitor-1", "toolu_monitor");
+  frame(child, { type: "result", subtype: "success" });
+  assert.equal(await turn, "end_turn");
+  assert.deepEqual(h.background.at(-1)?.pendingTaskIds, ["monitor-1", "shell-2"]);
+  assert.equal(h.background.some((update) => update.terminalJobs?.length), false);
+  h.driver.dispose();
+});
+
+test("a subagent's result does not close the model's stop call", async () => {
+  const h = harness();
+  const child = await launchTwoTasks(h);
+  h.driver.prompt("stop the monitor");
+  await nextTask();
+  frame(child, { type: "assistant", message: { content: [
+    { type: "tool_use", id: "toolu_stop", name: "TaskStop", input: { task_id: "monitor-1" } },
+  ] } });
+  frame(child, { type: "result", subtype: "success", parent_tool_use_id: "toolu_agent" });
+  killedReport(child, "monitor-1", "toolu_monitor");
+  await nextTask();
+  assert.deepEqual(h.background.at(-1)?.pendingTaskIds, ["shell-2"]);
+  h.driver.dispose();
+});

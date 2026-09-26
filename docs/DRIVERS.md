@@ -461,6 +461,14 @@ The lifetime policy is quiescence-aware and fail-safe:
   tombstoned in the driver and in the session's recovered-task ids: no later receipt read revives
   it as unfinished work. An agent-authored `hold.json` does not extend this bound: the prompts it
   would hold are someone else's. See Queue Holds in [agent-control.md](agent-control.md).
+- Claude reports a stopped task as a `task_updated` patch to `killed`, then a `stopped`
+  `task_notification`. It sends the same pair when the runner stops the task, when the model stops
+  it with its own `TaskStop` tool, and when Claude kills every task because its stdin closed. Only
+  the first two end the job. A model stop counts when its report arrives while that `TaskStop` call
+  naming the task has not yet returned. The job is recorded as `killed`, not runner-ended, and
+  tombstoned like the jobs above, so the trailing `stopped` report and a restart's receipt read
+  cannot revive it. A stdin-close kill, or any other unrequested report, leaves the job pending for
+  orphan recovery.
 - Eviction and runner-shutdown stops send EOF first and allow five seconds for a clean exit before
   `killTree` reaps the remaining native or WSL process group; explicit Stop and cancellation kill
   immediately. A stop with pending work writes the
