@@ -68,6 +68,7 @@ import type {
 import type { ControlPlaneDb } from "./db.js";
 import type { AuthPrincipal } from "./identity.js";
 import { LOCAL_OWNER_USER_ID, PERSONAL_ORGANIZATION_ID } from "./identity.js";
+import { withSessionCommandPermissions } from "./session-command-permissions.js";
 
 export function reminderWakeReasonForEvent(
   payload: SessionEventPayload,
@@ -180,6 +181,9 @@ interface UiClientInfo {
   observedBackgroundDeliveryKeys?: Set<string>;
   /** Pending Someday sessions omitted from a legacy UI's compatibility projection. */
   hiddenIndefiniteReminderSessionIds?: Set<string>;
+  /** The command-permission verdict last sent for each session (#1843), so a scope change can
+   * resend only the sessions whose verdict it changed. */
+  sentCommandPermissions?: Map<string, string>;
   backgroundObservationWindowStartedAt?: number;
   backgroundObservationsInWindow?: number;
 }
@@ -570,6 +574,11 @@ export class Hub {
       ? [] : this.db.worktreeSetupNoticeDismissals(reminderUserId);
     info.visibleRunnerIds = new Set(runners.map((runner) => runner.runnerId));
     info.visibleSessionIds = new Set(sessions.map((session) => session.id));
+    const snapshotSessions = sessions.map((s) => withSessionCommandPermissions(this.db, info.principal, this.withQueue(s)));
+    if (info.principal) {
+      info.sentCommandPermissions = new Map(snapshotSessions.map((session) =>
+        [session.id, JSON.stringify(session.commandPermissions)]));
+    }
     info.visibleProjectIds = new Set(projects.map((project) => project.id));
     this.uiClients.set(client, info);
     const snapshot: ControlPlaneToUi = {
@@ -592,7 +601,7 @@ export class Hub {
       },
       runners,
       boxes: globalAdmin ? this.db.listBoxes() : [],
-      sessions: sessions.map((s) => this.withQueue(s)),
+      sessions: snapshotSessions,
       projects,
       reminders,
       worktreeSetupNoticeDismissals,
@@ -801,7 +810,9 @@ export class Hub {
   }
 
   /** Scope changes invalidate the client's cached authorization snapshot. Reconnect creates a
-   * fresh filtered snapshot, so a revoked team/membership grant cannot continue receiving data. */
+   * fresh filtered snapshot, so a revoked team/membership grant cannot continue receiving data.
+   * Organization admins stay connected, but ownership decides their Stop Job verdict (#1843), so
+   * each is resent the sessions whose verdict the change moved. */
   closeScopedUiClients(): void {
     for (const [client, info] of this.uiClients) {
       if (info.principal === undefined || this.isOrganizationAdmin(info.principal)) continue;
@@ -811,6 +822,24 @@ export class Hub {
         /* already closing */
       }
       this.removeUiClient(client);
+    }
+    this.refreshSessionCommandPermissions();
+  }
+
+  private refreshSessionCommandPermissions(): void {
+    for (const [client, info] of this.uiClients) {
+      const principal = info.principal;
+      if (!principal || !info.sentCommandPermissions) continue;
+      for (const [sessionId, sent] of info.sentCommandPermissions) {
+        if (!info.visibleSessionIds?.has(sessionId) || !this.db.canAccessSession(principal, sessionId)) continue;
+        const session = this.db.getSession(sessionId);
+        if (!session) continue;
+        const view = withSessionCommandPermissions(this.db, principal, this.withQueue(session));
+        const verdict = JSON.stringify(view.commandPermissions);
+        if (verdict === sent) continue;
+        info.sentCommandPermissions.set(sessionId, verdict);
+        this.safeSend(client, { type: "session_upsert", session: view });
+      }
     }
   }
 
@@ -1157,6 +1186,9 @@ export class Hub {
     // O(clients × payload) on the streamed-delta hot path.
     if (this.uiClients.size === 0) return;
     const data = JSON.stringify(msg);
+    // A session view carries the receiving principal's command permissions (#1843). Most clients
+    // share one verdict, so serialize once per distinct verdict rather than once per client.
+    const sessionDataByPermissions = new Map<string, string>();
     for (const [client, info] of this.uiClients) {
       if (!this.isSubscribed(info, msg)) continue;
       if (!(predicate ? predicate(info.principal, info) : this.canReceive(info.principal, msg))) continue;
@@ -1174,6 +1206,15 @@ export class Hub {
           if (!project) continue;
           clientData = JSON.stringify({ type: "project_upsert", project } satisfies ControlPlaneToUi);
         }
+        if (projected.type === "session_upsert" && info.principal !== undefined) {
+          const session = withSessionCommandPermissions(this.db, info.principal, projected.session);
+          const key = JSON.stringify(session.commandPermissions);
+          const shared = projected === msg ? sessionDataByPermissions.get(key) : undefined;
+          clientData = shared ?? JSON.stringify({ ...projected, session } satisfies ControlPlaneToUi);
+          if (projected === msg && shared === undefined) sessionDataByPermissions.set(key, clientData);
+          (info.sentCommandPermissions ??= new Map()).set(session.id, key);
+        }
+        if (projected.type === "session_removed") info.sentCommandPermissions?.delete(projected.sessionId);
         if (projected.type === "session_upsert") info.visibleSessionIds?.add(projected.session.id);
         if (projected.type === "runner_upsert") info.visibleRunnerIds?.add(projected.runner.runnerId);
         if (projected.type === "project_upsert") info.visibleProjectIds?.add(projected.project.id);
