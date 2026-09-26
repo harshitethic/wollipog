@@ -18,8 +18,13 @@ import { createHash } from "node:crypto";
 import { PROTOCOL_VERSION, RUNNER_CAPABILITY_MIN_PROTOCOL, type AgentDefinition, type SessionLaunchSpec } from "@wollipog/protocol";
 import {
   agentControlMcpConfigPath,
+  agentControlRegistrationsToResend,
   agentControlTokenPath,
   agentControlReadyPath,
+  forgetAgentControlRegistrationAnswers,
+  isCurrentAgentControlCredential,
+  isStaleAgentControlAnswer,
+  noteAgentControlRegistrationSent,
   markAgentControlCredentialReady,
   markAgentControlCredentialRejected,
   piAgentControlExtensionPath,
@@ -565,6 +570,198 @@ test("provider-mode Agent Control keeps the registered credential in runner memo
     assert.notEqual(hashes[2], hashes[0], "runner-lifecycle loss mints a fresh credential");
   } finally {
     removeAgentControlFiles("s_agent", root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an unacknowledged registration is re-sent until answered, and only for the current credential (#1841)", () => {
+  const root = mkdtempSync(join(tmpdir(), "wollipog-agent-control-resend-"));
+  const launch = { ...spec("claude-code"), sessionId: "s_resend" };
+  try {
+    const host: AgentControlHost = { isSea: true, execPath: "/runner", execArgv: [], configDir: root, platform: "linux" };
+    const hashes: string[] = [];
+    const control = {
+      controlPlaneUrl: "ws://127.0.0.1:4317/runner",
+      controlPlaneProtocolVersion: PROTOCOL_VERSION,
+      executionIsolationMode: "provider" as const,
+      providerRelayEndpoint: "tcp://127.0.0.1:4318",
+      registerCredential: (_id: string, hash: string) => hashes.push(hash),
+    };
+    const due = (minAgeMs: number, now: number) => agentControlRegistrationsToResend(minAgeMs, now)
+      .filter((registration) => registration.sessionId === launch.sessionId);
+
+    const sent = Date.now();
+    provisionAgentControl(launch, control, () => {}, host);
+    const first = hashes[0]!;
+    assert.deepEqual(due(2_000, sent + 1_000), [], "a registration just sent is not retried yet");
+    assert.deepEqual(due(2_000, sent + 5_000), [{ sessionId: launch.sessionId, tokenHash: first }]);
+    assert.deepEqual(due(2_000, sent + 6_000), [], "a retry restarts the retry interval");
+    assert.deepEqual(due(0, sent + 6_000), [{ sessionId: launch.sessionId, tokenHash: first }],
+      "a fresh control-plane registration replays it at once");
+
+    markAgentControlCredentialReady(root, launch.sessionId, first);
+    assert.deepEqual(due(0, Date.now()), [], "an acknowledged registration is never re-sent");
+
+    provisionAgentControl(launch, control, () => {}, host);
+    assert.deepEqual(due(0, Date.now()), [{ sessionId: launch.sessionId, tokenHash: first }],
+      "a relaunch re-arms the acknowledgement fence and its retry");
+    markAgentControlCredentialRejected(root, launch.sessionId);
+    assert.deepEqual(due(0, Date.now()), [], "a rejected registration is never retried");
+    assert.equal(isCurrentAgentControlCredential(root, launch.sessionId, first), false);
+
+    provisionAgentControl(launch, control, () => {}, host);
+    const second = hashes.at(-1)!;
+    assert.notEqual(second, first);
+    assert.deepEqual(due(0, Date.now()), [{ sessionId: launch.sessionId, tokenHash: second }],
+      "only the current credential is re-sent");
+    assert.equal(isCurrentAgentControlCredential(root, launch.sessionId, first), false,
+      "an answer for the superseded credential cannot touch the current one");
+    assert.equal(isCurrentAgentControlCredential(root, launch.sessionId, second), true);
+
+    removeAgentControlFiles(launch.sessionId, root);
+    assert.deepEqual(due(0, Date.now()), [], "teardown stops the retry");
+  } finally {
+    removeAgentControlFiles(launch.sessionId, root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function staleAnswerHarness(sessionId: string) {
+  const root = mkdtempSync(join(tmpdir(), "wollipog-agent-control-stale-answer-"));
+  const launch = { ...spec("claude-code"), sessionId };
+  const host: AgentControlHost = { isSea: true, execPath: "/runner", execArgv: [], configDir: root, platform: "linux" };
+  const hashes: string[] = [];
+  // Frames the runner would write on the socket once registered; `wire` models that socket write,
+  // which is the only point index.ts counts a registration frame.
+  const outbox: string[] = [];
+  const control = {
+    controlPlaneUrl: "ws://127.0.0.1:4317/runner",
+    controlPlaneProtocolVersion: PROTOCOL_VERSION,
+    executionIsolationMode: "provider" as const,
+    providerRelayEndpoint: "tcp://127.0.0.1:4318",
+    registerCredential: (_id: string, hash: string) => { hashes.push(hash); outbox.push(hash); },
+  };
+  const wire = () => {
+    for (const hash of outbox.splice(0)) noteAgentControlRegistrationSent(launch.sessionId, hash);
+  };
+  const resend = () => {
+    for (const entry of agentControlRegistrationsToResend(0)) {
+      if (entry.sessionId === launch.sessionId) outbox.push(entry.tokenHash);
+    }
+  };
+  // The control plane answers each written frame in order. Mirror index.ts: a stale answer is dropped.
+  const answer = () => {
+    if (!isStaleAgentControlAnswer(root, launch.sessionId, hashes[0]!)) {
+      markAgentControlCredentialReady(root, launch.sessionId, hashes[0]!);
+    }
+  };
+  const relay = () => relayAgentControlRequest(launch.sessionId, {
+    key: launch.env[AGENT_CONTROL_RELAY_KEY_ENV]!, method: "GET", path: "/api/compatibility",
+  }, AbortSignal.timeout(400), async () => new Response("{}", { status: 200 }));
+  const provision = () => provisionAgentControl(launch, control, () => {}, host);
+  const cleanup = () => {
+    removeAgentControlFiles(launch.sessionId, root);
+    rmSync(root, { recursive: true, force: true });
+  };
+  return { hashes, wire, resend, answer, relay, provision, cleanup };
+}
+
+test("a late answer to a frame sent before a same-hash relaunch cannot open the relaunch's fence (#1841)", async () => {
+  const harness = staleAnswerHarness("s_stale_answer");
+  try {
+    harness.provision();
+    harness.wire();
+    harness.resend();
+    harness.wire();
+    harness.answer();
+    assert.equal((await harness.relay()).status, 200, "the first answer opened the fence");
+
+    harness.provision();
+    assert.equal(harness.hashes.at(-1), harness.hashes[0], "the relaunch re-registers the same credential");
+    harness.wire();
+    harness.answer();
+    await assert.rejects(harness.relay, /cancelled/,
+      "the answer to the re-sent frame from before the relaunch leaves the new fence closed");
+    harness.answer();
+    assert.equal((await harness.relay()).status, 200, "the relaunch's own answer opens it");
+
+    forgetAgentControlRegistrationAnswers();
+    harness.provision();
+    harness.wire();
+    harness.answer();
+    assert.equal((await harness.relay()).status, 200,
+      "a new socket carries no earlier frames, so its first answer is the relaunch's own");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("a registration buffered across a socket close is counted on the socket that carries it (#1841)", async () => {
+  const harness = staleAnswerHarness("s_buffered_answer");
+  try {
+    // The frame is buffered while the old socket is closing, so that socket never carries it.
+    harness.provision();
+    forgetAgentControlRegistrationAnswers();
+    // The next socket flushes the buffered frame, and the reconnect replays the registration.
+    harness.wire();
+    harness.resend();
+    harness.wire();
+    // Neither answer has arrived when a same-hash relaunch re-arms the fence.
+    harness.provision();
+    harness.wire();
+    harness.answer();
+    harness.answer();
+    await assert.rejects(harness.relay, /cancelled/,
+      "both answers to frames written before the relaunch are stale");
+    harness.answer();
+    assert.equal((await harness.relay()).status, 200, "the relaunch's own answer opens the fence");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("a relayed request already waiting succeeds once a re-sent registration is acknowledged (#1841)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "wollipog-agent-control-late-ack-"));
+  const launch = { ...spec("claude-code"), sessionId: "s_late_ack" };
+  try {
+    const host: AgentControlHost = { isSea: true, execPath: "/runner", execArgv: [], configDir: root, platform: "linux" };
+    const hashes: string[] = [];
+    provisionAgentControl(launch, {
+      controlPlaneUrl: "ws://127.0.0.1:4317/runner",
+      controlPlaneProtocolVersion: PROTOCOL_VERSION,
+      executionIsolationMode: "provider",
+      providerRelayEndpoint: "tcp://127.0.0.1:4318",
+      registerCredential: (_id, hash) => hashes.push(hash),
+    }, () => {}, host);
+    const pending = relayAgentControlRequest(launch.sessionId, {
+      key: launch.env[AGENT_CONTROL_RELAY_KEY_ENV]!, method: "GET", path: "/api/compatibility",
+    }, new AbortController().signal, async () => new Response('{"protocolVersion":1}', { status: 200 }));
+    setTimeout(() => markAgentControlCredentialReady(root, launch.sessionId, hashes[0]!), 300);
+    assert.deepEqual(await pending, { status: 200, body: '{"protocolVersion":1}' });
+  } finally {
+    removeAgentControlFiles(launch.sessionId, root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a file-mode credential is current only for the hash its token file holds (#1841)", () => {
+  const root = mkdtempSync(join(tmpdir(), "wollipog-agent-control-file-current-"));
+  const launch = { ...spec("codex"), sessionId: "s_file_current" };
+  try {
+    const host: AgentControlHost = { isSea: true, execPath: "/runner", execArgv: [], configDir: root };
+    const hashes: string[] = [];
+    provisionAgentControl(launch, {
+      controlPlaneUrl: "ws://127.0.0.1:4317/runner",
+      controlPlaneProtocolVersion: PROTOCOL_VERSION,
+      registerCredential: (_id, hash) => hashes.push(hash),
+    }, () => {}, host);
+    assert.equal(isCurrentAgentControlCredential(root, launch.sessionId, hashes[0]!), true);
+    assert.equal(isCurrentAgentControlCredential(root, launch.sessionId, "0".repeat(64)), false);
+    markAgentControlCredentialReady(root, launch.sessionId, hashes[0]!);
+    assert.deepEqual(agentControlRegistrationsToResend(0)
+      .filter((registration) => registration.sessionId === launch.sessionId), []);
+  } finally {
+    removeAgentControlFiles(launch.sessionId, root);
     rmSync(root, { recursive: true, force: true });
   }
 });

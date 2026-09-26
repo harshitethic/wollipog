@@ -107,7 +107,11 @@ import { MANAGED_WORKTREE_GUARD_MODE } from "./managed-worktree-guard.js";
 import type { ManagedWorktreeProtection } from "./managed-worktree-protection.js";
 import { runnerReentryCommand } from "./runner-reentry.js";
 import {
+  agentControlRegistrationsToResend,
   defaultAgentControlHost,
+  forgetAgentControlRegistrationAnswers,
+  isStaleAgentControlAnswer,
+  noteAgentControlRegistrationSent,
   markAgentControlCredentialReady,
   markAgentControlCredentialRejected,
   provisionAgentControl,
@@ -275,6 +279,7 @@ import { RunnerSessionNamingCustomModel } from "./session-naming-custom-model.js
 
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
+const AGENT_CONTROL_REGISTRATION_RETRY_MS = 2_000;
 // Half-open-socket liveness: after a laptop sleep / Wi-Fi drop / NAT rebind the control-plane socket
 // can sit readyState=OPEN with no FIN/RST, so frames written into it are silently lost until the OS
 // TCP timeout finally errors it (many minutes). Piggy-back a ws-level ping on every heartbeat and
@@ -718,6 +723,16 @@ const pendingAgentControlRegistrations = new Map<string, {
   timer: ReturnType<typeof setTimeout>;
 }>();
 const agentControlRegistrationKey = (sessionId: string, tokenHash: string) => `${sessionId}\0${tokenHash}`;
+/** Re-send every current Agent Control registration still unacknowledged after `minAgeMs` (#1841).
+ * A frame lost in a reconnect is otherwise never sent again, and every relayed request from that
+ * provider then waits out the acknowledgement fence. Only a registered socket can carry them; the
+ * next registration replays whatever is still due. */
+const resendAgentControlRegistrations = (minAgeMs: number) => {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !registered) return;
+  for (const { sessionId, tokenHash } of agentControlRegistrationsToResend(minAgeMs)) {
+    registerAgentControlCredential(sessionId, tokenHash);
+  }
+};
 const registerAgentControlCredentialAndWait = (sessionId: string, tokenHash: string): Promise<void> => {
   const key = agentControlRegistrationKey(sessionId, tokenHash);
   if (pendingAgentControlRegistrations.has(key)) {
@@ -1206,6 +1221,7 @@ function sendUp(msg: RunnerToControlPlane): void {
     if (!projected) return;
     try {
       ws.send(JSON.stringify(projected));
+      noteSentRegistration(projected);
     } catch (error) {
       if (ephemeral) return;
       outbox.enqueue(msg);
@@ -1217,13 +1233,24 @@ function sendUp(msg: RunnerToControlPlane): void {
   outbox.enqueue(msg);
 }
 
+/** Agent Control answers are matched to registration frames by order on the socket that carried
+ * them (#1841), so a frame counts once it is written, never while it waits in the outbox. */
+function noteSentRegistration(message: RunnerToControlPlane): void {
+  if (message.type === "agent_control_credential") {
+    noteAgentControlRegistrationSent(message.sessionId, message.tokenHash);
+  }
+}
+
 function flushOutbox(): void {
   if (!ws || ws.readyState !== WebSocket.OPEN || !registered) return;
   const socket = ws;
   flushProjectedOutbox(
     outbox,
     projectMessageForCurrentProtocol,
-    (message) => socket.send(JSON.stringify(message)),
+    (message) => {
+      socket.send(JSON.stringify(message));
+      noteSentRegistration(message);
+    },
     (error, message) => log(`dropping ${message.type}: wire projection failed (${errText(error)})`),
     (error, message) => log(`retaining ${message.type}: socket send failed (${errText(error)})`),
   );
@@ -1797,6 +1824,13 @@ let heartbeatPongObserved = false;
 let reportedStaleInstallationKey = "[]";
 const sessionCommandRecoveryTimer = setInterval(recoverStaleSessionCommands, 10_000);
 sessionCommandRecoveryTimer.unref?.();
+// A registration can also be lost without a reconnect (#1841). Retrying well inside the relay's
+// 10-second acknowledgement wait lets a request that is already waiting still succeed.
+const agentControlRegistrationRetryTimer = setInterval(
+  () => resendAgentControlRegistrations(AGENT_CONTROL_REGISTRATION_RETRY_MS),
+  AGENT_CONTROL_REGISTRATION_RETRY_MS,
+);
+agentControlRegistrationRetryTimer.unref?.();
 recoverStaleSessionCommands();
 
 function stopHeartbeat(): void {
@@ -1890,6 +1924,8 @@ function handleCommand(msg: ControlPlaneToRunner): void {
       log(`registered (heartbeat every ${msg.heartbeatIntervalMs}ms)`);
       if (ws) startHeartbeat(ws, msg.heartbeatIntervalMs);
       flushOutbox();
+      // Whatever registration the previous socket lost, this control plane has not seen (#1841).
+      resendAgentControlRegistrations(0);
       // Registration snapshots are sent before the control plane's protocol version is known, so
       // they conservatively omit native capability overlays. Re-publish negotiated snapshots now;
       // v65 peers continue to receive no overlay, while v66+ peers get the hook transport truth.
@@ -2044,6 +2080,17 @@ function handleCommand(msg: ControlPlaneToRunner): void {
       try {
         const pendingKey = agentControlRegistrationKey(msg.sessionId, msg.tokenHash);
         const pending = pendingAgentControlRegistrations.get(pendingKey);
+        // Registrations are re-sent until answered (#1841), so an answer can arrive after its
+        // credential was superseded, torn down, or re-armed by a relaunch. It says nothing about
+        // the current fence, which it must neither open nor revoke.
+        if (isStaleAgentControlAnswer(agentControlHost.configDir, msg.sessionId, msg.tokenHash)) {
+          if (pending) {
+            clearTimeout(pending.timer);
+            pendingAgentControlRegistrations.delete(pendingKey);
+            pending.reject(new Error("Agent Control credential was superseded before it was acknowledged"));
+          }
+          break;
+        }
         if (msg.accepted) {
           markAgentControlCredentialReady(agentControlHost.configDir, msg.sessionId, msg.tokenHash);
           if (pending) {
@@ -3614,6 +3661,7 @@ function connect(): void {
   socket.on("close", () => {
     stopHeartbeat();
     registered = false;
+    forgetAgentControlRegistrationAnswers();
     controlPlaneProtocolVersion = null;
     automaticAccountSwitchConfigurationSynchronized = false;
     sessions.setAutomaticAccountSwitchAuthorityReady(false);
@@ -3657,6 +3705,7 @@ function shutdown(exitCode = 0): void {
   bestEffort("stop heartbeat", () => stopHeartbeat());
   bestEffort("clear timers", () => {
     clearInterval(sessionCommandRecoveryTimer);
+    clearInterval(agentControlRegistrationRetryTimer);
     if (discoveryTimer) clearInterval(discoveryTimer);
     if (reconnectTimer) clearTimeout(reconnectTimer);
   });

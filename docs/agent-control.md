@@ -23,6 +23,16 @@ listener. Launch and resume re-register the
 memory-held credential behind a fresh positive-acknowledgement fence. A runner restart forgets it,
 mints and registers a new credential during the next launch, and publishes a new relay endpoint.
 
+A registration can be lost in transit, for example in a control-plane reconnect. Until the control
+plane acknowledges or rejects the session's current credential, the runner re-sends that
+registration every two seconds and again each time it registers with a control plane (#1841). A
+relayed request already waiting on the fence therefore still succeeds. An answer neither readies nor
+revokes the current credential when it names a superseded credential. The same holds when it
+answers a frame sent before a relaunch re-armed the fence with the same credential. The control
+plane answers each frame in order on its socket, so the runner counts the answers still owed. When the relay cannot serve a request, it
+answers `503` with the runner's error, such as `Agent Control credential was not acknowledged within
+10 seconds`. It does not close the connection without a response.
+
 The runner injects these non-transcript environment values at launch:
 
 - `WOLLIPOG_CONTROL_PLANE_URL`: HTTP origin for the session's control plane.
