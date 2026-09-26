@@ -84,6 +84,9 @@ import {
   type SessionHoldView,
   type SessionQueueHoldView,
   type ChildSessionAttentionOwner,
+  type ManagedBackgroundJobEnd,
+  type ManagedBackgroundJobEndActor,
+  type ManagedBackgroundJobEndReason,
   type ManagedBackgroundJobSnapshot,
   type ManagedBackgroundJobView,
   MANAGED_BACKGROUND_JOB_VIEW_LIMIT,
@@ -976,6 +979,10 @@ CREATE TABLE IF NOT EXISTS managed_background_jobs (
   assistant_result_persisted_at INTEGER,
   source_present             INTEGER NOT NULL DEFAULT 1 CHECK (source_present IN (0, 1)),
   last_observed_at           INTEGER NOT NULL,
+  ended_by_actor             TEXT CHECK (ended_by_actor IN ('runner','user','orchestrator')),
+  ended_by_session_id        TEXT,
+  ended_by_reason            TEXT CHECK (ended_by_reason IN ('handoff_wait_bound','stop_request','session_restart')),
+  ended_by_at                INTEGER,
   PRIMARY KEY (session_id, job_id),
   FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
@@ -4620,6 +4627,18 @@ export class ControlPlaneDb {
       db.exec("ALTER TABLE managed_background_jobs ADD COLUMN continuation_missing_result_at INTEGER");
     } catch {
       /* column already present */
+    }
+    for (const column of [
+      "ended_by_actor TEXT CHECK (ended_by_actor IN ('runner','user','orchestrator'))",
+      "ended_by_session_id TEXT",
+      "ended_by_reason TEXT CHECK (ended_by_reason IN ('handoff_wait_bound','stop_request','session_restart'))",
+      "ended_by_at INTEGER",
+    ]) {
+      try {
+        db.exec(`ALTER TABLE managed_background_jobs ADD COLUMN ${column}`);
+      } catch {
+        /* column already present */
+      }
     }
     try {
       db.exec("ALTER TABLE skill_git_auto_updates ADD COLUMN checked_modes TEXT");
@@ -13175,8 +13194,9 @@ export class ControlPlaneDb {
          terminal_observed_at, continuation_required, continuation_id, continuation_queued_at,
          continuation_submitted_at, continuation_accepted_at, continuation_missing_result_at,
          assistant_result_persisted_at,
-         source_present, last_observed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         source_present, last_observed_at,
+         ended_by_actor, ended_by_session_id, ended_by_reason, ended_by_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id, job_id) DO UPDATE SET
          parent_turn_id=managed_background_jobs.parent_turn_id,
          runner_id=managed_background_jobs.runner_id,
@@ -13198,7 +13218,18 @@ export class ControlPlaneDb {
          continuation_missing_result_at=COALESCE(managed_background_jobs.continuation_missing_result_at, excluded.continuation_missing_result_at),
          assistant_result_persisted_at=COALESCE(managed_background_jobs.assistant_result_persisted_at, excluded.assistant_result_persisted_at),
          source_present=1,
-         last_observed_at=MAX(managed_background_jobs.last_observed_at, excluded.last_observed_at)`,
+         last_observed_at=MAX(managed_background_jobs.last_observed_at, excluded.last_observed_at),
+         -- The first recorded account of who ended the job is kept whole; a later snapshot never
+         -- mixes its actor with an earlier reason. An account is adopted only while the job's
+         -- recorded terminal status is (or becomes) killed: the status above keeps its first value.
+         ended_by_actor=CASE WHEN ${ADOPT_BACKGROUND_JOB_END}
+                             THEN excluded.ended_by_actor ELSE managed_background_jobs.ended_by_actor END,
+         ended_by_session_id=CASE WHEN ${ADOPT_BACKGROUND_JOB_END}
+                                  THEN excluded.ended_by_session_id ELSE managed_background_jobs.ended_by_session_id END,
+         ended_by_at=CASE WHEN ${ADOPT_BACKGROUND_JOB_END}
+                          THEN excluded.ended_by_at ELSE managed_background_jobs.ended_by_at END,
+         ended_by_reason=CASE WHEN ${ADOPT_BACKGROUND_JOB_END}
+                              THEN excluded.ended_by_reason ELSE managed_background_jobs.ended_by_reason END`,
     );
     const upsertDelivery = this.stmt(
       `INSERT INTO managed_background_deliveries
@@ -13236,6 +13267,8 @@ export class ControlPlaneDb {
       const continuationMissingResultAt = job.continuationAcceptedAt == null
         ? null
         : job.continuationMissingResultAt ?? null;
+      // A malformed account of who ended the job drops only that account, never the job.
+      const endedBy = job.terminalStatus === "killed" ? validBackgroundJobEnd(job.endedBy) : null;
       upsertJob.run(
         sessionId,
         job.id,
@@ -13256,6 +13289,10 @@ export class ControlPlaneDb {
         job.assistantResultPersistedAt ?? null,
         1,
         now,
+        endedBy?.actor.kind ?? null,
+        endedBy?.actor.kind === "orchestrator" ? endedBy.actor.sessionId : null,
+        endedBy?.reason ?? null,
+        endedBy?.endedAt ?? null,
       );
       if (job.continuationId && validBackgroundIdentity(job.continuationId)) {
         upsertDelivery.run(
@@ -13583,7 +13620,8 @@ export class ControlPlaneDb {
       `SELECT job_id, parent_turn_id, launch_type, registered_at, last_observed_at,
               source_present, terminal_status, terminal_observed_at, continuation_required,
               continuation_id, continuation_queued_at, continuation_submitted_at,
-              continuation_accepted_at, continuation_missing_result_at, assistant_result_persisted_at
+              continuation_accepted_at, continuation_missing_result_at, assistant_result_persisted_at,
+              ended_by_actor, ended_by_session_id, ended_by_reason, ended_by_at
          FROM managed_background_jobs
         WHERE session_id=?
         ORDER BY CASE
@@ -13609,6 +13647,10 @@ export class ControlPlaneDb {
       continuation_accepted_at: number | null;
       continuation_missing_result_at: number | null;
       assistant_result_persisted_at: number | null;
+      ended_by_actor: ManagedBackgroundJobEndActor["kind"] | null;
+      ended_by_session_id: string | null;
+      ended_by_reason: ManagedBackgroundJobEndReason | null;
+      ended_by_at: number | null;
     }>;
     return rows.map((row) => ({
       id: row.job_id,
@@ -13630,6 +13672,7 @@ export class ControlPlaneDb {
       ...(row.assistant_result_persisted_at != null
         ? { assistantResultPersistedAt: row.assistant_result_persisted_at }
         : {}),
+      ...managedBackgroundJobEndFromRow(row),
       // A listed job with no terminal status past the bound is reported, not declared ended: the
       // runner cannot tell a monitor that never fires from one still waiting (#1651).
       ...(row.source_present === 1 && row.terminal_observed_at == null &&
@@ -25137,6 +25180,46 @@ function validBackgroundLaunchType(
 ): value is ManagedBackgroundJobSnapshot["launchType"] {
   return value === "agent" || value === "shell" || value === "monitor" ||
     value === "workflow" || value === "unknown";
+}
+
+/** Upsert condition for adopting a snapshot's account of who ended a job (#1849): none is recorded
+ * yet, and the job's stored terminal status, which never changes once set, is killed. */
+const ADOPT_BACKGROUND_JOB_END = `managed_background_jobs.ended_by_reason IS NULL AND
+  COALESCE(managed_background_jobs.terminal_status, excluded.terminal_status) = 'killed'`;
+
+/** Who ended a job, as a v192 runner reports it (#1849); `null` when absent or malformed. A person is
+ * accepted only by role: a snapshot naming an account is refused rather than stored. */
+function validBackgroundJobEnd(value: unknown): ManagedBackgroundJobEnd | null {
+  if (!value || typeof value !== "object") return null;
+  const end = value as Partial<ManagedBackgroundJobEnd>;
+  if (end.reason !== "handoff_wait_bound" && end.reason !== "stop_request" && end.reason !== "session_restart") {
+    return null;
+  }
+  if (!validBackgroundTimestamp(end.endedAt) || !end.actor || typeof end.actor !== "object") return null;
+  const actor = end.actor as Record<string, unknown>;
+  const keys = Object.keys(actor);
+  if ((actor.kind === "runner" || actor.kind === "user") && keys.length === 1) {
+    return { actor: { kind: actor.kind }, reason: end.reason, endedAt: end.endedAt };
+  }
+  if (actor.kind === "orchestrator" && keys.length === 2 && validBackgroundIdentity(actor.sessionId)) {
+    return { actor: { kind: "orchestrator", sessionId: actor.sessionId }, reason: end.reason, endedAt: end.endedAt };
+  }
+  return null;
+}
+
+function managedBackgroundJobEndFromRow(row: {
+  ended_by_actor: ManagedBackgroundJobEndActor["kind"] | null;
+  ended_by_session_id: string | null;
+  ended_by_reason: ManagedBackgroundJobEndReason | null;
+  ended_by_at: number | null;
+}): { endedBy?: ManagedBackgroundJobEnd } {
+  if (!row.ended_by_reason || row.ended_by_at == null || !row.ended_by_actor) return {};
+  if (row.ended_by_actor === "orchestrator") {
+    return row.ended_by_session_id
+      ? { endedBy: { actor: { kind: "orchestrator", sessionId: row.ended_by_session_id }, reason: row.ended_by_reason, endedAt: row.ended_by_at } }
+      : {};
+  }
+  return { endedBy: { actor: { kind: row.ended_by_actor }, reason: row.ended_by_reason, endedAt: row.ended_by_at } };
 }
 
 function validBackgroundTerminalStatus(
