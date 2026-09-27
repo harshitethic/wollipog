@@ -943,6 +943,46 @@ test("saving a queued edit restores the displaced composer only after its captur
   }
 });
 
+test("a queued edit opened before the person lost queue management is not saved (#1857)", async () => {
+  const draft = deferred<ComposerDraft | null>();
+  const saved: string[] = [];
+  const reason = "Your Viewer role is read-only.";
+  const fixture = await mountFixture(draft, {
+    runnerProtocolVersion: 99,
+    sessionPatch: { queued: [{
+      id: "queue-1", text: "Queued projection", liveQueueObserved: true,
+      editable: true, editRevision: "qer_exact",
+    }] },
+    client: {
+      readQueuedPrompt: async (_sessionId, promptId) => ({ prompt: {
+        promptId, text: "Queued exact content", images: [], editRevision: "qer_exact",
+      } }),
+      editQueuedPrompt: async (_sessionId, promptId) => {
+        saved.push(promptId);
+        return { prompt: { promptId, text: "Queued exact content", images: [], editRevision: "qer_saved" } };
+      },
+    },
+  });
+  try {
+    await resolveDraft(draft, "Displaced draft");
+    const edit = fixture.container.querySelector('button[aria-label="Edit Queued Message"]') as HTMLButtonElement;
+    await act(async () => { edit.click(); });
+    await flushAsyncWork();
+    assert.ok(fixture.container.querySelector('button[aria-label="Save Queued Message"]'), "the edit is open");
+    const refused = { allowed: false as const, reason };
+    await fixture.pushSession({ commandPermissions: {
+      stop: refused, restart: refused, stopBackgroundJob: refused, manageQueue: refused, prompt: refused,
+    } });
+    await act(async () => {
+      fixture.composer.dispatchEvent(new domWindow.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }) as never);
+    });
+    await flushAsyncWork();
+    assert.deepEqual(saved, [], "the open edit is not sent once queue management is refused");
+  } finally {
+    await unmountFixture(fixture);
+  }
+});
+
 test("navigating away mid-edit preserves the displaced session draft instead of queued content", async () => {
   const draft = deferred<ComposerDraft | null>();
   const fixture = await mountFixture(draft, {
@@ -2814,6 +2854,53 @@ test("cleanup throwing after provider acceptance cannot recover the accepted dra
   }
 });
 
+test("direct steering follows the queue-management verdict even when prompting is allowed (#1857)", async () => {
+  const reason = "Session credentials cannot use this command.";
+  for (const manageQueue of [{ allowed: false as const, reason }, { allowed: true as const }]) {
+    const draft = deferred<ComposerDraft | null>();
+    const calls: string[] = [];
+    const fixture = await mountFixture(draft, {
+      runnerProtocolVersion: 73,
+      sessionPatch: {
+        status: "running",
+        activeTurnId: "turn-1",
+        commandPermissions: {
+          stop: { allowed: true }, restart: { allowed: true }, stopBackgroundJob: { allowed: true },
+          prompt: { allowed: true }, manageQueue,
+        },
+      },
+      sessionCapabilities: {
+        models: [],
+        effortLevels: [],
+        slashCommands: [],
+        supportsImages: true,
+        supportsApprovals: false,
+        supportsSteering: true,
+      },
+      client: {
+        steer: async (_sessionId, request) => {
+          calls.push(request.text ?? "");
+          return {
+            submissionId: request.submissionId, turnId: request.turnId, source: "direct",
+            text: request.text ?? "", state: "accepted", reason: "accepted", createdAt: 1, updatedAt: 1,
+          };
+        },
+      },
+    });
+    try {
+      await resolveDraft(draft, "steer once");
+      await act(async () => {
+        fireDomEvent.keyDown(fixture.composer, { key: "Enter", ctrlKey: true, metaKey: false, shiftKey: false, altKey: false });
+      });
+      await flushAsyncWork();
+      assert.deepEqual(calls, manageQueue.allowed ? ["steer once"] : [],
+        manageQueue.allowed ? "an allowed person steers as before" : "a refused steer is not sent");
+    } finally {
+      await unmountFixture(fixture);
+    }
+  }
+});
+
 test("cleanup throwing after accepted steering cannot recover the accepted draft", async () => {
   const draft = deferred<ComposerDraft | null>();
   const calls: string[] = [];
@@ -3534,6 +3621,76 @@ test("a person the server refuses a prompt gets a read-only composer that says w
       });
       await flushAsyncWork();
       assert.deepEqual(prompted, [], "no prompt is sent");
+    } finally {
+      await unmountFixture(fixture);
+    }
+  }
+});
+
+test("a Viewer's Stop Turn, queued-message actions and Plan control are disabled with the reason and send nothing (#1857)", async () => {
+  const reason = "Your Viewer role is read-only.";
+  const refused = { allowed: false as const, reason };
+  const allowed = { allowed: true as const };
+  const everything = (permission: typeof refused | typeof allowed) => ({
+    stop: permission, restart: permission, stopBackgroundJob: permission, archive: permission,
+    unarchive: permission, prompt: permission, delete: permission, cancelTurn: permission,
+    manageQueue: permission, rename: permission, configure: permission, respond: permission,
+  });
+  for (const commandPermissions of [everything(refused), everything(allowed), undefined]) {
+    const draft = deferred<ComposerDraft | null>();
+    const calls: string[] = [];
+    const fixture = await mountFixture(draft, {
+      runnerProtocolVersion: 99,
+      sessionPatch: {
+        status: "running",
+        activeTurnId: "turn-1",
+        permissionMode: "plan",
+        queued: [{ id: "queue-1", text: "Queued message", liveQueueObserved: true, editable: true, editRevision: "qer_1" }],
+        ...(commandPermissions ? { commandPermissions } : {}),
+      },
+      client: {
+        cancelTurn: async (sessionId) => { calls.push("cancelTurn"); return session(sessionId); },
+        steer: async () => { calls.push("steer"); return new Promise<never>(() => {}); },
+        cancelQueuedPrompt: async () => { calls.push("cancelQueuedPrompt"); },
+        readQueuedPrompt: async () => { calls.push("readQueuedPrompt"); return new Promise<never>(() => {}); },
+        setConfig: async (sessionId) => { calls.push("setConfig"); return session(sessionId); },
+      },
+    });
+    const label = commandPermissions === undefined ? "without permissions" : commandPermissions.cancelTurn === refused ? "refused" : "allowed";
+    try {
+      await resolveComposerDraft(draft, { text: "", images: [], updatedAt: 1 });
+      const stopTurn = fixture.container.querySelector(".stop-turn-btn") as HTMLButtonElement;
+      const steer = fixture.container.querySelector('button[aria-label="Steer Queued Message"]') as HTMLButtonElement;
+      const edit = fixture.container.querySelector('button[aria-label="Edit Queued Message"]') as HTMLButtonElement;
+      const cancel = fixture.container.querySelector(".queued-cancel") as HTMLButtonElement;
+      const plan = fixture.container.querySelector(".mode-pill") as HTMLButtonElement;
+      for (const [name, control] of Object.entries({ stopTurn, steer, edit, cancel, plan })) {
+        assert.ok(control, `${label}: ${name} stays in place`);
+      }
+      if (commandPermissions?.cancelTurn !== refused) {
+        assert.equal(stopTurn.disabled, false, `${label}: Stop Turn is offered as before`);
+        assert.equal(edit.disabled, false, `${label}: Edit is offered as before`);
+        assert.equal(cancel.disabled, false, `${label}: Cancel is offered as before`);
+        assert.equal(plan.disabled, false, `${label}: Plan is offered as before`);
+        assert.notEqual(stopTurn.title, reason);
+        continue;
+      }
+      for (const [name, control] of Object.entries({ stopTurn, steer, edit, cancel, plan })) {
+        assert.equal(control.disabled, true, `${name} is disabled for a Viewer`);
+        const described = control.getAttribute("aria-describedby");
+        assert.ok(described, `${name} carries its reason as a description`);
+        assert.equal(fixture.container.ownerDocument.getElementById(described!)?.textContent, reason,
+          `${name}'s description is the refusal`);
+      }
+      assert.equal(stopTurn.title, reason, "Stop Turn says why");
+      assert.equal(cancel.title, reason);
+      await act(async () => {
+        for (const control of [stopTurn, steer, edit, cancel, plan]) control.click();
+        domWindow.dispatchEvent(new domWindow.KeyboardEvent("keydown", { key: "Escape", shiftKey: true, bubbles: true }) as never);
+        fixture.composer.dispatchEvent(new domWindow.KeyboardEvent("keydown", { key: "Escape", shiftKey: true, bubbles: true }) as never);
+      });
+      await flushAsyncWork();
+      assert.deepEqual(calls, [], "neither the controls nor the Stop Turn shortcut send anything");
     } finally {
       await unmountFixture(fixture);
     }
