@@ -622,3 +622,101 @@ test("a live runner queue entry keeps its enabled Cancel Queued Message control"
     await unmountFixture(fixture);
   }
 });
+
+test("a person refused Fork gets that reason from the preview surface that drives the Inbox Fork and F key (#1864)", async () => {
+  const reason = "Your Viewer role is read-only.";
+  for (const [fork, expected] of [
+    [{ allowed: false, reason }, { available: false, reason }],
+    [{ allowed: true }, { available: true, forkTurn: 1 }],
+    [undefined, { available: true, forkTurn: 1 }],
+  ] as const) {
+    const reported: unknown[] = [];
+    const fixture = await mountFixture({
+      sessionPatch: {
+        status: "idle",
+        useWorktree: true,
+        worktreePath: "/tmp/durable-dismissal-worktree",
+        ...(fork ? { commandPermissions: {
+          stop: { allowed: true }, restart: { allowed: true }, stopBackgroundJob: { allowed: true }, fork,
+        } } : {}),
+      },
+      // A completed checkpoint makes turn 1 forkable, so only the verdict can refuse it.
+      eventPayloads: [
+        { kind: "user_message", text: TEXT, images: [] },
+        { kind: "agent_message", text: "done", final: true },
+        { kind: "conversation_checkpoint", turn: 1 },
+      ],
+      onPreviewForkReady: (controls) => { if (controls) reported.push(controls.availability); },
+    });
+    try {
+      assert.deepEqual(reported.at(-1), expected, `fork verdict ${JSON.stringify(fork)}`);
+    } finally {
+      await unmountFixture(fixture);
+    }
+  }
+});
+
+test("a Viewer's per-turn Rewind, Fork and Hand Off are unavailable and say why (#1864)", async () => {
+  const reason = "Your Viewer role is read-only.";
+  const fixture = await mountFixture({
+    sessionPatch: {
+      status: "idle",
+      useWorktree: true,
+      worktreePath: "/tmp/durable-dismissal-worktree",
+      commandPermissions: {
+        stop: { allowed: false, reason }, restart: { allowed: false, reason }, stopBackgroundJob: { allowed: false, reason },
+        fork: { allowed: false, reason }, rewind: { allowed: false, reason },
+      },
+    },
+    eventPayloads: [
+      { kind: "user_message", text: TEXT, images: [] },
+      { kind: "checkpoint", turn: 1, tree: "a".repeat(40) },
+      { kind: "agent_message", text: "done", final: true },
+      { kind: "conversation_checkpoint", turn: 1 },
+    ],
+  });
+  try {
+    for (const label of ["Rewind Files to Before This Turn", "Fork Conversation After This Turn", "Hand Off After This Turn"]) {
+      assert.equal(button(fixture, label), null, `${label} is not offered as a button`);
+      const summary = fixture.container.querySelector(`summary[aria-label="${label} Unavailable"]`);
+      assert.ok(summary, `${label} is shown as unavailable`);
+      const description = fixture.container.querySelector(`[id="${summary.getAttribute("aria-describedby")}"]`);
+      assert.match(description?.textContent ?? "", /Your Viewer role is read-only\./u, `${label} says why`);
+    }
+  } finally {
+    await unmountFixture(fixture);
+  }
+});
+
+test("a refusal that arrives while Edit in Fork is open disables Create Fork and says why (#1864)", async () => {
+  const reason = "Your Viewer role is read-only.";
+  const fixture = await mountFixture({
+    sessionPatch: { status: "idle", useWorktree: true, worktreePath: "/tmp/durable-dismissal-worktree" },
+    eventPayloads: [
+      { kind: "user_message", text: "first", images: [] },
+      { kind: "agent_message", text: "one", final: true },
+      { kind: "conversation_checkpoint", turn: 1 },
+      { kind: "user_message", text: "second", images: [] },
+      { kind: "agent_message", text: "two", final: true },
+      { kind: "conversation_checkpoint", turn: 2 },
+    ],
+  });
+  try {
+    const edit = button(fixture, "Edit User Message in a New Conversation Fork");
+    assert.ok(edit, "Edit in Fork is offered while forking is allowed");
+    await act(async () => { edit.click(); });
+    const createFork = () => [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((candidate) => candidate.textContent === "Create Fork");
+    assert.equal(createFork()?.disabled, false);
+    await fixture.pushSession({ commandPermissions: {
+      stop: { allowed: true }, restart: { allowed: true }, stopBackgroundJob: { allowed: true },
+      fork: { allowed: false, reason },
+    } });
+    const refused = createFork();
+    assert.ok(refused, "the open dialog stays open");
+    assert.equal(refused.disabled, true);
+    assert.equal(document.getElementById(refused.getAttribute("aria-describedby") ?? "")?.textContent, reason);
+  } finally {
+    await unmountFixture(fixture);
+  }
+});

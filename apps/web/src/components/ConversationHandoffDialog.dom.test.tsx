@@ -47,7 +47,7 @@ function claude(serviceTiers?: { id: string; name: string }[]): AgentDefinition 
   } as AgentDefinition;
 }
 
-async function mount(agent: AgentDefinition, sourceServiceTier?: string) {
+async function mount(agent: AgentDefinition, sourceServiceTier?: string, refusal?: string | null) {
   const container = domWindow.document.createElement("div") as unknown as HTMLDivElement;
   domWindow.document.body.append(container as never);
   const root = createRoot(container);
@@ -58,6 +58,7 @@ async function mount(agent: AgentDefinition, sourceServiceTier?: string) {
       sourceDriver="codex-app-server"
       sourceServiceTier={sourceServiceTier}
       turn={1}
+      refusal={refusal}
       onClose={() => {}}
       onCreate={async (agentId, config) => { created.push({ agentId, config }); }}
     />,
@@ -143,5 +144,61 @@ test("handoff choices exclude installations blocked by the Machine selection", a
     } finally {
       await fixture.unmount();
     }
+  }
+});
+
+test("a person refused Fork while the dialog is open cannot create the handoff, and is told why (#1864)", async () => {
+  const reason = "Your Viewer role is read-only.";
+  const refused = await mount(claude(), undefined, reason);
+  try {
+    const create = refused.create();
+    assert.equal(create.disabled, true);
+    const describedBy = create.getAttribute("aria-describedby");
+    assert.ok(describedBy, "the refusal describes Create Handoff");
+    assert.equal(refused.container.querySelector(`#${describedBy}`)?.textContent, reason);
+    await act(async () => { create.click(); });
+    assert.deepEqual(refused.created, []);
+  } finally {
+    await refused.unmount();
+  }
+  for (const refusal of [null, undefined]) {
+    const allowed = await mount(claude(), undefined, refusal);
+    try {
+      assert.equal(allowed.create().disabled, false);
+      assert.equal(allowed.create().getAttribute("aria-describedby"), null);
+    } finally {
+      await allowed.unmount();
+    }
+  }
+});
+
+test("a refusal that arrives after a failed attempt is still stated beside the error (#1864)", async () => {
+  const reason = "Your Viewer role is read-only.";
+  const container = domWindow.document.createElement("div") as unknown as HTMLDivElement;
+  domWindow.document.body.append(container as never);
+  const root = createRoot(container);
+  const render = (refusal: string | null) => root.render(
+    <ConversationHandoffDialog
+      agents={[claude()]}
+      sourceDriver="codex-app-server"
+      turn={1}
+      refusal={refusal}
+      onClose={() => {}}
+      onCreate={async () => { throw new Error("The runner is offline."); }}
+    />,
+  );
+  const create = () => [...container.querySelectorAll("button")]
+    .find((element) => element.textContent === "Create Handoff") as HTMLButtonElement;
+  try {
+    await act(async () => render(null));
+    await act(async () => { create().click(); });
+    assert.match(container.textContent ?? "", /The runner is offline\./u);
+    await act(async () => render(reason));
+    assert.equal(create().disabled, true);
+    const described = container.querySelector(`#${create().getAttribute("aria-describedby")}`);
+    assert.equal(described?.textContent, reason, "the refusal is stated even after an earlier error");
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
   }
 });
