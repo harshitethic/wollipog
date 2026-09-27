@@ -144,7 +144,8 @@ export function ImageStrip({
 }: {
   images: PromptImageInput[];
   onRemove: (i: number) => void;
-  onInspectReference?: (reference: WorkspaceReference) => void;
+  /** `opener` is the chip, for returning focus on close: a pointer never focuses it. */
+  onInspectReference?: (reference: WorkspaceReference, opener: HTMLElement) => void;
 }) {
   if (!images.length) return null;
   return (
@@ -155,7 +156,10 @@ export function ImageStrip({
             <button
               className="workspace-reference-open"
               type="button"
-              onClick={() => onInspectReference?.(img)}
+              // Keep the composer focused until the click lands, like Send: blurring it on
+              // pointerdown brings the phone rail back and moves this chip out from under the finger.
+              onPointerDown={(event) => event.preventDefault()}
+              onClick={(event) => onInspectReference?.(img, event.currentTarget)}
               aria-label={`Inspect Workspace Reference ${workspaceReferenceLabel(img)}`}
               title="Inspect Workspace Reference"
             >
