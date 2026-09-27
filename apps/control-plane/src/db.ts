@@ -755,6 +755,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_decisions_session_request
   ON workflow_decisions(session_id, request_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_decisions_resource
   ON workflow_decisions(session_id, category, resource_key, created_at);
+-- The restart notice a child is owed for each decision its restart revoked (#1779, #1861). A
+-- guardrail that refuses the notice leaves it held rather than forcing it through; the first
+-- boundary that finds the guardrail cleared delivers every held row in one notice. See
+-- RestartNoticeState. The decision itself stays revoked either way.
+CREATE TABLE IF NOT EXISTS session_restart_notices (
+  occurrence_id TEXT PRIMARY KEY,
+  session_id    TEXT NOT NULL,
+  category      TEXT NOT NULL,
+  resource_key  TEXT NOT NULL,
+  prior_status  TEXT NOT NULL CHECK (prior_status IN ('approved','pending')),
+  state         TEXT NOT NULL,
+  command_id    TEXT,
+  revoked_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_session_restart_notices_held
+  ON session_restart_notices(session_id, revoked_at) WHERE state='held';
+CREATE INDEX IF NOT EXISTS idx_session_restart_notices_command
+  ON session_restart_notices(command_id) WHERE state='delivering';
 -- Provider invocation identities are hashed before storage. Claiming one here makes a replayed
 -- approval-review receipt unable to consume a later grant for the same canonical command.
 CREATE TABLE IF NOT EXISTS workflow_decision_action_receipts (
@@ -2913,6 +2933,25 @@ export type CampaignContinuationEventKind =
  */
 export type WorkflowDecisionResumeState =
   | "delivering" | "held" | "delivered" | "uncertain" | "failed" | "abandoned";
+
+/**
+ * How the restart notice naming one revoked decision is progressing (#1861). `held`: it is owed
+ * and no command carries it yet — a guardrail refused it, or the restart could not queue it. The
+ * first boundary that finds the session free of guardrails delivers every held row in one notice.
+ * `delivering`: a durable prompt command carries it. `delivered`: the runner started that turn,
+ * or a runner without durable receipts accepted the prompt. `uncertain`: the transport cannot say,
+ * so it is never re-sent. `failed`: the runner refused it for a reason other than worktree
+ * recovery. `abandoned`: the session ended for good before it could be delivered.
+ */
+export type RestartNoticeState =
+  | "held" | "delivering" | "delivered" | "uncertain" | "failed" | "abandoned";
+
+export interface RestartNoticeEntry {
+  occurrenceId: string;
+  category: WorkflowDecisionView["category"];
+  resourceKey: string;
+  priorStatus: "approved" | "pending";
+}
 
 export interface CampaignContinuationEventRecord {
   seq: number;
@@ -15511,13 +15550,16 @@ export class ControlPlaneDb {
   }
 
   /** Sessions on a runner that still owe typed-decision work: an unconsumed (pending or approved)
-   * decision, or a held resume. Reconnect ends the ones the runner no longer holds without walking
-   * every retained session (#1759). */
+   * decision, a held resume, or a restart notice still held or in flight. Reconnect ends the ones the runner no longer
+   * holds without walking every retained session (#1759, #1861). */
   sessionsOwingWorkflowDecisionWork(runnerId: string): string[] {
     return (this.stmt(
-      `SELECT DISTINCT d.session_id AS id FROM workflow_decisions d JOIN sessions s ON s.id=d.session_id
-       WHERE s.runner_id=? AND (d.status IN ('pending','approved') OR d.resume_state='held')`,
-    ).all(runnerId) as Array<{ id: string }>).map((row) => row.id);
+      `SELECT d.session_id AS id FROM workflow_decisions d JOIN sessions s ON s.id=d.session_id
+       WHERE s.runner_id=? AND (d.status IN ('pending','approved') OR d.resume_state='held')
+       UNION
+       SELECT n.session_id AS id FROM session_restart_notices n JOIN sessions s ON s.id=n.session_id
+       WHERE s.runner_id=? AND n.state IN ('held','delivering')`,
+    ).all(runnerId, runnerId) as Array<{ id: string }>).map((row) => row.id);
   }
 
   sessionsWithHeldWorkflowDecisionResumes(runnerId?: string): string[] {
@@ -15525,6 +15567,156 @@ export class ControlPlaneDb {
       `SELECT DISTINCT d.session_id AS id FROM workflow_decisions d JOIN sessions s ON s.id=d.session_id
        WHERE d.resume_state='held' ${runnerId ? "AND s.runner_id=?" : ""}`,
     ).all(...(runnerId ? [runnerId] : [])) as Array<{ id: string }>).map((row) => row.id);
+  }
+
+  /** Restart notices this session still owes, oldest revocation first. */
+  heldRestartNotices(sessionId: string): RestartNoticeEntry[] {
+    return (this.stmt(
+      `SELECT occurrence_id, category, resource_key, prior_status FROM session_restart_notices
+       WHERE session_id=? AND state='held' ORDER BY revoked_at, rowid`,
+    ).all(sessionId) as Array<{
+      occurrence_id: string; category: RestartNoticeEntry["category"]; resource_key: string;
+      prior_status: RestartNoticeEntry["priorStatus"];
+    }>).map((row) => ({
+      occurrenceId: row.occurrence_id,
+      category: row.category,
+      resourceKey: row.resource_key,
+      priorStatus: row.prior_status,
+    }));
+  }
+
+  /** Whether this session still owes a restart notice, held or in flight: an end must retire it. */
+  hasOpenRestartNotices(sessionId: string): boolean {
+    return this.stmt(
+      "SELECT 1 FROM session_restart_notices WHERE session_id=? AND state IN ('held','delivering') LIMIT 1",
+    ).get(sessionId) !== undefined;
+  }
+
+  restartNoticeState(occurrenceId: string): { state: RestartNoticeState; commandId: string | null } | null {
+    const row = this.stmt("SELECT state, command_id FROM session_restart_notices WHERE occurrence_id=?")
+      .get(occurrenceId) as { state: RestartNoticeState; command_id: string | null } | undefined;
+    return row ? { state: row.state, commandId: row.command_id } : null;
+  }
+
+  /**
+   * Stage the durable command that carries a restart notice and bind every occurrence it names to
+   * it in one transaction (#1861), exactly as a decision's resume is staged. A crash leaves the
+   * notice either still held (the next boundary delivers it) or in flight with its command (the
+   * outbox delivers it). Throws, staging nothing, unless every named occurrence is still held.
+   */
+  stageRestartNotice(input: {
+    occurrenceIds: readonly string[];
+    command: Parameters<ControlPlaneDb["stageSessionPromptCommand"]>[0];
+  }): SessionPromptCommandRecord {
+    this.db.exec("BEGIN");
+    try {
+      const update = this.stmt(
+        `UPDATE session_restart_notices SET state='delivering', command_id=?, updated_at=?
+         WHERE occurrence_id=? AND session_id=? AND state='held'`,
+      );
+      const staged = this.stageSessionPromptCommand(input.command);
+      for (const occurrenceId of input.occurrenceIds) {
+        if (Number(update.run(staged.commandId, input.command.now, occurrenceId, input.command.sessionId).changes) !== 1) {
+          throw new Error("restart notice changed before it could be staged");
+        }
+      }
+      this.db.exec("COMMIT");
+      return staged;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** Record held notices delivered just before they go out on the immediate lane, which has no
+   * receipt to follow. All or nothing: false, claiming none, unless every one is still held. */
+  claimHeldRestartNotices(sessionId: string, occurrenceIds: readonly string[], now: number): boolean {
+    try {
+      return this.atomic(() => {
+        const update = this.stmt(
+          `UPDATE session_restart_notices SET state='delivered', command_id=NULL, updated_at=?
+           WHERE occurrence_id=? AND session_id=? AND state='held'`,
+        );
+        for (const occurrenceId of occurrenceIds) {
+          if (Number(update.run(now, occurrenceId, sessionId).changes) !== 1) throw new Error("restart notice changed");
+        }
+        return true;
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  /** The immediate send that followed a claim failed synchronously: owe the notice again. */
+  releaseRestartNoticeClaim(sessionId: string, occurrenceIds: readonly string[], now: number): void {
+    const update = this.stmt(
+      `UPDATE session_restart_notices SET state='held', updated_at=?
+       WHERE occurrence_id=? AND session_id=? AND state='delivered' AND command_id IS NULL`,
+    );
+    for (const occurrenceId of occurrenceIds) update.run(now, occurrenceId, sessionId);
+  }
+
+  /** The session whose restart notice this command carries, if the notice is still in flight. */
+  restartNoticeSessionForCommand(commandId: string): string | null {
+    const row = this.stmt(
+      "SELECT session_id FROM session_restart_notices WHERE command_id=? AND state='delivering' LIMIT 1",
+    ).get(commandId) as { session_id: string } | undefined;
+    return row?.session_id ?? null;
+  }
+
+  setRestartNoticeCommandState(commandId: string, state: RestartNoticeState, now: number): number {
+    return Number(this.stmt(
+      `UPDATE session_restart_notices SET state=?, updated_at=? WHERE command_id=? AND state='delivering'`,
+    ).run(state, now, commandId).changes);
+  }
+
+  /**
+   * The runner reported the notice's command not sent because the session's worktree needs
+   * recovery: owe the notice again and retire the not-sent row in one transaction, so it can
+   * neither be lost nor also retried by hand (#1861). False when no notice is carried by it.
+   */
+  holdRestartNoticeCommand(sessionId: string, commandId: string, now: number): boolean {
+    this.db.exec("BEGIN");
+    try {
+      const held = Number(this.stmt(
+        `UPDATE session_restart_notices SET state='held', command_id=NULL, updated_at=?
+         WHERE session_id=? AND command_id=? AND state='delivering'`,
+      ).run(now, sessionId, commandId).changes) > 0;
+      if (held) this.dismissTerminalSessionPromptCommand(sessionId, commandId, now);
+      this.db.exec("COMMIT");
+      return held;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** A session that ended for good is owed no notice any more (#1861). One still in flight is
+   * abandoned too, so a late not-sent receipt for its command cannot hold it again for a later
+   * restart to deliver. */
+  abandonRestartNotices(sessionId: string, now: number): number {
+    return Number(this.stmt(
+      `UPDATE session_restart_notices SET state='abandoned', updated_at=?
+       WHERE session_id=? AND state IN ('held','delivering')`,
+    ).run(now, sessionId).changes);
+  }
+
+  sessionsWithHeldRestartNotices(runnerId?: string): string[] {
+    return (this.stmt(
+      `SELECT DISTINCT n.session_id AS id FROM session_restart_notices n JOIN sessions s ON s.id=n.session_id
+       WHERE n.state='held' ${runnerId ? "AND s.runner_id=?" : ""}`,
+    ).all(...(runnerId ? [runnerId] : [])) as Array<{ id: string }>).map((row) => row.id);
+  }
+
+  /** Commands carrying an in-flight notice whose outcome is recorded but was never applied to it. */
+  settledRestartNoticeCommands(runnerId?: string, limit = 100): string[] {
+    return (this.stmt(
+      `SELECT DISTINCT n.command_id AS id FROM session_restart_notices n
+       JOIN session_prompt_commands c ON c.command_id=n.command_id
+       WHERE n.state='delivering' AND c.state IN ('started','completed','failed','uncertain')
+         ${runnerId ? "AND c.runner_id=?" : ""}
+       LIMIT ?`,
+    ).all(...(runnerId ? [runnerId, limit] : [limit])) as Array<{ id: string }>).map((row) => row.id);
   }
 
   /** Descendants held from starting their next turn (#1650), without hydrating full views. Only a
@@ -15619,16 +15811,30 @@ export class ControlPlaneDb {
     ).run(now, occurrenceId);
   }
 
-  markWorkflowDecisionRevoked(occurrenceId: string, now: number): WorkflowDecisionView | null {
+  /** `oweRestartNotice` records, in the revocation's own transaction, the notice a restart owes
+   * the child for this occurrence (#1861): no crash can leave the revocation without it, and it
+   * stays owed whatever the decision's status becomes later (a forge-settled merge, say). */
+  markWorkflowDecisionRevoked(occurrenceId: string, now: number, oweRestartNotice = false): WorkflowDecisionView | null {
     // One transaction, so a restart can never leave a revoked decision with its resume still
     // waiting to be sent.
     this.db.exec("BEGIN");
     try {
+      const prior = this.stmt(
+        "SELECT status FROM workflow_decisions WHERE occurrence_id=? AND status IN ('pending','approved')",
+      ).get(occurrenceId) as { status: "pending" | "approved" } | undefined;
       const revoked = Number(this.stmt(
         `UPDATE workflow_decisions SET status='revoked', resolved_at=COALESCE(resolved_at, ?)
          WHERE occurrence_id=? AND status IN ('pending','approved')`,
       ).run(now, occurrenceId).changes) === 1;
       if (revoked) this.retireWorkflowDecisionResume(occurrenceId, now);
+      if (revoked && prior && oweRestartNotice) {
+        this.stmt(
+          `INSERT OR IGNORE INTO session_restart_notices
+           (occurrence_id,session_id,category,resource_key,prior_status,state,command_id,revoked_at,updated_at)
+           SELECT occurrence_id,session_id,category,resource_key,?,'held',NULL,?,? FROM workflow_decisions
+           WHERE occurrence_id=?`,
+        ).run(prior.status, now, now, occurrenceId);
+      }
       this.revokeUiEvidenceReviewReceipts(occurrenceId, now);
       this.db.exec("COMMIT");
     } catch (error) {
@@ -18468,22 +18674,31 @@ export class ControlPlaneDb {
    * journal deduplicates, and if the stop proves final a later call without the flag ends it. A
    * resume whose command this does cancel ends with it: never sent is `abandoned` and its row is
    * retired, as when its decision is revoked; anything later is `uncertain` and never re-sent.
+   * A restart notice's command is kept the same way (#1861), and also by a restart that relaunches
+   * a provisionally stopped child (`keepRestartNotices`), which still owes it; one this does cancel
+   * is settled from the command by the receipt sweep, unless the end that follows abandons it first.
    */
   cancelSessionPromptCommands(
     sessionId: string,
     reason: string,
     now: number,
     keepWorkflowDecisionResumes = false,
+    keepRestartNotices = keepWorkflowDecisionResumes,
   ): number {
     return this.atomic(() => {
       const rows = this.stmt(
-        `SELECT c.command_id, c.state, d.occurrence_id FROM session_prompt_commands c
+        `SELECT c.command_id, c.state, d.occurrence_id,
+           EXISTS (SELECT 1 FROM session_restart_notices n
+             WHERE n.command_id=c.command_id AND n.state='delivering') AS restart_notice
+         FROM session_prompt_commands c
          LEFT JOIN workflow_decisions d ON d.resume_command_id=c.command_id AND d.resume_state='delivering'
          WHERE c.session_id=? AND c.state IN ('pending','sent','accepted','queued','started')`,
-      ).all(sessionId) as Array<{ command_id: string; state: SessionPromptCommandState; occurrence_id: string | null }>;
+      ).all(sessionId) as Array<{
+        command_id: string; state: SessionPromptCommandState; occurrence_id: string | null; restart_notice: number;
+      }>;
       let cancelled = 0;
       for (const row of rows) {
-        if (keepWorkflowDecisionResumes && row.occurrence_id) continue;
+        if ((keepWorkflowDecisionResumes && row.occurrence_id) || (keepRestartNotices && row.restart_notice)) continue;
         // `sent` is mark-before-send, so only a never-attempted pending row is definitely cancelled.
         // Anything later may already have reached provider admission and is explicitly uncertain.
         const state = row.state === "pending" ? "failed" : "uncertain";
