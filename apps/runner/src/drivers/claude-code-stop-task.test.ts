@@ -213,8 +213,8 @@ test("an answer without Claude's report leaves the job as it was (#1780)", async
   await nextTask();
   const late = h.background.at(-1)!;
   assert.deepEqual(late.pendingTaskIds, ["shell-2"]);
-  assert.deepEqual(late.terminalJobs?.map((job) => [job.id, job.status, job.endedByRunner, job.stopConfirmedLate]),
-    [["monitor-1", "killed", undefined, true]]);
+  assert.deepEqual(late.terminalJobs?.map((job) => [job.id, job.status, job.endedByRunner, job.stopConfirmedLate, job.stoppedByModel]),
+    [["monitor-1", "killed", undefined, true, undefined]]);
   assert.equal(late.terminalJobs?.[0]?.continuationRequired, true, "outside a turn, the provider is told the job ended");
   frame(child, { type: "system", subtype: "task_notification", task_id: "monitor-1", status: "stopped" });
   await nextTask();
@@ -380,7 +380,10 @@ test("a job Claude stops on its own ends as killed and no longer holds its sibli
   assert.equal(h.background.at(-1)?.state, "running");
   assert.deepEqual(h.background.at(-1)?.pendingTaskIds, ["shell-2"], "the stopped job is no longer running");
   const ended = h.background.flatMap((update) => update.terminalJobs ?? []);
-  assert.deepEqual(ended.map((job) => [job.id, job.status, job.endedByRunner]), [["monitor-1", "killed", undefined]]);
+  // The model stopped it inside its own turn, so no continuation is needed to tell it, although an
+  // earlier turn launched the job (#1855).
+  assert.deepEqual(ended.map((job) => [job.id, job.status, job.endedByRunner, job.continuationRequired, job.stoppedByModel]),
+    [["monitor-1", "killed", undefined, false, true]]);
   assert.equal(h.frames.some((value) => value.type === "control_request"), false, "Wollipog asked for nothing");
 
   // Claude may repeat its report; the ended job is not revived, and its sibling still completes.
@@ -389,7 +392,30 @@ test("a job Claude stops on its own ends as killed and no longer holds its sibli
   await nextTask();
   assert.equal(h.background.at(-1)?.state, null);
   assert.deepEqual(h.background.at(-1)?.pendingTaskIds, []);
-  assert.equal(h.background.flatMap((update) => update.terminalJobs ?? []).length, 2, "each job ends once");
+  const all = h.background.flatMap((update) => update.terminalJobs ?? []);
+  assert.equal(all.length, 2, "each job ends once");
+  assert.deepEqual(all.map((job) => [job.id, job.continuationRequired, job.stoppedByModel]),
+    [["monitor-1", false, true], ["shell-2", true, undefined]], "the sibling's result is still delivered");
+  h.driver.dispose();
+});
+
+test("a job the model stops in the turn that launched it is marked as the model's stop (#1855)", async () => {
+  const h = harness();
+  const turn = h.driver.prompt("start a monitor, then stop it");
+  await nextTask();
+  const child = h.spawned[0];
+  taskStarted(child, "monitor-1", "toolu_monitor");
+  frame(child, { type: "assistant", message: { content: [
+    { type: "tool_use", id: "toolu_stop", name: "TaskStop", input: { task_id: "monitor-1" } },
+  ] } });
+  killedReport(child, "monitor-1", "toolu_monitor");
+  frame(child, { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_stop", content: "ok" }] } });
+  frame(child, { type: "result", subtype: "success" });
+  assert.equal(await turn, "end_turn");
+  assert.deepEqual(h.background.flatMap((update) => update.terminalJobs ?? [])
+    .map((job) => [job.id, job.status, job.continuationRequired, job.stoppedByModel]),
+  [["monitor-1", "killed", false, true]]);
+  assert.deepEqual(h.background.at(-1)?.pendingTaskIds, []);
   h.driver.dispose();
 });
 
@@ -435,6 +461,59 @@ test("only a report inside the model's own stop call ends the job it named", asy
   h.driver.dispose();
 });
 
+test("a stop call left outstanding by a cancelled turn proves nothing in a later turn (#1855)", async () => {
+  // Cancelling retires the process, so each spawn gets its own stdin.
+  const spawned: any[] = [];
+  const background: DriverBackgroundWorkUpdate[] = [];
+  const driver = new ClaudeCodeDriver(baseOpts, {
+    onEvent: () => {},
+    onStderr: () => {},
+    onExit: () => {},
+    onBackgroundWork: (update) => background.push(update),
+  }, {
+    spawn: () => {
+      const child = fakeProcess(new PassThrough());
+      spawned.push(child);
+      return child;
+    },
+    kill: () => {},
+    setTimer: () => ({ unref() {} }) as any,
+    clearTimer: () => {},
+  } as any);
+  const first = driver.prompt("watch CI");
+  await nextTask();
+  taskStarted(spawned[0], "monitor-1", "toolu_monitor");
+  frame(spawned[0], { type: "result", subtype: "success" });
+  assert.equal(await first, "end_turn");
+
+  const cancelled = driver.prompt("stop the monitor");
+  await nextTask();
+  frame(spawned[0], { type: "assistant", message: { content: [
+    { type: "tool_use", id: "toolu_stop", name: "TaskStop", input: { task_id: "monitor-1" } },
+  ] } });
+  await nextTask();
+  // The turn ends without the call's tool result or the turn's own result.
+  driver.cancel();
+  assert.equal(await cancelled, "cancelled");
+  spawned[0].emit("close", 0);
+
+  const later = driver.prompt("carry on");
+  await nextTask();
+  await nextTask();
+  const child = spawned.at(-1);
+  assert.notEqual(child, spawned[0]);
+  killedReport(child, "monitor-1", "toolu_monitor");
+  await nextTask();
+  // The leftover call still ends the job as #1847 does, but it is not the model's stop in this turn,
+  // so the job keeps its continuation.
+  assert.deepEqual(background.flatMap((update) => update.terminalJobs ?? [])
+    .map((job) => [job.id, job.status, job.continuationRequired, job.stoppedByModel]),
+  [["monitor-1", "killed", true, undefined]]);
+  frame(child, { type: "result", subtype: "success" });
+  assert.equal(await later, "end_turn");
+  driver.dispose();
+});
+
 test("a subagent's result does not close the model's stop call", async () => {
   const h = harness();
   const child = await launchTwoTasks(h);
@@ -471,6 +550,7 @@ test("a model stop outstanding for the task outranks an earlier unconfirmed runn
   frame(child, { type: "result", subtype: "success" });
   assert.equal(await turn, "end_turn");
   const ended = h.background.flatMap((update) => update.terminalJobs ?? []);
-  assert.deepEqual(ended.map((job) => [job.id, job.status, job.stopConfirmedLate]), [["monitor-1", "killed", undefined]]);
+  assert.deepEqual(ended.map((job) => [job.id, job.status, job.stopConfirmedLate, job.stoppedByModel, job.continuationRequired]),
+    [["monitor-1", "killed", undefined, true, false]]);
   h.driver.dispose();
 });

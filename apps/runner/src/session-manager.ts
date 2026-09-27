@@ -1296,6 +1296,9 @@ export class SessionManager {
    * provider carries it out later, the job is still that actor's stop. Bounded like the driver's
    * own record, and dropped once the job reports a terminal status. */
   private readonly unconfirmedJobStops = new Map<string, Map<string, BackgroundJobStopActor>>();
+  /** Jobs the model stopped itself during the session's current runner turn (#1855). That turn's
+   * outcome decides whether they are settled or get their continuation back. */
+  private readonly modelStoppedJobs = new Map<string, { turnId: string; jobIds: Set<string> }>();
   private readonly activeTurnAdmitted = new Set<string>();
   private activeTurnRetryTimer: ReturnType<typeof setTimeout> | null = null;
   /** Parking retirements remain serialized while an exact exit is pending. Once an attempt settles
@@ -12212,6 +12215,7 @@ export class SessionManager {
       if (stop !== "cancelled" && stop !== "refusal") {
         this.finishParentTurnBackgroundJobs(sessionId, queued.id);
       }
+      this.settleModelStoppedJobs(sessionId, queued.id, stop !== "cancelled" && stop !== "refusal");
       if (!this.active.has(sessionId)) {
         durable?.uncertain("session stopped while provider execution was in progress");
         return;
@@ -12280,6 +12284,7 @@ export class SessionManager {
       }
       entry.currentBackgroundJobIds = undefined;
     } catch (err) {
+      this.settleModelStoppedJobs(sessionId, queued.id, false);
       if (backgroundJobIds?.length && !entry.backgroundPromptAccepted) {
         this.resetBackgroundContinuationSubmission(sessionId, backgroundJobIds);
         this.scheduleBackgroundContinuation(sessionId, ORPHAN_RECOVERY_RETRY_MS);
@@ -15538,12 +15543,25 @@ export class SessionManager {
     });
     for (const job of update.terminalJobs ?? []) unconfirmedStops?.delete(job.id);
     if (unconfirmedStops?.size === 0) this.unconfirmedJobStops.delete(sessionId);
+    // The model stopped these jobs itself (#1855). In a runner turn, that turn's outcome settles them
+    // (settleModelStoppedJobs). A provider-initiated turn has no such outcome, and a runner prompt
+    // waiting behind it may already hold the active turn id, so its stops are settled at once.
+    const active = this.active.get(sessionId);
+    const stoppedByModel = (update.terminalJobs ?? []).filter((job) => job.stoppedByModel).map((job) => job.id);
+    const runnerTurnId = active && !active.providerInitiatedTurnActive ? active.activeTurnId : undefined;
+    if (runnerTurnId !== undefined && stoppedByModel.length > 0) {
+      const tracked = this.modelStoppedJobs.get(sessionId);
+      const jobIds = tracked?.turnId === runnerTurnId ? tracked.jobIds : new Set<string>();
+      for (const id of stoppedByModel) jobIds.add(id);
+      this.modelStoppedJobs.set(sessionId, { turnId: runnerTurnId, jobIds });
+    }
     const { jobs: backgroundJobs, queuedJobIds } = this.mergeDurableBackgroundJobs(
       current,
       update,
-      this.active.get(sessionId)?.activeTurnId,
+      active?.activeTurnId,
       ending ? { actor: ending.actor, reason: ending.reason, endedAt: ending.endedAt } : undefined,
       new Map(confirmedLate.map(({ job, end }) => [job.id, end])),
+      runnerTurnId === undefined ? new Set(stoppedByModel) : new Set(),
     );
     const observedTaskIds = update.observedTaskIds ?? [];
     // A killed job leaves a task file with no completion marker, whether Wollipog ended it (#1778)
@@ -15662,6 +15680,7 @@ export class SessionManager {
     activeTurnId: string | undefined,
     end?: BackgroundJobEnd,
     lateStops: ReadonlyMap<string, BackgroundJobEnd> = new Map(),
+    settledModelStops: ReadonlySet<string> = new Set(),
   ): { jobs: DurableBackgroundJob[]; queuedJobIds: string[] } {
     const byId = new Map((current.backgroundJobs ?? []).map((job) => [job.id, { ...job }]));
     const findAlias = (id: string, toolUseId?: string) => byId.get(id) ?? (toolUseId
@@ -15708,6 +15727,11 @@ export class SessionManager {
       durable.continuationRequired = terminal.continuationRequired;
       if (terminal.endedByRunner && end) durable.endedBy = end;
       else if (lateStops.has(terminal.id)) durable.endedBy = lateStops.get(terminal.id);
+      // The model stopped the job itself outside a runner turn, so the result is already in its
+      // conversation and its launching turn, which may have ended long ago, will not settle it (#1855).
+      if (terminal.stoppedByModel && settledModelStops.has(terminal.id)) {
+        durable.assistantResultPersistedAt ??= terminal.terminalAt;
+      }
     }
 
     const terminalCandidates = [...byId.values()].filter((job) => job.terminalObservedAt &&
@@ -15725,8 +15749,11 @@ export class SessionManager {
           .filter((job) => job.parentTurnId === parentTurnId);
         const continuationId = barrierJobs.find((job) => job.continuationId)?.continuationId ??
           `bgcont_${randomUUID()}`;
+        // A job that already has its own id keeps it: an overflow split or a restored model stop
+        // (#1855) is queued apart from a continuation that does not name it, and delivery proof is
+        // keyed by that id.
         for (const job of barrierJobs) {
-          job.continuationId = continuationId;
+          job.continuationId ??= continuationId;
           job.continuationQueuedAt ??= queuedAt;
         }
       }
@@ -16205,6 +16232,45 @@ export class SessionManager {
       return { ...job, assistantResultPersistedAt: persistedAt };
     });
     if (changed) this.store.patchMeta(sessionId, { backgroundJobs });
+  }
+
+  /** A job the model stopped itself during a runner turn needs no continuation once that turn
+   * completes: it is settled like a job the turn launched (#1855). If the turn was cancelled or
+   * failed, the model may never have seen its stop succeed, so the job gets back the continuation
+   * it would otherwise have had. It still waits for any unfinished sibling from its launching turn,
+   * and it gets a continuation id of its own: a sibling's continuation may already be queued with a
+   * prompt that does not name it, and delivery proof is keyed by that id. */
+  private settleModelStoppedJobs(sessionId: string, turnId: string, completed: boolean): void {
+    const tracked = this.modelStoppedJobs.get(sessionId);
+    if (tracked?.turnId !== turnId) return;
+    this.modelStoppedJobs.delete(sessionId);
+    const current = this.store.readMeta(sessionId);
+    if (!current?.backgroundJobs) return;
+    const now = Date.now();
+    const backgroundJobs = current.backgroundJobs.map((job) => ({ ...job }));
+    const changed = backgroundJobs.filter((job) => tracked.jobIds.has(job.id) && !job.continuationRequired &&
+      job.assistantResultPersistedAt === undefined);
+    if (changed.length === 0) return;
+    const restored = completed ? [] : changed;
+    for (const job of changed) {
+      if (completed) job.assistantResultPersistedAt = now;
+      else job.continuationRequired = true;
+    }
+    const continuationIds = new Map<string, string>();
+    for (const job of restored) {
+      const siblingRunning = backgroundJobs.some((other) => other.parentTurnId === job.parentTurnId &&
+        !other.terminalObservedAt && !other.assistantResultPersistedAt);
+      if (siblingRunning) continue;
+      if (!continuationIds.has(job.parentTurnId)) continuationIds.set(job.parentTurnId, `bgcont_${randomUUID()}`);
+      job.continuationId = continuationIds.get(job.parentTurnId);
+      job.continuationQueuedAt = now;
+    }
+    const updated = this.store.patchMeta(sessionId, {
+      backgroundJobs,
+      ...(completed ? {} : { backgroundWorkState: managedBackgroundWorkState(backgroundJobs) }),
+    });
+    if (updated) this.send({ type: "session_runtime_updated", snapshot: this.snapshot(updated) });
+    if (continuationIds.size > 0) this.scheduleBackgroundContinuation(sessionId);
   }
 
   /** Automatic background work must not turn a restart into new spending authority. */
