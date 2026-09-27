@@ -13,6 +13,7 @@ for (const [name, value] of Object.entries({
   window: domWindow,
   document: domWindow.document,
   navigator: domWindow.navigator,
+  Element: domWindow.Element,
   HTMLElement: domWindow.HTMLElement,
   Node: domWindow.Node,
   React,
@@ -68,6 +69,11 @@ async function mount(view: SessionView, usage: SessionUsageResponse | Error | nu
     popover: () => container.querySelector<HTMLElement>(".session-usage-popover"),
     async open() {
       await act(async () => { container.querySelector<HTMLButtonElement>(".session-cost-button")!.click(); });
+    },
+    async rerender(next: SessionView) {
+      await act(async () => {
+        root.render(<ApiProvider client={client}><SessionUsageControl session={next} /></ApiProvider>);
+      });
     },
     async cleanup() {
       await act(async () => { root.unmount(); });
@@ -133,11 +139,135 @@ test("Escape dismisses the popover and the control keeps its own accessible name
   const view = await mount(session(), { sessionId: "s1", totals: amount(), byModel: [] });
   await view.open();
   assert.ok(view.popover());
+  // The session view's own Escape handler skips a prevented key, so consuming it keeps one Escape
+  // from also leaving the session (#1796).
+  const escape = new domWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  let reachedView = false;
+  const onViewKey = () => { reachedView = true; };
+  domWindow.addEventListener("keydown", onViewKey);
   await act(async () => {
-    domWindow.document.dispatchEvent(new domWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true }) as never);
+    view.button()!.dispatchEvent(escape as never);
   });
+  domWindow.removeEventListener("keydown", onViewKey);
   assert.equal(view.popover(), null);
   assert.equal(view.button()!.getAttribute("aria-expanded"), "false");
+  assert.equal(escape.defaultPrevented, true);
+  assert.equal(reachedView, false, "a view-level Escape handler never sees the key that closed the popover");
+  await view.cleanup();
+});
+
+test("a modal opened over the popover keeps the first Escape", async () => {
+  const view = await mount(session(), { sessionId: "s1", totals: amount(), byModel: [] });
+  await view.open();
+  const modal = domWindow.document.createElement("div");
+  modal.setAttribute("role", "dialog");
+  modal.setAttribute("aria-modal", "true");
+  domWindow.document.body.append(modal);
+  const escape = new domWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  await act(async () => {
+    modal.dispatchEvent(escape);
+  });
+  assert.ok(view.popover(), "the popover beneath the modal stays open");
+  assert.equal(escape.defaultPrevented, false, "the modal's own Escape handling still sees the key");
+  modal.remove();
+  await act(async () => {
+    view.button()!.dispatchEvent(new domWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }) as never);
+  });
+  assert.equal(view.popover(), null);
+  await view.cleanup();
+});
+
+test("a menu opened over the popover from the keyboard keeps the first Escape", async () => {
+  const view = await mount(session(), { sessionId: "s1", totals: amount(), byModel: [] });
+  await view.open();
+  const menu = domWindow.document.createElement("div");
+  menu.setAttribute("role", "menu");
+  domWindow.document.body.append(menu);
+  const escape = new domWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  await act(async () => {
+    menu.dispatchEvent(escape);
+  });
+  assert.ok(view.popover(), "the popover beneath the menu stays open");
+  assert.equal(escape.defaultPrevented, false);
+  menu.remove();
+  await view.cleanup();
+});
+
+test("a non-modal popup dialog opened over the popover keeps the first Escape", async () => {
+  // The session header's hidden-status list is a `role="dialog"` popup without aria-modal.
+  const view = await mount(session(), { sessionId: "s1", totals: amount(), byModel: [] });
+  await view.open();
+  const popup = domWindow.document.createElement("div");
+  popup.setAttribute("role", "dialog");
+  popup.setAttribute("aria-label", "Session Statuses");
+  domWindow.document.body.append(popup);
+  const escape = new domWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  await act(async () => {
+    popup.dispatchEvent(escape);
+  });
+  assert.ok(view.popover());
+  assert.equal(escape.defaultPrevented, false);
+  popup.remove();
+  await view.cleanup();
+});
+
+test("a field that focus has moved on to keeps its own Escape while the popover closes", async () => {
+  const view = await mount(session(), { sessionId: "s1", totals: amount(), byModel: [] });
+  await view.open();
+  const field = domWindow.document.createElement("textarea");
+  domWindow.document.body.append(field);
+  field.focus();
+  const escape = new domWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  await act(async () => {
+    field.dispatchEvent(escape);
+  });
+  assert.equal(view.popover(), null);
+  assert.equal(escape.defaultPrevented, false, "the composer's own Escape (closing its suggestions, blurring) still runs");
+  assert.equal(domWindow.document.activeElement, field as never, "focus is not pulled back to the chip");
+  field.remove();
+  await view.cleanup();
+});
+
+test("an IME's composition Escape neither closes the popover nor is consumed", async () => {
+  const view = await mount(session(), { sessionId: "s1", totals: amount(), byModel: [] });
+  await view.open();
+  const escape = new domWindow.KeyboardEvent("keydown", { key: "Escape", isComposing: true, bubbles: true, cancelable: true });
+  await act(async () => {
+    view.button()!.dispatchEvent(escape as never);
+  });
+  assert.ok(view.popover());
+  assert.equal(escape.defaultPrevented, false);
+  await view.cleanup();
+});
+
+test("Escape passes through once the open control has stopped rendering", async () => {
+  // Usage that never arrives keeps the label on the session snapshot, so zeroing it unrenders the chip.
+  const view = await mount(session(), null);
+  await view.open();
+  assert.ok(view.popover());
+  await view.rerender(session({ tokensIn: 0, tokensOut: 0, costUsd: 0 }));
+  assert.equal(view.button(), null);
+  const escape = new domWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  await act(async () => {
+    domWindow.document.body.dispatchEvent(escape);
+  });
+  assert.equal(escape.defaultPrevented, false, "no visible popover, so the session's own Escape still runs");
+  await view.rerender(session());
+  assert.equal(view.popover(), null, "the stale open state was cleared rather than reappearing");
+  await view.cleanup();
+});
+
+test("Escape from inside the popover returns focus to the cost chip", async () => {
+  const view = await mount(session({ driver: "codex-app-server" }), { sessionId: "s1", totals: amount(), byModel: [] });
+  await view.open();
+  const info = view.popover()!.querySelector<HTMLButtonElement>('[aria-label="About Codex App Server Usage"]')!;
+  info.focus();
+  assert.equal(domWindow.document.activeElement, info as never);
+  await act(async () => {
+    info.dispatchEvent(new domWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }) as never);
+  });
+  assert.equal(view.popover(), null);
+  assert.equal(domWindow.document.activeElement, view.button() as never);
   await view.cleanup();
 });
 

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
+import { isEditableShortcutTarget } from "../shortcuts.js";
 
 export interface AnchoredPopover<Root extends HTMLElement, Anchor extends HTMLElement> {
   open: boolean;
@@ -17,6 +18,8 @@ const GAP = 6;
 const MARGIN = 8;
 /** Below this, a side is too cramped to host the panel at all and anchoring is abandoned. */
 const MIN_HEIGHT = 120;
+/** Layers that can open over a panel and own Escape. Each renders only while open. */
+const OVERLYING_LAYERS = '[aria-modal="true"], [role="dialog"], [role="menu"]';
 
 export interface Placement {
   left: number;
@@ -79,8 +82,15 @@ function clamp(value: number, min: number, max: number): number {
  * VIEWPORT from the trigger's rectangle rather than flowing inside an ancestor that would cut it
  * off. Placed below when there is room, else above. Escape and an outside pointer close it, both
  * on the capture phase so a view-level Escape handler that stops propagation (the composer's, the
- * menus') cannot swallow the key while this panel is the thing the user is trying to close. A
- * nested popover can consume Escape so one key closes only the innermost layer.
+ * menus') cannot swallow the key while this panel is the thing the user is trying to close.
+ *
+ * Escape is consumed by default, so one key closes only this layer (#718): a view's own Escape
+ * handler — the session view's return to the Sessions list — would otherwise run on the same key
+ * press and remove the layer beneath too (#1796). A caller that really wants the key to continue
+ * opts out with `consumeEscape: false`. A dialog or menu opened over the panel takes Escape first,
+ * a field that focus has moved on to keeps its own Escape, and an IME's composition Escape is left
+ * alone. When focus was inside the popover, Escape returns it to the trigger rather than letting it
+ * fall to the document as the panel unmounts.
  *
  * Placement runs in a LAYOUT effect: the panel's un-placed fallback position is absolute, and a
  * status-strip track clips overflow, so a passive effect would let one clipped frame paint.
@@ -91,7 +101,7 @@ function clamp(value: number, min: number, max: number): number {
 export function useAnchoredPopover<Root extends HTMLElement, Anchor extends HTMLElement>(
   size: { width: number; height: number; consumeEscape?: boolean },
 ): AnchoredPopover<Root, Anchor> {
-  const { width, height, consumeEscape = false } = size;
+  const { width, height, consumeEscape = true } = size;
   const [open, setOpen] = useState(false);
   const [placement, setPlacement] = useState<Placement | null>(null);
   const rootRef = useRef<Root | null>(null);
@@ -120,11 +130,28 @@ export function useAnchoredPopover<Root extends HTMLElement, Anchor extends HTML
   useEffect(() => {
     if (!open) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (consumeEscape) {
+      // An IME's Escape cancels its composition, not this panel.
+      if (event.key !== "Escape" || event.isComposing || event.keyCode === 229) return;
+      const root = rootRef.current;
+      // The control stopped rendering while open (its session no longer qualifies for it): nothing
+      // is left on screen to close, so the key belongs to whatever handles it next.
+      if (!root?.isConnected) {
+        setOpen(false);
+        return;
+      }
+      // A layer opened over the panel from the keyboard (the Search palette, a dialog, a menu) is
+      // the top layer and owns this key; the panel waits beneath it for the next Escape.
+      if (Array.from(document.querySelectorAll(OVERLYING_LAYERS)).some((layer) => !layer.contains(root))) return;
+      // A key bound for a field focus has moved on to (the composer and its suggestions, a terminal)
+      // keeps that field's own Escape; the panel still closes with it, as it always has.
+      const target = event.target instanceof Node ? event.target : null;
+      const fieldOwnsKey = target !== null && !root.contains(target) && isEditableShortcutTarget(target);
+      if (consumeEscape && !fieldOwnsKey) {
         event.preventDefault();
         event.stopPropagation();
       }
+      const active = document.activeElement;
+      if (active && active !== anchorRef.current && root.contains(active)) anchorRef.current?.focus();
       setOpen(false);
     };
     const onPointer = (event: PointerEvent) => {
