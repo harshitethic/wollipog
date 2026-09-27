@@ -962,6 +962,91 @@ test("an unavailable alternate installation is visible on the automation card", 
   }
 });
 
+test("a waiting target's resolution error is visible on its automation card", async () => {
+  const stored = schedule("waiting-target", "Waiting Target");
+  stored.targetHealth = {
+    scheduledFor: 60_000, firstSeenAt: 60_001,
+    error: "No configured automation target is available. Check that its Machine is online.",
+  };
+  const fixture = await mountFixture([stored]);
+  try {
+    assert.match(cardToggle(fixture.container, "Waiting Target").textContent ?? "", /Target Unavailable/);
+    await expandCard(fixture, "Waiting Target");
+    assert.match(fixture.container.querySelector('[role="alert"]')?.textContent ?? "",
+      /Waiting for target: No configured automation target is available/);
+  } finally {
+    await unmountFixture(fixture);
+  }
+});
+
+test("a legacy create-session Agent with one installation is shown as available", async () => {
+  const machine = { ...runners[0]!, protocolVersion: 175, agents: [{
+    ...runners[0]!.agents[0]!, installation: {
+      id: "system", path: "/usr/bin/claude", via: "path" as const, selection: "selected" as const,
+    },
+  }] };
+  const stored = schedule("legacy-installation", "Legacy Installation");
+  const fixture = await mountFixture([stored], {}, {}, [], {}, [machine]);
+  try {
+    await expandCard(fixture, "Legacy Installation");
+    assert.doesNotMatch(fixture.container.textContent ?? "",
+      /Saved Agent Harness installation unavailable or unbound/);
+    await act(async () => { button(fixture.container, "Edit").click(); });
+    assert.doesNotMatch(fixture.container.textContent ?? "",
+      /The saved Agent Harness installation is unavailable or unbound/);
+  } finally {
+    await unmountFixture(fixture);
+  }
+});
+
+test("an explicit empty installation binding remains visibly blocked", async () => {
+  const machine = { ...runners[0]!, protocolVersion: 175, agents: [{
+    ...runners[0]!.agents[0]!, installation: {
+      id: "system", path: "/usr/bin/claude", via: "path" as const, selection: "selected" as const,
+    },
+  }] };
+  const stored = schedule("explicit-unbound", "Explicit Unbound");
+  if (stored.action.kind !== "create_session") throw new Error("expected create-session action");
+  stored.action.installationBindings = {};
+  const fixture = await mountFixture([stored], {}, {}, [], {}, [machine]);
+  try {
+    await expandCard(fixture, "Explicit Unbound");
+    assert.match(fixture.container.textContent ?? "",
+      /Saved Agent Harness installation unavailable or unbound/);
+    await act(async () => { button(fixture.container, "Edit").click(); });
+    assert.match(fixture.container.textContent ?? "",
+      /The saved Agent Harness installation is unavailable or unbound/);
+  } finally {
+    await unmountFixture(fixture);
+  }
+});
+
+test("legacy alternate targets auto-pin while explicitly unbound alternates warn in both views", async () => {
+  const alternate = { ...runners[1]!, protocolVersion: 175, agents: [{
+    ...runners[1]!.agents[0]!, installation: {
+      id: "system", path: "/usr/bin/claude", via: "path" as const, selection: "selected" as const,
+    },
+  }] };
+  for (const explicit of [false, true]) {
+    const stored = schedule(`alternate-${explicit}`, `Alternate ${explicit}`);
+    stored.runnerPolicy = { kind: "alternate", targets: [{
+      runnerId: "runner-2", workspaceId: "runner-2-workspace", agentId: "alternate-agent",
+      ...(explicit ? { installationBindings: {} } : {}),
+    }] };
+    const fixture = await mountFixture([stored], {}, {}, [], {}, [runners[0]!, alternate]);
+    try {
+      await expandCard(fixture, stored.name);
+      assert.equal(/Saved Agent Harness installation unavailable or unbound/.test(
+        fixture.container.textContent ?? ""), explicit);
+      await act(async () => { button(fixture.container, "Edit").click(); });
+      assert.equal(/The alternate Agent Harness installation is unavailable or unbound/.test(
+        fixture.container.textContent ?? ""), explicit);
+    } finally {
+      await unmountFixture(fixture);
+    }
+  }
+});
+
 test("automation cards are collapsed by default and render only their headers", async () => {
   const fixture = await mountFixture([
     schedule("automation-a", "Alpha"),

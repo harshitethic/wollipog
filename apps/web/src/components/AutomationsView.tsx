@@ -88,12 +88,14 @@ function AutomationCard({
   name,
   action,
   enabled,
+  unhealthy,
   children,
 }: {
   id: string;
   name: string;
   action: string;
   enabled: boolean;
+  unhealthy: boolean;
   children: ReactNode;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -115,6 +117,7 @@ function AutomationCard({
             <span className="automation-card-action">{action}</span>
           </span>
           <span className="automation-card-meta">
+            {unhealthy && <span className="automation-state unhealthy">Target Unavailable</span>}
             <span className={`automation-state ${enabled ? "enabled" : "paused"}`}>{enabled ? "Enabled" : "Paused"}</span>
             <span className="automation-card-chevron" aria-hidden="true">▸</span>
           </span>
@@ -244,6 +247,13 @@ export function AutomationsView() {
       ? { driver: agent.driver ?? "acp", context: agent.context ?? { kind: "native" as const },
           installationId: agent.installation.id } : null;
   };
+  const unboundInstallationUnavailable = (
+    runner: typeof selectedRunner, agentId: string, mayAutoPin: boolean,
+  ) => {
+    const installed = runner?.agents.filter((agent) => agent.id === agentId && agent.installation) ?? [];
+    return !runner?.agents.some((agent) => agent.id === agentId && !agent.installation) &&
+      !(mayAutoPin && installed.length === 1 && installationFor(runner, agentId));
+  };
   const resolvedInstallationAgentId = (runner: typeof selectedRunner, saved: {
     driver: string; context: { kind: string; distro?: string }; installationId: string;
   }) => runner?.agents.find((agent) => {
@@ -259,7 +269,8 @@ export function AutomationsView() {
     editingSpec.action.request.runnerId === form.runnerId && !rebindPrimary
     ? editingSpec.action.installationBindings?.agent
       ? !bindingAvailable(selectedRunner, editingSpec.action.installationBindings.agent)
-      : !selectedRunner?.agents.some((agent) => agent.id === form.agentId && !agent.installation)
+      : unboundInstallationUnavailable(selectedRunner, form.agentId,
+        editingSpec.action.installationBindings === undefined)
     : false;
   const carriedAlternateRunnerIds = new Set(editingSpec?.runnerPolicy.kind === "alternate" &&
       editingSpec.action.kind === form.actionKind &&
@@ -833,7 +844,8 @@ export function AutomationsView() {
                   if (!oldTarget || oldTarget.runnerId !== form.fallbackRunnerId) return null;
                   const reference = oldTarget.installationBindings?.agent;
                   const unavailable = reference ? !bindingAvailable(selectedFallback, reference)
-                    : !selectedFallback?.agents.some((agent) => agent.id === form.fallbackAgentId && !agent.installation);
+                    : unboundInstallationUnavailable(selectedFallback, form.fallbackAgentId,
+                      oldTarget.installationBindings === undefined);
                   return unavailable ? <div className="automation-error automation-span" role="alert">
                     The alternate Agent Harness installation is unavailable or unbound.
                     <button type="button" className="btn ghost sm"
@@ -886,8 +898,7 @@ export function AutomationsView() {
           const unavailableInstallation = savedBindings && Object.values(savedBindings)
             .some((binding) => !bindingAvailable(actionRunner, binding));
           const unboundInstallation = item.action.kind === "create_session" && !savedBindings?.agent &&
-            !actionRunner?.agents.some((agent) => agent.id ===
-              (item.action.kind === "create_session" ? item.action.request.agentId : "") && !agent.installation);
+            unboundInstallationUnavailable(actionRunner, item.action.request.agentId, savedBindings === undefined);
           const workflowAction = item.action.kind === "workflow_run" ? item.action : null;
           const unboundWorkflow = workflowAction !== null && (() => {
             const workflow = workflows.find((definition) =>
@@ -911,8 +922,8 @@ export function AutomationsView() {
               const bindings = target.installationBindings;
               if (Object.values(bindings ?? {}).some((binding) => !bindingAvailable(runner, binding))) return true;
               if (item.action.kind === "create_session") {
-                return !bindings?.agent && !runner?.agents.some((agent) =>
-                  agent.id === target.agentId && !agent.installation);
+                return !bindings?.agent &&
+                  unboundInstallationUnavailable(runner, target.agentId!, bindings === undefined);
               }
               if (!workflowAction) return false;
               const workflow = workflows.find((definition) =>
@@ -930,9 +941,12 @@ export function AutomationsView() {
               return unboundRole || Boolean(orchestrator && !bindings?.orchestrator &&
                 !runner?.agents.some((agent) => agent.id === orchestrator && !agent.installation));
             });
-          return <AutomationCard key={item.automationId} id={item.automationId} name={item.name} action={actionSummary(item.action)} enabled={item.enabled}>
+          return <AutomationCard key={item.automationId} id={item.automationId} name={item.name} action={actionSummary(item.action)} enabled={item.enabled} unhealthy={Boolean(item.targetHealth)}>
             {(unavailableInstallation || unboundInstallation || unboundWorkflow || unboundOrchestrator || unavailableAlternate) && <p className="automation-execution-error" role="alert">
               Saved Agent Harness installation unavailable or unbound. Edit this automation to choose an available installation.
+            </p>}
+            {item.targetHealth && <p className="automation-execution-error" role="alert">
+              Waiting for target: {item.targetHealth.error}
             </p>}
             <dl className="automation-facts"><div><dt>Schedule</dt><dd><code>{item.cron}</code> · {item.timezone}</dd></div><div><dt>Next Fire</dt><dd>{formatTime(item.nextFireAt)}</dd></div><div><dt>Last Result</dt><dd>{latest ? `${titleCaseLabel(latest.status)} · ${formatTime(latest.completedAt ?? latest.startedAt ?? latest.createdAt)}` : "Never"}</dd></div><div><dt>Policies</dt><dd>{titleCaseLabel(item.misfirePolicy.kind)} · {titleCaseLabel(item.runnerPolicy.kind)} · {titleCaseLabel(item.concurrencyPolicy)}</dd></div><div><dt>Ceilings</dt><dd>${item.limits.maxCostUsd} · {item.limits.maxToolCalls} Tools</dd></div></dl>
             {latest?.error && <p className="automation-execution-error">{latest.error}</p>}

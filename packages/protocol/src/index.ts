@@ -7000,6 +7000,8 @@ export interface AutomationSchedule extends AutomationSpec {
   revision: number;
   nextFireAt?: number;
   lastFiredAt?: number;
+  /** Current scheduled occurrence is waiting for target resolution. */
+  targetHealth?: { scheduledFor: number; firstSeenAt: number; error: string };
   createdBy: GovernanceActor;
   createdAt: number;
   updatedAt: number;
@@ -7259,6 +7261,7 @@ export type AutomationAuditEventKind =
   | "disabled"
   | "deleted"
   | "execution_claimed"
+  | "target_unresolved"
   | "execution_status_changed"
   | "command_status_changed"
   | "trigger_created"
