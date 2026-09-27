@@ -1,10 +1,19 @@
-import type { SessionCommandPermission, SessionCommandPermissions, SessionView } from "@wollipog/protocol";
+import {
+  queueHoldRecoveryAction,
+  worktreeRecoveryAction,
+  type SessionCommandPermission,
+  type SessionCommandPermissions,
+  type OrchestratorCampaignProjection,
+  type SessionHoldReader,
+  type SessionView,
+} from "@wollipog/protocol";
 import { isAgentControlApiRouteAllowed } from "./auth.js";
 import {
   AGENT_UNARCHIVE_ERROR,
   agentCredentialSessionTargetError,
   backgroundJobStopAuthorizationError,
   mutationAuthorizationError,
+  orchestratorSelfWorktreeAuthorizationError,
   type AuthPrincipal,
   type HumanPrincipal,
 } from "./identity.js";
@@ -130,26 +139,145 @@ export function sessionCommandPermissions(
   };
 }
 
+/** The routes behind select_worktree and create_worktree, the tools worktree-recovery advice names. */
+const HOLD_ADVICE_WORKTREE_ROUTES = ["/api/sessions/:id/worktrees/select", "/api/sessions/:id/worktrees"] as const;
+
+/**
+ * What an agent credential may do to a held session, for the hold advice it reads through its tools
+ * (#1863): its Stop Job and Restart verdicts, and whether both worktree routes the advice names
+ * admit it. `target.orchestratorPolicy` carries Strict Project Isolation, which only an
+ * Orchestrator's own session can be refused by. A person gets no reader: they read the server's
+ * copy, which the dashboard rewrites for them from their command permissions (#1857).
+ */
+export function sessionHoldReader(
+  principal: AuthPrincipal,
+  target: Pick<SessionView, "id" | "parentSessionId" | "orchestratorPolicy">,
+  facts: SessionCommandPermissionFacts,
+): SessionHoldReader | undefined {
+  if (principal.kind !== "agent") return undefined;
+  const permissions = sessionCommandPermissions(principal, target, facts);
+  const role = principal.orchestrator ? "orchestrator" : null;
+  const canManageWorktrees = HOLD_ADVICE_WORKTREE_ROUTES.every((routePath) =>
+    isAgentControlApiRouteAllowed("POST", routePath, role) &&
+    agentCredentialSessionTargetError(routePath, principal, target.id, facts.isDescendant) === null) &&
+    orchestratorSelfWorktreeAuthorizationError(
+      principal,
+      target.id,
+      target.orchestratorPolicy?.execution.strictProjectIsolation !== false,
+    ) === null;
+  return {
+    canStopJobs: permissions.stopBackgroundJob.allowed,
+    canRestart: permissions.restart.allowed,
+    canManageWorktrees,
+  };
+}
+
+/** A copy of `session` whose hold advice is written for `reader` (#1863). Each hold is rewritten
+ * from the session's own record of it; without a reader the view is returned unchanged. */
+export function withHoldAdviceFor<T extends Pick<SessionView, "holds" | "queueHold" | "worktreeRecovery">>(
+  session: T,
+  reader: SessionHoldReader | undefined,
+): T {
+  if (!reader || !session.holds?.length) return session;
+  const { queueHold, worktreeRecovery } = session;
+  return {
+    ...session,
+    holds: session.holds.map((hold) => {
+      if (hold.kind === "worktree_recovery") {
+        return worktreeRecovery?.recoveryId === hold.holdId
+          ? { ...hold, recoveryAction: worktreeRecoveryAction(worktreeRecovery, reader) }
+          : hold;
+      }
+      return queueHold?.holdId === hold.holdId
+        ? { ...hold, recoveryAction: queueHoldRecoveryAction(queueHold, reader) }
+        : hold;
+    }),
+  };
+}
+
 /** The ownership lookups `withSessionCommandPermissions` needs from the database. */
 export interface SessionCommandPermissionSource {
   isSessionOwner(principal: HumanPrincipal, sessionId: string): boolean;
   isSessionDescendant(ancestorId: string, targetId: string): boolean;
+  /** The records behind a projection's holds, read only for an agent credential's projection. */
+  sessionHoldRecords(ids: readonly string[]): Map<string,
+    Pick<SessionView, "orchestratorPolicy" | "worktreeRecovery" | "queueHold"> & { parentSessionId: string | null }>;
 }
 
-/** A copy of `session` carrying the requester's command permissions. Without a principal (a
- * trusted local connection) the view is returned unchanged, so every command stays offered. */
+function permissionFacts(
+  source: SessionCommandPermissionSource,
+  principal: AuthPrincipal,
+  sessionId: string,
+): SessionCommandPermissionFacts {
+  const credentialSessionId = principal.kind === "agent" ? principal.credentialSessionId : undefined;
+  return {
+    ownsSession: principal.kind === "human" && source.isSessionOwner(principal, sessionId),
+    isDescendant: Boolean(credentialSessionId && source.isSessionDescendant(credentialSessionId, sessionId)),
+  };
+}
+
+/** `sessionHoldReader` with the ownership facts looked up from the database. */
+export function sessionHoldReaderFor(
+  source: SessionCommandPermissionSource,
+  principal: AuthPrincipal | null | undefined,
+  target: Pick<SessionView, "id" | "parentSessionId" | "orchestratorPolicy">,
+): SessionHoldReader | undefined {
+  return principal?.kind === "agent"
+    ? sessionHoldReader(principal, target, permissionFacts(source, principal, target.id))
+    : undefined;
+}
+
+/** A campaign projection whose held children's advice is written for the agent credential reading
+ * it (#1863). The projection spans every campaign descendant, and only a direct child's jobs are
+ * the Orchestrator's to stop. A person's projection is returned unchanged. */
+export function withCampaignHoldAdviceFor<T extends Pick<OrchestratorCampaignProjection, "heldChildren">>(
+  source: SessionCommandPermissionSource,
+  principal: AuthPrincipal | null | undefined,
+  projection: T,
+): T {
+  if (principal?.kind !== "agent" || !projection.heldChildren?.length) return projection;
+  const records = source.sessionHoldRecords(projection.heldChildren.map((child) => child.sessionId));
+  return {
+    ...projection,
+    heldChildren: projection.heldChildren.map((child) => {
+      const record = records.get(child.sessionId);
+      if (!record) return child;
+      // A nested Orchestrator's campaign can list its own session, where its isolation policy decides
+      // whether it may manage its worktrees.
+      const reader = sessionHoldReader(principal, { ...record, id: child.sessionId },
+        permissionFacts(source, principal, child.sessionId));
+      return { ...child, holds: withHoldAdviceFor({ ...record, holds: child.holds }, reader).holds ?? child.holds };
+    }),
+  };
+}
+
+/** A session view whose hold advice is written for the principal reading it (#1863): its own holds
+ * for `reader`, and, when it is an Orchestrator's view, its campaign's held children for
+ * `principal`. A person's view is returned unchanged. */
+export function withSessionHoldAdviceFor<T extends SessionView>(
+  source: SessionCommandPermissionSource,
+  principal: AuthPrincipal | null | undefined,
+  session: T,
+  reader: SessionHoldReader | undefined,
+): T {
+  const view = withHoldAdviceFor(session, reader);
+  return view.orchestratorCampaign
+    ? { ...view, orchestratorCampaign: withCampaignHoldAdviceFor(source, principal, view.orchestratorCampaign) }
+    : view;
+}
+
+/** A copy of `session` carrying the requester's command permissions, and for an agent credential,
+ * hold advice written for it, including its campaign's held children (#1863). Without a principal
+ * (a trusted local connection) the view is returned unchanged, so every command stays offered. */
 export function withSessionCommandPermissions<T extends SessionView>(
   source: SessionCommandPermissionSource,
   principal: AuthPrincipal | null | undefined,
   session: T,
 ): T {
   if (!principal) return session;
-  const credentialSessionId = principal.kind === "agent" ? principal.credentialSessionId : undefined;
-  return {
+  const facts = permissionFacts(source, principal, session.id);
+  return withSessionHoldAdviceFor(source, principal, {
     ...session,
-    commandPermissions: sessionCommandPermissions(principal, session, {
-      ownsSession: principal.kind === "human" && source.isSessionOwner(principal, session.id),
-      isDescendant: Boolean(credentialSessionId && source.isSessionDescendant(credentialSessionId, session.id)),
-    }),
-  };
+    commandPermissions: sessionCommandPermissions(principal, session, facts),
+  }, session.holds?.length ? sessionHoldReader(principal, session, facts) : undefined);
 }

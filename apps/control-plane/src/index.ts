@@ -167,7 +167,12 @@ import { APP_RELEASE_VERSION, RUNNER_RELEASE_TAG } from "./release-version.js";
 import { readSshConfigHosts } from "./ssh-config.js";
 import { ControlPlaneDb, GOVERNANCE_AUDIT_RETENTION_MS } from "./db.js";
 import { registerSessionLookupRoute } from "./session-lookup-route.js";
-import { withSessionCommandPermissions } from "./session-command-permissions.js";
+import {
+  sessionHoldReaderFor,
+  withCampaignHoldAdviceFor,
+  withSessionHoldAdviceFor,
+  withSessionCommandPermissions,
+} from "./session-command-permissions.js";
 import {
   sanitizeSessionNamingCustomModelResult,
   sanitizeSessionNamingRunnerResult,
@@ -3653,7 +3658,10 @@ app.get("/api/sessions/:id/orchestrator-campaign", async (req, reply) => {
   if (principal?.kind !== "agent" || principal.credentialSessionId !== id || !principal.orchestrator) {
     return reply.code(403).send({ error: "a matching Orchestrator session credential is required" });
   }
-  return respond(reply, svc.campaignProjection(id));
+  const projection = svc.campaignProjection(id);
+  return respond(reply, projection.ok && projection.data
+    ? { ...projection, data: withCampaignHoldAdviceFor(db, principal, projection.data) }
+    : projection);
 });
 
 app.post("/api/sessions/:id/orchestrator-campaign/follow-ups", async (req, reply) => {
@@ -3751,6 +3759,10 @@ app.get("/api/sessions/:id/descendant-requests", async (req, reply) => {
     id,
     (sessionId) => db.canAccessSession(principal, sessionId),
     principal.kind === "agent" ? "orchestrator" : "human",
+    true,
+    // A descendant is never the credential's own session, so Strict Project Isolation, which only
+    // refuses an Orchestrator's own worktrees, has no policy to read here.
+    (target) => sessionHoldReaderFor(db, principal, target),
   ));
 });
 
@@ -4196,9 +4208,16 @@ app.post("/api/sessions/:id/prompt", async (req, reply) => {
   // A person sending from the dashboard has the queue in front of them and an explicit Steer
   // control; an agent parent sending to a descendant has neither, which is why its mid-turn
   // message used to vanish (#1406). Give only the agent lane the steer-first admission.
-  return respond(reply, human
-    ? svc.promptFromUser(human.userId, id, text, images, slashCommand, body?.config)
-    : await svc.promptOrSteer(id, text, images, slashCommand, body?.config));
+  if (human) return respond(reply, svc.promptFromUser(human.userId, id, text, images, slashCommand, body?.config));
+  // Hold advice in the refusal, the delivery report and the returned view, including a nested
+  // Orchestrator's campaign, names only the tools this agent credential may call (#1863).
+  const principal = requestPrincipals.get(req) ?? requestPrincipal(req);
+  const target = db.getSession(id);
+  const holdReader = target ? sessionHoldReaderFor(db, principal, target) : undefined;
+  const result = await svc.promptOrSteer(id, text, images, slashCommand, body?.config, holdReader);
+  return respond(reply, result.ok && result.data
+    ? { ...result, data: withSessionHoldAdviceFor(db, principal, result.data, holdReader) }
+    : result);
 });
 
 app.post("/api/sessions/:id/command-invocations", async (req, reply) => {

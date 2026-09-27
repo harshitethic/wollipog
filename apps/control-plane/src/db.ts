@@ -81,6 +81,7 @@ import {
   type ProviderHistoryQuarantineView,
   type WorktreeRecoveryView,
   type HeldSessionResumeView,
+  type SessionHoldReader,
   type SessionHoldView,
   type SessionQueueHoldView,
   type ChildSessionAttentionOwner,
@@ -15720,8 +15721,12 @@ export class ControlPlaneDb {
   }
 
   /** Descendants held from starting their next turn (#1650), without hydrating full views. Only a
-   * live session is held: a terminal one has nothing left to start. */
-  listSessionDescendantHolds(ancestorId: string): Array<{
+   * live session is held: a terminal one has nothing left to start. `readerFor` writes each
+   * session's hold advice for the principal reading it (#1863). */
+  listSessionDescendantHolds(
+    ancestorId: string,
+    readerFor?: (target: { id: string; parentSessionId: string | null }) => SessionHoldReader | undefined,
+  ): Array<{
     id: string;
     title: string;
     runnerId: string;
@@ -15734,7 +15739,8 @@ export class ControlPlaneDb {
         SELECT id FROM sessions WHERE parent_session_id=?
         UNION
         SELECT s.id FROM sessions s JOIN descendants d ON s.parent_session_id=d.id
-      ) SELECT s.id, s.title, s.runner_id, s.event_epoch, s.status, s.worktree_recovery, s.queue_hold
+      ) SELECT s.id, s.parent_session_id, s.title, s.runner_id, s.event_epoch, s.status, s.worktree_recovery,
+               s.queue_hold
         FROM descendants d JOIN sessions s ON s.id=d.id
         WHERE s.id<>?
           AND ((s.worktree_recovery IS NOT NULL AND s.worktree_recovery<>'')
@@ -15742,11 +15748,12 @@ export class ControlPlaneDb {
           AND s.status NOT IN ('completed','failed','stopped')
         ORDER BY s.created_at DESC, s.id ASC
     `).all(ancestorId, ancestorId) as unknown as Array<{
-      id: string; title: string; runner_id: string; event_epoch: number | null; status: SessionStatus;
-      worktree_recovery: string | null; queue_hold: string | null;
+      id: string; parent_session_id: string | null; title: string; runner_id: string; event_epoch: number | null;
+      status: SessionStatus; worktree_recovery: string | null; queue_hold: string | null;
     }>;
     return rows.flatMap((row) => {
-      const holds = this.sessionHoldsFor(row.id, row.worktree_recovery, row.queue_hold);
+      const holds = this.sessionHoldsFor(row.id, row.worktree_recovery, row.queue_hold,
+        readerFor?.({ id: row.id, parentSessionId: row.parent_session_id }));
       return holds.length ? [{
         id: row.id,
         title: row.title,
@@ -15758,16 +15765,43 @@ export class ControlPlaneDb {
     });
   }
 
+  /** The records behind each listed session's holds, so a projection that carries only the holds
+   * can have their advice rewritten for its reader (#1863). The Orchestrator policy is included
+   * because Strict Project Isolation decides whether a nested Orchestrator may manage its own
+   * worktrees. Unknown ids are omitted. */
+  sessionHoldRecords(ids: readonly string[]): Map<string, {
+    parentSessionId: string | null;
+    orchestratorPolicy?: OrchestratorCampaignPolicy;
+    worktreeRecovery?: WorktreeRecoveryView;
+    queueHold?: SessionQueueHoldView;
+  }> {
+    if (!ids.length) return new Map();
+    const rows = this.stmt(
+      `SELECT id, parent_session_id, status, orchestrator_policy, worktree_recovery, queue_hold
+       FROM sessions WHERE id IN (${ids.map(() => "?").join(",")})`,
+    ).all(...ids) as unknown as Array<{
+      id: string; parent_session_id: string | null; status: SessionStatus; orchestrator_policy: string | null;
+      worktree_recovery: string | null; queue_hold: string | null;
+    }>;
+    return new Map(rows.map((row) => [row.id, {
+      parentSessionId: row.parent_session_id,
+      orchestratorPolicy: orchestratorCampaignPolicyFromJson(row.orchestrator_policy) ?? undefined,
+      worktreeRecovery: parseWorktreeRecovery(row.worktree_recovery),
+      queueHold: isTerminal(row.status) ? undefined : parseQueueHold(row.queue_hold),
+    }]));
+  }
+
   /** The holds one stored row implies; resumes are read only while a hold exists. */
   private sessionHoldsFor(
     sessionId: string,
     worktreeRecoveryJson: string | null,
     queueHoldJson: string | null,
+    reader?: SessionHoldReader,
   ): SessionHoldView[] {
     const worktreeRecovery = parseWorktreeRecovery(worktreeRecoveryJson);
     const queueHold = parseQueueHold(queueHoldJson);
     if (!worktreeRecovery && !queueHold) return [];
-    return sessionHolds({ worktreeRecovery, queueHold }, this.workflowDecisionResumesWaitingOnHold(sessionId));
+    return sessionHolds({ worktreeRecovery, queueHold }, this.workflowDecisionResumesWaitingOnHold(sessionId), reader);
   }
 
   /** Resumes a hold keeps from reaching the provider (#1651): the ones the control plane still
