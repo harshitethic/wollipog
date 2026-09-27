@@ -2306,6 +2306,29 @@ export function toolTargetsGuardState(
   return null;
 }
 
+/** File tools that can change a path, unlike Read, Grep, and Glob. */
+const WORKTREE_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
+export const MANAGED_WORKTREE_EDIT_UNRESOLVED_REFUSAL =
+  "Wollipog cannot tell where this relative file-tool path resolves without the managed-worktree guard, so it was not run. Use an absolute path.";
+
+/** Hold Claude's path-bearing edits to the same managed-worktree boundary as `apply_patch`. */
+export function editToolTargetsManagedWorktree(
+  toolName: string,
+  input: unknown,
+  cwd: string | null,
+  protections: readonly ManagedWorktreeProtection[],
+): string | "malformed" | null {
+  if (!WORKTREE_EDIT_TOOLS.has(toolName)) return null;
+  const spec = GUARD_STATE_FILE_TOOLS[toolName]!;
+  const fields = input && typeof input === "object" ? input as Record<string, unknown> : {};
+  const path = fields[spec.key];
+  if (typeof path !== "string" || !path || path.includes("\0")) return "malformed";
+  // Claude's control requests carry no event cwd. A relative path can land differently after a
+  // Bash cd, so the hookless fallback cannot safely locate it. The sidecar passes the real cwd.
+  if (cwd === null && !isAbsolute(path)) return MANAGED_WORKTREE_EDIT_UNRESOLVED_REFUSAL;
+  return pathTargetsManagedWorktree(path, cwd ?? "", protections) ? MANAGED_WORKTREE_REFUSAL : null;
+}
+
 /* ---------------------------------------------------------------------------------------------
  * Codex `apply_patch`.
  *
