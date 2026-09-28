@@ -1,8 +1,25 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { dialogMotionSettled } from "./dialog-motion.js";
 
+/**
+ * A measured length in Chromium's layout unit (1/64px). A box under a transform is measured in
+ * float32, so a 44px control can read 43.99997 (44 - 2^-15): the same 44px of layout, not a shorter
+ * control. Rounding to the unit layout itself uses absorbs that and nothing larger, so a real
+ * 43.9px control still reads below 44.
+ */
+function layoutPx(value: number): number {
+  return Math.round(value * 64) / 64;
+}
+
+test("measured heights are compared in layout units, never forgiving a short control", () => {
+  expect(layoutPx(43.999969482421875), "float32 noise on a 44px box").toBe(44);
+  expect(layoutPx(44.00003), "and above it").toBe(44);
+  expect(layoutPx(43.9), "a genuinely short control").toBeLessThan(44);
+  expect(layoutPx(43.99)).toBeLessThan(44);
+});
+
 async function controlGeometry(control: Locator) {
-  return control.evaluate((element) => {
+  const geometry = await control.evaluate((element) => {
     const rect = element.getBoundingClientRect();
     const style = getComputedStyle(element);
     return {
@@ -15,6 +32,7 @@ async function controlGeometry(control: Locator) {
       paddingBottom: Number.parseFloat(style.paddingBottom),
     };
   });
+  return { ...geometry, height: layoutPx(geometry.height) };
 }
 
 async function openProjectManager(page: Page, projectName = "Alpha") {
@@ -365,11 +383,12 @@ test("desktop can apply a pending Inbox order without losing selection or scroll
   const stationaryToolbar = () => page.locator(".inbox-toolbar-actions > :not(.sr-only, .inbox-order-update)")
     .evaluateAll((elements) => elements.map((element) => {
       const rect = element.getBoundingClientRect();
-      return { className: element.className, left: rect.left, right: rect.right };
+      // The segmented controls by their group name: both are the shared `.seg` (§10.2).
+      return { name: element.getAttribute("aria-label") ?? element.className, left: rect.left, right: rect.right };
     }));
   const toolbarWithoutButton = await stationaryToolbar();
-  expect(toolbarWithoutButton.map(({ className }) => className)).toEqual([
-    "ui-seg sessions-view-toggle", "ui-seg inbox-reminder-view", "inbox-create-menu", "inbox-search",
+  expect(toolbarWithoutButton.map(({ name }) => name)).toEqual([
+    "Sessions View", "Reminder View", "inbox-create-menu", "inbox-search",
   ]);
 
   await page.evaluate(() => {
@@ -383,7 +402,7 @@ test("desktop can apply a pending Inbox order without losing selection or scroll
   await expect(applyOrder).toBeVisible();
   expect(await stationaryToolbar()).toEqual(toolbarWithoutButton);
   const applyOrderBox = await applyOrder.boundingBox();
-  const toggleBox = await page.locator(".sessions-view-toggle").boundingBox();
+  const toggleBox = await page.getByRole("radiogroup", { name: "Sessions View" }).boundingBox();
   expect(applyOrderBox && toggleBox && applyOrderBox.x + applyOrderBox.width <= toggleBox.x).toBe(true);
   // The toolbar gives the button its width from the Project tabs, not by clipping the button.
   expect(await applyOrder.evaluate((button) => button.scrollWidth <= button.clientWidth)).toBe(true);
@@ -833,7 +852,7 @@ test("Inbox titles keep one reading axis across row signals, widths, and densiti
     window.__WOLLIPOG_PROJECT_INBOX_E2E__.updateSession("session-alpha", { status: "running" });
     window.__WOLLIPOG_PROJECT_INBOX_E2E__.updateSession("session-secret", { status: "starting" });
   });
-  await page.getByRole("tab", { name: /^All\d/ }).click();
+  await page.getByRole("tab", { name: /^All \d/ }).click();
   await expect(page.locator(".inbox-row-title")).toHaveCount(3);
 
   for (const density of ["compact", "comfortable"] as const) {
@@ -1297,7 +1316,7 @@ async function openMoveToProjectDialog(page: Page) {
 test("the Project crumb navigates independently beside persistent Project Actions", async ({ page }) => {
   // A longer name keeps its click region separate from the compact trailing actions gutter.
   await page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.updateProject("alpha", { name: "Alpha Project" }));
-  await page.getByRole("tab", { name: /^All\d/ }).click();
+  await page.getByRole("tab", { name: /^All \d/ }).click();
   await page.getByRole("row", { name: /Alpha Session/ }).click();
   await page.getByRole("button", { name: "Expand Session" }).click();
   const projectChip = page.locator(".detail-crumbs .cctx-chip").filter({ hasText: "Alpha Project" });

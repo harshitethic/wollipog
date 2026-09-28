@@ -383,9 +383,9 @@ test("InboxView preserves the server-authoritative Project count when reminders 
       pods: [],
     });
   });
-  const projectTab = [...container.querySelectorAll<HTMLElement>(".inbox-tab")]
+  const projectTab = [...container.querySelectorAll<HTMLElement>(".inbox-tabs .tab")]
     .find((tab) => tab.textContent?.includes("Project One"));
-  assert.equal(projectTab?.querySelector(".inbox-tab-count")?.textContent, "7");
+  assert.equal(projectTab?.querySelector(".count")?.textContent, "7");
   await act(async () => { projectTab!.click(); });
   assert.equal(container.querySelector('[title="Active"]')?.getAttribute("aria-label"), "Active, 7 Sessions");
   assert.equal(container.querySelector('[title="Snoozed"]')?.getAttribute("aria-label"), "Snoozed, 0 Sessions");
@@ -450,7 +450,7 @@ test("Active and Snoozed badges follow the selected Project split and live remin
   assert.equal(countLabel("Active"), "Active, 3 Sessions");
   assert.equal(countLabel("Snoozed"), "Snoozed, 2 Sessions");
 
-  const alphaTab = [...container.querySelectorAll<HTMLButtonElement>(".inbox-tab")]
+  const alphaTab = [...container.querySelectorAll<HTMLButtonElement>(".inbox-tabs .tab")]
     .find((tab) => tab.textContent?.includes("Alpha"))!;
   await act(async () => { alphaTab.click(); });
   assert.equal(countLabel("Active"), "Active, 1 Session");
@@ -466,12 +466,80 @@ test("Active and Snoozed badges follow the selected Project split and live remin
   assert.equal(countLabel("Active"), "Active, 0 Sessions");
   assert.equal(countLabel("Snoozed"), "Snoozed, 2 Sessions");
 
-  const betaTab = [...container.querySelectorAll<HTMLButtonElement>(".inbox-tab")]
+  const betaTab = [...container.querySelectorAll<HTMLButtonElement>(".inbox-tabs .tab")]
     .find((tab) => tab.textContent?.includes("Beta"))!;
   await act(async () => { betaTab.click(); });
   assert.equal(countLabel("Active"), "Active, 2 Sessions");
   assert.equal(countLabel("Snoozed"), "Snoozed, 1 Session");
 
+});
+
+test("the tab the URL names survives widening from a phone to a desktop that remembered another", async () => {
+  // Widening restores the desktop's remembered Inbox state, which can name another tab than the URL
+  // does; the URL is what Back and reload return to, so the visible tab has to follow it (§10.1).
+  mobileViewport = false;
+  const { container, root } = mountTestRoot();
+  const socket = new FakeSocket();
+  const connection: UiConnectionRuntime = {
+    instanceId: "inbox-route-resize-test",
+    runtimeKey: "inbox-route-resize-test:1",
+    createSocket: () => socket,
+    close() {},
+  };
+  const pushed: Array<{ name: string; split?: string | null }> = [];
+  const spyNavigation: ViewNavigation = {
+    current: () => ({ name: "inbox" }),
+    push: (view) => void pushed.push(view as { name: string; split?: string | null }),
+    listen: () => () => {},
+  };
+  const project = (id: string, name: string): ProjectView => ({
+    id, name, hidden: false, locations: [], activeSessionCount: 1, unarchivedSessionCount: 1,
+    totalSessionCount: 1, createdAt: 1, updatedAt: 1,
+  });
+  const render = (routeSplit?: string | null) => root.render(
+    <StoreProvider connection={connection} navigation={spyNavigation}>
+      <InboxView rightPanel={rightPanel} onOpenTerminal={() => undefined} pinnedOpen={false} routeSplit={routeSplit} />
+    </StoreProvider>,
+  );
+  await act(async () => { render(); });
+  await act(async () => {
+    socket.push({
+      type: "snapshot",
+      capabilities: { sessionSubscriptions: false, boundedDelivery: false, paginatedSessionHistory: false, projects: true },
+      runners: [],
+      boxes: [],
+      sessions: [session("alpha-one", 20, { projectId: "alpha" }), session("beta-one", 10, { projectId: "beta" })],
+      projects: [project("alpha", "Alpha"), project("beta", "Beta")],
+      runs: [],
+      pods: [],
+    });
+  });
+  const tab = (name: string) => [...container.querySelectorAll<HTMLButtonElement>(".inbox-tabs .tab")]
+    .find((candidate) => candidate.textContent?.includes(name))!;
+  const selected = () => container.querySelector('.inbox-tabs .tab[aria-selected="true"]')?.textContent ?? "";
+
+  // The desktop remembers Alpha.
+  await act(async () => { tab("Alpha").click(); });
+  assert.match(selected(), /Alpha/);
+
+  // On a phone, Beta is chosen and the URL names it.
+  await act(async () => {
+    mobileViewport = true;
+    domWindow.dispatchEvent(new domWindow.Event("resize"));
+  });
+  await act(async () => { tab("Beta").click(); });
+  const betaKey = pushed.at(-1)?.split;
+  assert.ok(typeof betaKey === "string", "choosing a tab writes it to the URL");
+  await act(async () => { render(betaKey); });
+  assert.match(selected(), /Beta/);
+
+  // Widening restores the desktop's Alpha, and the URL's Beta wins.
+  await act(async () => {
+    mobileViewport = false;
+    domWindow.dispatchEvent(new domWindow.Event("resize"));
+  });
+  assert.match(selected(), /Beta/, "the visible tab is the one the URL names");
+  await act(async () => { root.unmount(); });
 });
 
 test("reminder membership stays exclusive while scoped attention reconciles in Snoozed list and board", async () => {
@@ -740,7 +808,7 @@ test("InboxView holds desktop browsing order until the user leaves the window", 
   const applyOrder = [...container.querySelectorAll<HTMLButtonElement>("button")]
     .find((button) => button.textContent?.trim() === "Apply New Order");
   assert.ok(applyOrder, "sustained desktop activity exposes a deliberate reorder boundary");
-  assert.equal(applyOrder.nextElementSibling, container.querySelector(".sessions-view-toggle"),
+  assert.equal(applyOrder.nextElementSibling, container.querySelector('[role="radiogroup"][aria-label="Sessions View"]'),
     "the conditional button leads List / Board so showing it cannot move the toggle (#1675)");
   assert.match(container.textContent ?? "", /A newer Inbox order is available/);
   await act(async () => { applyOrder.click(); });
@@ -1287,7 +1355,7 @@ test("board mode shares the Sessions toolbar scope and toggles back to the list"
   assert.equal(domWindow.document.activeElement, search,
     "Enter does not invent a selected-row focus model for the board");
 
-  const toggle = container.querySelector(".sessions-view-toggle");
+  const toggle = container.querySelector('[role="radiogroup"][aria-label="Sessions View"]');
   assert.ok(toggle, "the List / Board toggle lives in the shared toolbar");
   const listOption = [...toggle!.querySelectorAll("button")]
     .find((option) => option.textContent === "List") as unknown as HTMLButtonElement;

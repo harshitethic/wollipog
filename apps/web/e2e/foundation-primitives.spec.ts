@@ -1,0 +1,282 @@
+import { expect, test, type Page } from "@playwright/test";
+
+/**
+ * The #1803 foundation measured in a browser: tabs (§10.1), the dense row (§5.2), the table's
+ * narrow fallback (§14) and the neutral flag badge (§11.3). Sizes come from tokens that the
+ * coarse-pointer block resizes, so each is read with a mouse and again on touch.
+ */
+const shell = (path: string) => `/command-inbox-projects-e2e.html?fullShell=1&path=${encodeURIComponent(path)}`;
+
+async function heights(page: Page, selector: string): Promise<number[]> {
+  await expect(page.locator(selector).first()).toBeVisible();
+  return page.locator(selector).evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().height));
+}
+
+async function coarse(page: Page): Promise<boolean> {
+  return page.evaluate(() => matchMedia("(pointer: coarse)").matches);
+}
+
+for (const pointer of ["fine", "coarse"] as const) {
+  test.describe(`with a ${pointer} pointer`, () => {
+    test.use({ viewport: { width: 1440, height: 900 }, hasTouch: pointer === "coarse" });
+    const tab = pointer === "fine" ? 40 : 48;
+    const dense = pointer === "fine" ? 32 : 44;
+
+    test(`the Sessions and Connections tabs are ${tab}px, underlined rather than filled`, async ({ page }) => {
+      await page.goto(shell("/inbox"));
+      expect(await coarse(page)).toBe(pointer === "coarse");
+      for (const height of await heights(page, ".inbox-tabs .tab")) expect(height).toBe(tab);
+
+      await page.goto(shell("/connections"));
+      const tabs = page.getByRole("tablist", { name: "Connection Settings" }).getByRole("tab");
+      await expect(tabs.first()).toBeVisible();
+      for (const height of await tabs.evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().height))) {
+        expect(height).toBe(tab);
+      }
+      const selected = page.getByRole("tablist", { name: "Connection Settings" }).locator('[role="tab"][aria-selected="true"]');
+      await expect(selected).toHaveCount(1);
+      const look = await selected.evaluate((element) => ({
+        background: getComputedStyle(element).backgroundColor,
+        underline: getComputedStyle(element, "::after").height,
+        transform: getComputedStyle(element).textTransform,
+      }));
+      expect(look).toEqual({ background: "rgba(0, 0, 0, 0)", underline: "2px", transform: "none" });
+    });
+
+    test(`Files entries and Review changed files are ${dense}px dense rows`, async ({ page }) => {
+      await page.goto("/files-panel-e2e.html");
+      const files = await heights(page, ".files-list .row");
+      expect(files.length).toBe(7);
+      for (const height of files) expect(height).toBe(dense);
+      // A file's size is trailing meta (§5.2): at the row's end edge, not after its name.
+      const offsets = await page.locator(".files-list .row:has(.row-trail)").evaluateAll((rows) => rows.map((row) => {
+        const trail = row.querySelector(".row-trail")!.getBoundingClientRect();
+        return row.getBoundingClientRect().right - Number.parseFloat(getComputedStyle(row).paddingRight) - trail.right;
+      }));
+      expect(offsets.length).toBeGreaterThan(0);
+      for (const offset of offsets) expect(Math.abs(offset)).toBeLessThan(1);
+
+      await page.goto("/review-anchor-reload-e2e.html");
+      const changed = await heights(page, ".git-files .row");
+      expect(changed.length).toBe(2);
+      for (const height of changed) expect(height).toBe(dense);
+    });
+  });
+}
+
+test.describe("at 1440px", () => {
+  test.use({ viewport: { width: 1440, height: 900 } });
+
+  test("the Archive State column shows every badge whole", async ({ page }) => {
+    await page.goto(shell("/archived"));
+    await expect(page.locator(".archive-state-badges .status").first()).toBeVisible();
+    const clipped = await page.locator(".archive-state-badges .status").evaluateAll((badges) => badges
+      .filter((badge) => {
+        const cell = badge.closest("td")!.getBoundingClientRect();
+        const box = badge.getBoundingClientRect();
+        return badge.scrollWidth > badge.clientWidth + 0.5 || box.right > cell.right + 0.5 || box.left < cell.left - 0.5;
+      })
+      .map((badge) => badge.textContent));
+    expect(clipped, "no badge is cut off by its cell").toEqual([]);
+  });
+});
+
+// A picker inside a table opens against its trigger and whole: the table wrapper is a size container
+// and a sideways scroller, and neither may become the fixed list's containing block or clip it.
+for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+  test(`an Invocation picker in the Skills assignments table opens beside its trigger at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    await page.goto("/skills-removals-e2e.html?assignment=1");
+    await page.getByRole("button", { name: /code-review/i }).first().click();
+    const trigger = page.locator(".skills-table").getByRole("button", { name: /^Invocation:/ });
+    await trigger.scrollIntoViewIfNeeded();
+    await trigger.click();
+    const list = page.getByRole("listbox", { name: "Invocation" });
+    await expect(list).toBeVisible();
+    const geometry = await list.evaluate((element) => {
+      const trigger = document.querySelector<HTMLElement>('.skills-table [aria-haspopup="listbox"]')!.getBoundingClientRect();
+      const box = element.getBoundingClientRect();
+      const options = [...element.querySelectorAll<HTMLElement>('[role="option"]')];
+      return {
+        gap: Math.min(Math.abs(box.top - trigger.bottom), Math.abs(trigger.top - box.bottom)),
+        overlapsHorizontally: box.left < trigger.right && box.right > trigger.left,
+        // Every option is where a pointer can reach it: the topmost element at its centre is it.
+        reachable: options.every((option) => {
+          const rect = option.getBoundingClientRect();
+          return option.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2));
+        }),
+        count: options.length,
+      };
+    });
+    expect(geometry.count).toBe(2);
+    expect(geometry.gap, "the list opens against its trigger").toBeLessThanOrEqual(8);
+    expect(geometry.overlapsHorizontally).toBe(true);
+    expect(geometry.reachable, "no option is clipped or covered").toBe(true);
+    await list.getByRole("option", { name: /Manual/ }).click();
+    await expect(list).toBeHidden();
+  });
+}
+
+test("a required finding shows a neutral Required badge beside its severity", async ({ page }) => {
+  await page.goto("/review-anchor-reload-e2e.html");
+  const badge = page.locator(".status", { hasText: /^Required$/ }).first();
+  await expect(badge).toBeVisible();
+  expect(await badge.evaluate((element) => ({
+    neutral: element.classList.contains("t-neutral"),
+    noDot: element.classList.contains("no-dot"),
+    transform: getComputedStyle(element).textTransform,
+    dot: getComputedStyle(element, "::before").content,
+  }))).toEqual({ neutral: true, noDot: true, transform: "none", dot: "none" });
+});
+
+test.describe("at 390px", () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+  test("an Archive row's inline action and ⋯ are separate 44px touch targets", async ({ page }) => {
+    await page.goto(shell("/archived"));
+    const actions = page.locator(".archive-row-actions").first();
+    await expect(actions).toBeVisible();
+    const hits = await actions.evaluate((element) => {
+      const [inline, more] = [...element.querySelectorAll<HTMLElement>("button")];
+      const a = inline!.getBoundingClientRect();
+      const b = more!.getBoundingClientRect();
+      const y = a.top + a.height / 2;
+      const at = (x: number, yy: number) => document.elementFromPoint(x, yy);
+      return {
+        gap: b.left - a.right,
+        // 3px past each visible edge, inside its own borrowed area and not the neighbour's.
+        inlineRight: inline!.contains(at(a.right + 3, y)),
+        moreLeft: more!.contains(at(b.left - 3, y)),
+        // The borrowed area above and below is not clipped by the actions container.
+        inlineAbove: inline!.contains(at(a.left + a.width / 2, a.top - 3)),
+        moreBelow: more!.contains(at(b.left + b.width / 2, b.bottom + 3)),
+      };
+    });
+    expect(hits.gap, "neighbours sit at least 8px apart (§2.8)").toBeGreaterThanOrEqual(8);
+    expect(hits).toMatchObject({ inlineRight: true, moreLeft: true, inlineAbove: true, moreBelow: true });
+  });
+
+  test("the Usage breakdown keeps every driver's value on a phone, each named", async ({ page }) => {
+    // No detail view holds the per-driver split, so the two-line row shows it on line 2 rather
+    // than hiding it with the other extra columns.
+    await page.goto("/usage-view-e2e.html");
+    const table = page.locator(".usage-breakdown-section table").first();
+    await expect(table).toBeVisible();
+    const drivers = await table.evaluate((element) => {
+      const headers = [...element.querySelectorAll("thead th")].map((th) => th.textContent?.trim() ?? "");
+      const cells = [...element.querySelectorAll<HTMLElement>("tbody tr:first-child td[data-driver]")];
+      return {
+        count: cells.length,
+        visible: cells.every((cell) => cell.getBoundingClientRect().height > 0 && getComputedStyle(cell).display !== "none"),
+        named: cells.every((cell) => {
+          const label = cell.querySelector(".cell-label");
+          return !!label && getComputedStyle(label).display !== "none"
+            && headers.some((header) => header && label.textContent?.startsWith(header));
+        }),
+      };
+    });
+    expect(drivers.count, "the fixture has a per-driver split").toBeGreaterThan(0);
+    expect(drivers).toMatchObject({ visible: true, named: true });
+
+    // The headers are off screen here, so every figure on a meta line carries its own name: the
+    // period breakdown and Cost by User as the view opens, then the Model breakdown.
+    const unnamed = () => page.locator(".usage-table tbody td.cell-meta").evaluateAll((cells) => cells
+      .filter((cell) => getComputedStyle(cell).display !== "none" && cell.getBoundingClientRect().height > 0)
+      .filter((cell) => {
+        const label = cell.querySelector(".cell-label");
+        // A word or a 14px icon (§5.2) names it.
+          return !label || getComputedStyle(label).display === "none" || !(label.textContent?.trim() || label.querySelector("svg"));
+      })
+      .map((cell) => `${cell.closest("table")?.querySelector("caption")?.textContent}: ${cell.textContent}`));
+    expect(await unnamed(), "no unlabelled figure on a phone").toEqual([]);
+    await page.getByRole("radiogroup", { name: "Usage Breakdown" }).getByRole("radio", { name: "Model" }).click();
+    await expect(page.locator(".usage-breakdown-section caption")).toHaveText("Usage by Model");
+    expect(await unnamed(), "nor in the Model breakdown").toEqual([]);
+  });
+
+  test("a long trailing value gives way to the row's title", async ({ page }) => {
+    await page.goto("/colour-schemes-e2e.html");
+    const row = page.locator(".surface > .row.row-2");
+    await expect(row).toBeVisible();
+    const widths = await row.evaluate((element) => ({
+      row: element.getBoundingClientRect().width,
+      title: element.querySelector(".row-title")!.getBoundingClientRect().width,
+      trail: element.querySelector(".row-trail")!.getBoundingClientRect().width,
+    }));
+    expect(widths.trail, "the trailing slot is at most half the row").toBeLessThanOrEqual(widths.row / 2);
+    expect(widths.title, "the title keeps its room").toBeGreaterThan(widths.row * 0.4);
+  });
+
+  // The Archive in the real shell; the Usage breakdowns in their own fixture, which serves usage.
+  // Archive rows are exactly two lines. A Usage row keeps every driver's value on its meta line,
+  // which may wrap, because no detail view holds the per-driver split.
+  for (const [url, title, exact] of [[shell("/archived"), "Archived Sessions", true], ["/usage-view-e2e.html", "Usage & Cost", false]] as const) {
+    test(`${title} tables become stacked rows without sideways scroll`, async ({ page }) => {
+      await page.goto(url);
+      const row = page.locator(".table tbody tr").first();
+      await expect(row).toBeVisible();
+      const layout = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll<HTMLElement>(".table tbody tr")]
+          .filter((element) => element.getBoundingClientRect().height > 0 && element.children.length > 1);
+        // Lines, not tops: cells on one line are centred on it, so a button and a line of meta text
+        // share a line while starting at different heights. A cell whose centre sits below every
+        // earlier cell's box starts a new line.
+        const lines = rows.map((element) => {
+          const boxes = [...element.children]
+            .filter((cell) => getComputedStyle(cell).display !== "none" && cell.getBoundingClientRect().height > 0)
+            .map((cell) => cell.getBoundingClientRect())
+            .sort((a, b) => a.top - b.top);
+          let count = 0;
+          let bottom = -Infinity;
+          for (const box of boxes) {
+            if (box.top + box.height / 2 > bottom) count += 1;
+            bottom = Math.max(bottom, box.bottom);
+          }
+          return count;
+        });
+        // Line 1 holds only the row's name and its status or key figure.
+        const firstLine = rows.every((element) => {
+          const cells = [...element.children].filter((cell) => getComputedStyle(cell).display !== "none"
+            && cell.getBoundingClientRect().height > 0);
+          const nameBox = cells[0]!.getBoundingClientRect();
+          return cells.slice(1).every((cell) => cell.classList.contains("cell-status")
+            || cell.getBoundingClientRect().top >= nameBox.bottom - 0.5);
+        });
+        const head = document.querySelector(".table thead")!.getBoundingClientRect();
+        const widest = Math.max(...[...document.querySelectorAll<HTMLElement>(".table-wrap")]
+          .map((wrap) => wrap.scrollWidth - wrap.clientWidth));
+        return {
+          rows: rows.length,
+          lines: [...new Set(lines)],
+          firstLine,
+          headHidden: head.width <= 1 && head.height <= 1,
+          pageScroll: document.scrollingElement!.scrollWidth - innerWidth,
+          tableScroll: widest,
+        };
+      });
+      expect(layout.rows).toBeGreaterThan(0);
+      if (exact) expect(layout.lines).toEqual([2]);
+      else expect(Math.min(...layout.lines)).toBeGreaterThanOrEqual(2);
+      expect(layout.firstLine, "line 1 is the name and its status or key figure").toBe(true);
+      // The headers are off screen, so every figure on the meta line names itself.
+      const unnamed = await page.locator(".table tbody td.cell-meta").evaluateAll((cells) => cells
+        .filter((cell) => getComputedStyle(cell).display !== "none" && cell.getBoundingClientRect().height > 0)
+        .filter((cell) => {
+          const label = cell.querySelector(".cell-label");
+          // A word or a 14px icon (§5.2) names it.
+          return !label || getComputedStyle(label).display === "none" || !(label.textContent?.trim() || label.querySelector("svg"));
+        })
+        .map((cell) => cell.textContent));
+      expect(unnamed, "no unlabelled figure on a phone").toEqual([]);
+      // Each meta item, label or icon included, is one line of text.
+      const tall = await page.locator(".table tbody td.cell-meta").evaluateAll((cells) => cells
+        .filter((cell) => getComputedStyle(cell).display !== "none" && cell.getBoundingClientRect().height > 0)
+        .filter((cell) => cell.getBoundingClientRect().height > Number.parseFloat(getComputedStyle(cell).lineHeight) * 1.5)
+        .map((cell) => cell.textContent));
+      expect(tall, "no meta item wraps onto a second line").toEqual([]);
+      expect(layout.headHidden).toBe(true);
+      expect(layout.pageScroll).toBeLessThanOrEqual(0);
+      expect(layout.tableScroll).toBeLessThanOrEqual(0);
+    });
+  }
+});
