@@ -115,6 +115,17 @@ test("instance selector remains keyboard-managed and exposes switching plus mana
       .find((button) => button.textContent === "Manage Instances")!;
     await act(async () => { manage.click(); });
     assert.equal(managed, 1);
+
+    // Dismissing through the shared backdrop hands focus back to the trigger: the backdrop takes
+    // the click, so nothing underneath it would otherwise receive focus.
+    await act(async () => { trigger.click(); });
+    await act(async () => {
+      (domWindow.document.querySelector(".menu-backdrop") as unknown as HTMLElement).click();
+      await tick();
+    });
+    assert.equal(domWindow.document.querySelector('[role="menu"]'), null);
+    // Identity, not assert.equal: a failed diff of two DOM nodes serialises the whole tree.
+    assert.ok(domWindow.document.activeElement === (trigger as never), "focus returns to the trigger, not <body>");
   } finally {
     await act(async () => { mounted.root.unmount(); });
     mounted.mountPoint.remove();
@@ -158,16 +169,28 @@ test("compact instance selector stays bottom-anchored inside the real desktop Ra
       toJSON: () => ({}),
     });
 
-    await act(async () => { trigger.click(); });
-    const menu = rail?.querySelector<HTMLElement>('[role="menu"][aria-label="Switch Instance"]');
+    // The shared menu is placed from its own rendered size; happy-dom has no layout, so give the
+    // surface the size a two-profile menu renders at.
+    const surface = domWindow.HTMLElement.prototype as unknown as Record<string, unknown>;
+    const priorScrollHeight = Object.getOwnPropertyDescriptor(surface, "scrollHeight");
+    Object.defineProperty(surface, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) { return this.classList.contains("menu") ? 188 : 0; },
+    });
+    try {
+      await act(async () => { trigger.click(); });
+    } finally {
+      if (priorScrollHeight) Object.defineProperty(surface, "scrollHeight", priorScrollHeight);
+      else delete surface["scrollHeight"];
+    }
+    const menu = domWindow.document.querySelector('[role="menu"][aria-label="Switch Instance"]') as unknown as HTMLElement;
     assert.ok(menu);
-    assert.equal(menu.style.position, "fixed");
+    assert.ok(menu.classList.contains("menu"), "the shared menu surface, fixed by the stylesheet");
     assert.equal(menu.style.top, "auto");
-    assert.equal(menu.style.bottom, "98px");
+    assert.equal(menu.style.bottom, "96px", "4px above the trigger, which sits near the bottom of the rail");
     assert.equal(menu.style.left, "11px");
     assert.equal(menu.style.width, "260px");
-    // 2 profile rows × 58 (20px line boxes) + 36 Manage + 2 × 11 separators + 14 chrome.
-    assert.equal(menu.style.maxHeight, "188px", "two profiles right-size the menu maximum");
+    assert.equal(menu.style.maxHeight, "188px", "a short menu is not given more room than it uses");
   } finally {
     await act(async () => { mounted.root.unmount(); });
     mounted.mountPoint.remove();

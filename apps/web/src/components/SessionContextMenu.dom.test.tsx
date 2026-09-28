@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import type { SessionReminderView } from "@wollipog/protocol";
 import { SessionContextMenu, type SessionContextMenuState } from "./SessionContextMenu.js";
+import { useLongPress } from "./interactions.js";
 
 const domWindow = new Window({ url: "http://localhost/" });
 for (const [name, value] of Object.entries({
@@ -17,6 +18,7 @@ for (const [name, value] of Object.entries({
   Event: domWindow.Event,
   MouseEvent: domWindow.MouseEvent,
   KeyboardEvent: domWindow.KeyboardEvent,
+  PointerEvent: domWindow.PointerEvent,
   React,
   IS_REACT_ACT_ENVIRONMENT: true,
 })) Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
@@ -87,7 +89,7 @@ test("the menu names its session, offers its actions, and takes initial focus", 
     assert.deepEqual(items, ["Rename Session…", "Pin Session", "Snooze Session…", "Archive"]);
     assert.equal(domWindow.document.activeElement?.textContent, "Rename Session…",
       "the virtualized collections never focus rows, so the menu takes focus itself");
-    assert.ok(menu.querySelector(".menu-item.menu-danger")?.textContent === "Archive");
+    assert.ok(menu.querySelector(".menu-item.danger")?.textContent === "Archive");
     assert.ok(domWindow.document.querySelector(".menu-backdrop"),
       "the backdrop enrolls the menu in the shell's Escape ladder");
   } finally {
@@ -157,7 +159,7 @@ test("dialog actions close without restoring focus; pin, archive, and dismissal 
   const second = await mount();
   try {
     await act(async () => {
-      (second.menu.querySelector(".menu-danger") as unknown as HTMLButtonElement).click();
+      (second.menu.querySelector(".menu-item.danger") as unknown as HTMLButtonElement).click();
     });
     assert.deepEqual(second.log.archived, ["s-1"]);
     assert.equal(second.log.restored, 1, "archive opens no dialog, so keyboard position returns");
@@ -201,7 +203,7 @@ test("a Viewer's Rename and Archive stay listed, disabled and described by the r
       assert.equal(described ? domWindow.document.getElementById(described)?.textContent : null, reason,
         `${label} is described by the visible reason`);
     }
-    assert.equal(menu.querySelectorAll(".menu-caution").length, 1, "one shared reason is shown once");
+    assert.equal(menu.querySelectorAll(".menu-note").length, 1, "one shared reason is shown once");
     assert.equal(domWindow.document.activeElement?.textContent, "Pin Session",
       "initial focus skips the disabled Rename item");
     await act(async () => {
@@ -213,6 +215,52 @@ test("a Viewer's Rename and Archive stay listed, disabled and described by the r
     await act(async () => { item("Pin Session").click(); });
     assert.deepEqual(log.toggledPin, ["s-1"], "per-person Pin still works");
   } finally {
+    await unmount(root);
+  }
+});
+
+test("Tab closes the menu from where it was opened, not from the end of <body>", async () => {
+  const { root, log, menu } = await mount();
+  try {
+    await act(async () => {
+      menu.dispatchEvent(new domWindow.KeyboardEvent("keydown", { key: "Tab", bubbles: true }) as never);
+    });
+    assert.equal(log.closed, 1);
+    // Focus is back on the row the menu belongs to before the browser's Tab moves on from it.
+    assert.equal(log.restored, 1);
+  } finally {
+    await unmount(root);
+  }
+});
+
+test("the click a long-press releases onto a phone sheet item runs nothing", async () => {
+  // A long-press on a low row can mount the phone sheet under the finger: the release click then
+  // lands on an item rather than the backdrop. It is the opening gesture, not a choice.
+  function Pressable() {
+    const press = useLongPress(() => undefined);
+    return <div data-testid="pressable" {...press.handlers} />;
+  }
+  const host = domWindow.document.createElement("div") as unknown as HTMLDivElement;
+  domWindow.document.body.append(host as never);
+  const pressRoot = createRoot(host);
+  await act(async () => { pressRoot.render(<Pressable />); });
+  const pressable = domWindow.document.querySelector('[data-testid="pressable"]')!;
+  const pointer = { bubbles: true, pointerId: 1, pointerType: "touch", clientX: 20, clientY: 20 };
+  await act(async () => {
+    pressable.dispatchEvent(new domWindow.PointerEvent("pointerdown", pointer) as never);
+    await new Promise((resolve) => domWindow.setTimeout(resolve, 560));
+    pressable.dispatchEvent(new domWindow.PointerEvent("pointerup", pointer) as never);
+  });
+  const { root, log, menu } = await mount();
+  try {
+    const pin = [...menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find((item) => item.textContent === "Pin Session")!;
+    await act(async () => { pin.click(); });
+    assert.deepEqual(log.toggledPin, [], "the release click is swallowed");
+    await act(async () => { pin.click(); });
+    assert.deepEqual(log.toggledPin, ["s-1"], "the next, deliberate tap acts");
+  } finally {
+    await act(async () => { pressRoot.unmount(); });
     await unmount(root);
   }
 });
