@@ -132,6 +132,29 @@ export function shouldAdjustVirtualScrollForResize({
     (!anchorPending || (mountRestorePending && itemEnd <= scrollOffset));
 }
 
+export function shouldCommitAnchoredResizeSynchronously({
+  itemEnd,
+  scrollOffset,
+  anchorPending,
+  mountRestorePending,
+  widthReflowPending,
+}: {
+  itemEnd: number;
+  scrollOffset: number;
+  anchorPending: boolean;
+  mountRestorePending: boolean;
+  /** Read only when it decides the result; the caller may consult live layout. */
+  widthReflowPending: () => boolean;
+}): boolean {
+  // A structural anchor owns a fully preceding row's growth, but TanStack renders that growth
+  // asynchronously when it does not compensate. The frame before that render paints the grown row
+  // over the anchor, and a render landing as the bounded window releases adopts the wrong visible
+  // row. Committing it before paint lets the anchor correct in the same pass without a TanStack
+  // scroll write, which iOS may defer past the window. A width anchor restores its rewrapped rows
+  // on its own schedule, and session return already compensates through TanStack.
+  return anchorPending && !mountRestorePending && itemEnd <= scrollOffset && !widthReflowPending();
+}
+
 interface VirtualMeasurementReseeder {
   measure: () => void;
   getVirtualItems: () => unknown;
@@ -399,6 +422,8 @@ function VirtualList<T>({
   const clearAnchorFrameRef = useRef<number | null>(null);
   const widthAnchorFrameRef = useRef<number | null>(null);
   const widthAnchorRef = useRef<VirtualScrollAnchor | null>(null);
+  const anchoredResizeCommitRef = useRef(false);
+  const measuringRowInCommitRef = useRef(false);
   const anchorCorrectionScrollTopRef = useRef<number | null>(null);
   const anchorCorrectionIntentVersionRef = useRef<number | null>(null);
   const viewportIntentVersionRef = useRef(0);
@@ -503,6 +528,13 @@ function VirtualList<T>({
     // that phase; the fault-injection provider enables its animation-frame deferral so the painted-
     // frame regressions retain a library-owned negative control.
     useAnimationFrameWithResizeObserver: deferMeasurements,
+    onChange: () => {
+      if (!anchoredResizeCommitRef.current) return;
+      anchoredResizeCommitRef.current = false;
+      // TanStack's own rerender is asynchronous here. This render reads the same live measurements
+      // and lets the pending anchor's layout effect correct them before paint.
+      flushSync(() => forceAnchorRetry((epoch) => epoch + 1));
+    },
   });
   const initialMeasurementVirtualizerRef = useRef(virtualizer);
   initialMeasurementVirtualizerRef.current = virtualizer;
@@ -530,14 +562,43 @@ function VirtualList<T>({
   // return, a fully preceding row still needs TanStack's immediate adjustment when its measured
   // growth lands at the end of that window. Below-viewport rows must not move paused readers.
   // The public tracked offset includes each adjustment before the next row is measured.
-  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) =>
-    shouldAdjustVirtualScrollForResize({
+  // A structural anchor's fully preceding row instead requests a synchronous render above. A row
+  // measured from its ref during a commit needs none: React commits that update before paint.
+  // TanStack's row observer can report rewrapped rows before the viewport observer below records
+  // the new width, so a width reflow is also pending while the live width differs from that record.
+  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => {
+    const scrollOffset = instance.scrollOffset ?? 0;
+    const anchorPending = pendingAnchorRef.current != null;
+    const mountRestorePending = anchorCorrectionRequiresIntentRef.current;
+    anchoredResizeCommitRef.current = !measuringRowInCommitRef.current &&
+      shouldCommitAnchoredResizeSynchronously({
+        itemEnd: item.end,
+        scrollOffset,
+        anchorPending,
+        mountRestorePending,
+        widthReflowPending: () => {
+          if (widthAnchorRef.current != null) return true;
+          const scroll = scrollRef.current;
+          return scroll != null && viewportWidthRef.current !== 0 &&
+            Math.round(scroll.getBoundingClientRect().width) !== viewportWidthRef.current;
+        },
+      });
+    return shouldAdjustVirtualScrollForResize({
       itemStart: item.start,
       itemEnd: item.end,
-      scrollOffset: instance.scrollOffset ?? 0,
-      anchorPending: pendingAnchorRef.current != null,
-      mountRestorePending: anchorCorrectionRequiresIntentRef.current,
+      scrollOffset,
+      anchorPending,
+      mountRestorePending,
     });
+  };
+  const measureRow = useCallback((node: HTMLDivElement | null) => {
+    measuringRowInCommitRef.current = true;
+    try {
+      virtualizer.measureElement(node);
+    } finally {
+      measuringRowInCommitRef.current = false;
+    }
+  }, [virtualizer]);
 
   useEffect(() => {
     const root = rootRef.current;
@@ -1261,7 +1322,7 @@ function VirtualList<T>({
         return (
           <div
             key={virtualRow.key}
-            ref={virtualizer.measureElement}
+            ref={measureRow}
             data-index={virtualRow.index}
             data-virtual-row=""
             data-virtual-key={getKey(item)}
