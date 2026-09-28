@@ -3878,6 +3878,18 @@ function SessionDetailLoaded({
     if (!planSupported) return; // never set an unsupported "plan" mode (would map to a writable sandbox)
     applyConfig({ permissionMode: on ? "plan" : "" });
   };
+  // The Plan pill and each attachment ✕ unmount when they act. A pointer never focuses them, but a
+  // keyboard user's focus would fall to the page with them, so it moves to the composer (#1913).
+  // A composer that cannot prompt is disabled and refuses focus; then Session Activity takes it, as
+  // it does when a resolved request cannot hand focus back to the composer.
+  const keepFocusInComposer = (control: HTMLElement) => {
+    const document = control.ownerDocument;
+    if (document.activeElement !== control) return;
+    for (const target of [inputRef.current, scrollRef.current]) {
+      target?.focus({ preventScroll: true });
+      if (document.activeElement === target) return;
+    }
+  };
 
   const clearAppCommandText = () => {
     draftDirty.current = true;
@@ -5624,7 +5636,10 @@ function SessionDetailLoaded({
               )}
               <ImageStrip
                 images={images}
-                onRemove={remove}
+                onRemove={(i, control) => {
+                  remove(i);
+                  keepFocusInComposer(control);
+                }}
                 onInspectReference={(reference, opener) => {
                   workspaceReferenceReturnFocusRef.current = opener;
                   setInspectedWorkspaceReference(reference);
@@ -5746,7 +5761,10 @@ function SessionDetailLoaded({
                       // pointerdown brings the phone rail back and moves this pill out from under the
                       // finger (#1903).
                       onPointerDown={(event) => event.preventDefault()}
-                      onClick={() => togglePlan(false)}
+                      onClick={(event) => {
+                        togglePlan(false);
+                        if (planSupported) keepFocusInComposer(event.currentTarget);
+                      }}
                       aria-describedby={configRefusal !== null ? configRefusalId : undefined}
                       title={configRefusal !== null
                         ? `Plan mode is on. ${configRefusal}`
