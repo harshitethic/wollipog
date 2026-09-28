@@ -3,6 +3,9 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import ts from "typescript";
+import { ApiError } from "./api.js";
+import { archiveAndStopMessage } from "./archive-actions.js";
+import { lifecycleConflictPresentation } from "./components/RunnersView.js";
 
 const SOURCE_ROOT = path.resolve("apps/web/src");
 const MINOR_WORDS = new Set([
@@ -135,6 +138,82 @@ function staticBranches(node: ts.Expression): string[] | null {
   return null;
 }
 
+const MAX_BODY_BRANCHES = 256;
+
+/**
+ * Confirmation bodies built by a helper the static reader cannot follow. Each one has its own
+ * sentence check below; a new unreadable body fails until it is listed here and tested.
+ */
+const COMPUTED_BODIES = [/^archiveAndStopMessage\(/, /^conflict\.message$/];
+
+/**
+ * Every text a confirmation body can produce: conditions, template holes and `+` concatenation are
+ * followed, and a local constant is read through (`fenced` in the skill copy discard). A template
+ * hole the reader cannot follow is a name (`“${target.name}”`). A condition branch or `+` operand it
+ * cannot follow is copy it cannot see, so the whole body is unreadable (`null`) and must be a known,
+ * separately tested helper (COMPUTED_BODIES).
+ */
+function bodyBranches(node: ts.Expression, sourceFile: ts.SourceFile): string[] | null {
+  const unreadable = { found: false };
+  const branches = readBody(node, sourceFile, unreadable);
+  return unreadable.found ? null : branches;
+}
+
+function readBody(node: ts.Expression, sourceFile: ts.SourceFile, unreadable: { found: boolean }): string[] | null {
+  const bodyBranches = (inner: ts.Expression, file: ts.SourceFile) => readBody(inner, file, unreadable);
+  const required = (branches: string[] | null) => {
+    if (!branches) unreadable.found = true;
+    return branches ?? ["Name"];
+  };
+  const combine = (left: string[], right: string[]) =>
+    left.flatMap((head) => right.map((tail) => head + tail)).slice(0, MAX_BODY_BRANCHES);
+  const orPlaceholder = (branches: string[] | null) => branches ?? ["Name"];
+  if (ts.isParenthesizedExpression(node)) return bodyBranches(node.expression, sourceFile);
+  if (ts.isStringLiteralLike(node)) return [node.text];
+  if (ts.isTemplateExpression(node)) {
+    let branches = [node.head.text];
+    for (const span of node.templateSpans) {
+      branches = combine(combine(branches, orPlaceholder(bodyBranches(span.expression, sourceFile))), [span.literal.text]);
+    }
+    return branches;
+  }
+  if (ts.isConditionalExpression(node)) {
+    return [...required(bodyBranches(node.whenTrue, sourceFile)), ...required(bodyBranches(node.whenFalse, sourceFile))];
+  }
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    return combine(required(bodyBranches(node.left, sourceFile)), required(bodyBranches(node.right, sourceFile)));
+  }
+  if (ts.isIdentifier(node)) {
+    let found: ts.Expression | undefined;
+    const find = (candidate: ts.Node) => {
+      if (!found && ts.isVariableDeclaration(candidate) && ts.isIdentifier(candidate.name) &&
+          candidate.name.text === node.text && candidate.initializer &&
+          (candidate.parent.flags & ts.NodeFlags.Const) !== 0) {
+        found = candidate.initializer;
+      }
+      ts.forEachChild(candidate, find);
+    };
+    find(sourceFile);
+    if (!found) return null;
+    // A constant that is not fully readable copy (`sessionCount`) is a value, like any other name.
+    const inner = { found: false };
+    const branches = readBody(found, sourceFile, inner);
+    return inner.found ? null : branches;
+  }
+  return null;
+}
+
+/**
+ * A sentence ends at `.`, `!` or `?` followed by space and anything but a lowercase letter, or by the end:
+ * "v0.1" and "e.g. a" do not split, "One. 2 files…" does. Trailing text with no final stop is a sentence too.
+ */
+function sentenceCount(text: string): number {
+  const trimmed = text.trim();
+  if (!trimmed) return 0;
+  const ends = trimmed.match(/[.!?](?=\s+[^\sa-z]|\s*$)/g)?.length ?? 0;
+  return /[.!?]$/.test(trimmed) ? ends : ends + 1;
+}
+
 function optionLiterals(node: ts.Expression): ts.ObjectLiteralExpression[] {
   if (ts.isParenthesizedExpression(node)) return optionLiterals(node.expression);
   if (ts.isObjectLiteralExpression(node)) return [node];
@@ -174,6 +253,16 @@ test("every confirmation names its action in the title and its outcome on the bu
               failures.push(`${where(literal)} confirmation has no confirmLabel`);
               continue;
             }
+            const message = property("message");
+            const bodies = message ? bodyBranches(message.initializer, sourceFile) : null;
+            if (message && !bodies && !COMPUTED_BODIES.some((pattern) => pattern.test(message.initializer.getText(sourceFile)))) {
+              failures.push(`${where(message)} body is not readable copy; add its helper to COMPUTED_BODIES and test it there`);
+            }
+            for (const body of bodies ?? []) {
+              if (sentenceCount(body) > 2) {
+                failures.push(`${where(message!)} body is longer than two sentences (§7.4): ${JSON.stringify(body)}`);
+              }
+            }
             const titles = staticBranches(title.initializer);
             const labels = staticBranches(label.initializer);
             if (!titles || !labels) {
@@ -201,4 +290,39 @@ test("every confirmation names its action in the title and its outcome on the bu
   }
   assert.ok(checked >= 38, `expected to read every confirmation caller, read ${checked}`);
   assert.deepEqual(failures, [], failures.join("\n"));
+});
+
+test("the confirmation sentence count reads sentences, not every dot", () => {
+  assert.equal(sentenceCount("“Fix rounding” stops now. You can restore it."), 2);
+  assert.equal(sentenceCount("Version v0.1.2 of the skill, e.g. from Git, is kept."), 1);
+  assert.equal(sentenceCount("It is deleted only if it still matches; if it changed, nothing is deleted."), 1);
+  assert.equal(sentenceCount("One. Two! Three? "), 3);
+  assert.equal(sentenceCount("One. 2 files are removed. This cannot be undone."), 3);
+  assert.equal(sentenceCount("A fragment with no final stop"), 1);
+  assert.equal(sentenceCount("Done. And a trailing fragment"), 2);
+});
+
+test("confirmation bodies built by a helper are one or two sentences too", () => {
+  const bodies = [
+    ...[null, "Fix the half-cent rounding bug"].flatMap((title) => [true, false].map((retrying) => archiveAndStopMessage(title, retrying))),
+    ...(["update", "reconnect", "adopt"] as const).flatMap((action) => [undefined, 1, 3].map((count) =>
+      lifecycleConflictPresentation(new ApiError("conflict", 409, "conflict", count === undefined ? {} : { activeSessionCount: count }), action).message)),
+  ];
+  assert.equal(bodies.length, 13);
+  for (const body of bodies) assert.ok(sentenceCount(body) <= 2, JSON.stringify(body));
+});
+
+test("the confirmation body reader treats copy it cannot see as unreadable, and names as names", () => {
+  const read = (source: string) => {
+    const file = ts.createSourceFile("body.ts", source, ts.ScriptTarget.Latest, true);
+    const statement = file.statements.at(-1)!;
+    assert.ok(ts.isExpressionStatement(statement));
+    return bodyBranches(statement.expression, file);
+  };
+  assert.equal(read(`useServerCopy ? serverCopy : "Safe."`), null, "an unreadable condition branch");
+  assert.equal(read(`"Delivery stops. " + serverCopy`), null, "an unreadable concatenation operand");
+  assert.deepEqual(read(`\`“\${target.name}” is removed.\``), ["“Name” is removed."], "a name in a template hole");
+  assert.deepEqual(read(`const fenced = "It is kept."; \`Gone. \${fenced}\``), ["Gone. It is kept."], "a local constant");
+  assert.deepEqual(read(`const count = a ? b.length : c.length; \`All \${count} are removed.\``), ["All Name are removed."],
+    "a constant holding a value is a name");
 });
