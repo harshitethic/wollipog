@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import postcss from "postcss";
 import { allDeclarations, customProperties, declarationsOf, mediaBlocks, topLevelRule } from "./css-rules.js";
 
 const raw = readFileSync(fileURLToPath(new URL("./styles.css", import.meta.url)), "utf8");
@@ -123,10 +124,133 @@ test("every referenced custom property is defined in the shared root scope", () 
 test("the global focus ring does not restyle the focused element", () => {
   // Anchored to the complete selector: a substring search matches the tail of component rules such
   // as `.rail-brand:focus-visible`, which would leave this test green if the global rule regressed.
-  const body = soleRuleBody(":focus-visible");
+  const body = soleRuleBody(":where(:focus-visible)");
   assert.match(body, /outline:/);
   assert.doesNotMatch(body, /border-radius/,
     "border-radius in :focus-visible changes the element's shape, not the outline's");
+});
+
+/** The one top-level rule whose selector, with all whitespace removed, is exactly this. */
+function baseRule(selector: string): string {
+  const squash = (text: string) => text.replace(/\s+/g, "");
+  const matches = allDeclarations(css).filter((declaration) => squash(declaration.selector) === squash(selector));
+  assert.ok(matches.length > 0, `the base layer must contain a rule for ${selector}`);
+  return matches.map((declaration) => `${declaration.prop}: ${declaration.value};`).join("\n");
+}
+
+/**
+ * Focus is neutral (docs/design-system.md §16.1). The global ring is `--focus` at zero specificity,
+ * programmatic targets (`tabIndex={-1}`: the page title, a dialog card, the Settings panel heading)
+ * show none, and text fields show focus on their own edge.
+ */
+test("the global focus ring is neutral, zero-specificity and absent on programmatic targets", () => {
+  assert.equal(soleRuleBody(":where(:focus-visible)"),
+    "outline: var(--focus-width) solid var(--focus);\noutline-offset: var(--focus-offset);");
+  const programmatic = allDeclarations(css).filter((declaration) =>
+    /^:where\(\[tabindex="-1"\]/.test(declaration.selector) && /\):focus$/.test(declaration.selector));
+  assert.equal(programmatic.length, 1, "exactly one programmatic-focus suppression");
+  assert.equal(`${programmatic[0]!.prop}: ${programmatic[0]!.value}`, "outline: none");
+  // A roving group focuses options that keep tabIndex -1 (an aria-disabled choice card is focused but
+  // never checked). Suppressing the ring on controls would make that keyboard focus invisible.
+  // A keyboard-opened Select focuses its tabIndex -1 listbox, which may have no option to highlight.
+  for (const control of ["button", "a[href]", "input", "select", "textarea", '[role="radio"]', '[role="option"]',
+    '[role="tab"]', '[role="menuitem"]', '[role="checkbox"]', '[role="switch"]', '[role="listbox"]', '[role="menu"]',
+    '[role="grid"]', '[role="tree"]', '[role="combobox"]']) {
+    assert.ok(programmatic[0]!.selector.includes(control),
+      `the programmatic-focus suppression must exclude ${control}`);
+  }
+  // F6 lands keyboard focus on these tabIndex -1 containers; the ring is their only cue, so it is
+  // restored after the suppression (equal specificity, later wins).
+  const zoneRing = ":where(.board-wrap, .inbox-zero, .inbox-preview-empty, [data-focus-zone]):focus-visible";
+  assert.equal(baseRule(zoneRing),
+    "outline: var(--focus-width) solid var(--focus);\noutline-offset: calc(-1 * var(--focus-width));");
+  assert.ok(css.indexOf(zoneRing) > css.indexOf(':where([tabindex="-1"]:not('),
+    "the F6 landing ring must follow the programmatic-focus suppression to win the tie");
+  // The palette search suppresses its outline, so its bottom edge is its only focus cue.
+  assert.equal(soleRuleBody(".palette-input:focus-visible"), "border-color: var(--focus);");
+  assert.equal(soleRuleBody(".clip-focus :focus-visible"), "outline-offset: calc(-1 * var(--focus-width));");
+  // A bare `:focus-visible` is (0,1,0) and would outrank component rules that draw their own focus.
+  assert.throws(() => topLevelRule(css, ":focus-visible"), /found 0/,
+    "the global ring must stay inside :where() so it never outranks a component");
+
+  const field = baseRule(':where(input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], ' +
+    '[type="color"]), textarea, select, .ui-select-trigger, .ui-searchable-combobox-input):focus-visible');
+  assert.match(field, /border-color: var\(--focus\);/);
+  assert.match(field, /outline: 1px solid var\(--focus\);/);
+});
+
+test("no focus ring anywhere is drawn in the accent colour", () => {
+  // Teal marks selection. A component that restates the ring restates it neutral; the components
+  // that draw focus another way (a field's border, the composer card) are not outlines.
+  // One exception, until selection moves to the accent bar (§5.2): the selected Sessions row is a
+  // --text ring today, so a neutral focus ring on that row would be indistinguishable from it.
+  const SELECTION_IS_NEUTRAL = new Set([".inbox-row:focus-visible"]);
+  const accentRings = allDeclarations(css).filter((declaration) =>
+    /:focus/.test(declaration.selector) && /^outline/.test(declaration.prop) && /--accent\b/.test(declaration.value)
+    && !SELECTION_IS_NEUTRAL.has(declaration.selector));
+  assert.deepEqual(accentRings.map((declaration) => `${declaration.line}: ${declaration.selector}`), []);
+  assert.match(soleRuleBody(".inbox-row-shell.selected .inbox-row"), /border-color: var\(--text\);/,
+    "the exception exists only while the selected row is drawn in --text; remove it when that changes");
+});
+
+/**
+ * The base resets (docs/design-system.md §2.3 and §2.4). Without them inputs render in the browser's
+ * Arial, unsized buttons at 13.333px, a field inside a bold label renders bold, and a button with no
+ * class renders as a gray browser button.
+ */
+test("form controls and buttons inherit the app's type, and bare buttons reset", () => {
+  assert.equal(baseRule("body").split("\n").find((line) => line.startsWith("font:")), "font: var(--type-body);");
+  assert.doesNotMatch(baseRule("body"), /font-size|font-family/, "body type comes from --type-body alone");
+  assert.equal(baseRule("button, input, select, textarea"), "font: inherit;");
+  assert.equal(baseRule("input, select, textarea").split("\n")[0], "font-weight: 400;");
+  assert.equal(baseRule(":where(button)"),
+    ["background: none;", "border: 0;", "color: inherit;", "font: inherit;", "padding: 0;"].join("\n"));
+  // The Automation form's fields inherited 600 from their label through a local `font: inherit`.
+  assert.doesNotMatch(soleRuleBody(".automation-form-grid input, .automation-form-grid select, .automation-form-grid textarea"),
+    /font:/, "a local font shorthand would re-inherit the label's weight");
+});
+
+/**
+ * At phone width the iOS focus-zoom guard lifts fields to 16px. That rule may change a control's SIZE
+ * only: a family (or a `font` shorthand, which resets the family) inside a phone-width block would put
+ * phone fields back on a face other than the app's, which is the defect the base reset exists to fix.
+ */
+test("phone-width rules resize controls but never change their font family", () => {
+  const offenders: string[] = [];
+  let phoneBlocks = 0;
+  let guard: string[] | null = null;
+  postcss.parse(css).walkAtRules("media", (block) => {
+    const widths = [...block.params.matchAll(/max-width:\s*(\d+)px/g)].map((match) => Number(match[1]));
+    if (!widths.some((width) => width <= 760)) return;
+    phoneBlocks += 1;
+    block.walkRules((rule) => {
+      const controls = /\b(input|select|textarea|button)\b|composer-input/.test(rule.selector);
+      const declarations = rule.nodes.flatMap((node) => (node.type === "decl" ? [node] : []));
+      if (rule.selector.includes(":root .composer-input")) {
+        guard = declarations.map((declaration) => `${declaration.prop}: ${declaration.value}`);
+      }
+      if (!controls) return;
+      for (const declaration of declarations) {
+        if (declaration.prop === "font-family" || (declaration.prop === "font" && declaration.value !== "inherit")) {
+          offenders.push(`${rule.selector.replace(/\s+/g, " ")} { ${declaration.prop}: ${declaration.value} }`);
+        }
+      }
+    });
+  });
+  assert.ok(phoneBlocks > 0, "the phone-width media blocks must be found");
+  assert.deepEqual(offenders, [], "a phone rule must not change a control's font family");
+  assert.deepEqual(guard, ["font-size: 16px"], "the focus-zoom guard sets the size and nothing else");
+});
+
+test("links, native controls and code use the base recipes", () => {
+  assert.equal(baseRule("html"), "accent-color: var(--accent);");
+  assert.equal(baseRule("a, .link"), "color: var(--accent);");
+  assert.equal(baseRule("a.btn"), "text-decoration: none;");
+  assert.equal(baseRule("code, pre"), "font-family: var(--font-mono);");
+  assert.match(baseRule(":not(pre) > code"), /border: 1px solid var\(--border\);/);
+  // The chip belongs to inline code only. A bare `code` rule would put it back inside `pre`.
+  assert.throws(() => topLevelRule(css, "code"), /found 0/, "the chip must stay scoped to :not(pre) > code");
+  assert.equal(baseRule(":where(.form, .section, .surface, .notice, .empty) > *"), "margin: 0;");
 });
 
 test("the permission-mode popover keeps rows compact while long labels can wrap", () => {
