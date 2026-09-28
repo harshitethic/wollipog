@@ -381,9 +381,9 @@ for (const width of [390, 1400]) {
       [7, "Waiting on External Job"],
       [8, "Waiting on External Job"],
       [9, "Continuation Pending"],
-      [10, "Orphaned"],
+      [10, "Lost"],
     ] as const) {
-      const badge = page.locator(".inbox-row").nth(index).locator(".background-work-badge");
+      const badge = page.locator(".inbox-row").nth(index).locator(".status[data-group='background-work']");
       await expect(badge).toHaveCount(1);
       await expect(badge).toHaveAttribute("aria-label", `Background Work: ${label}`);
     }
@@ -400,7 +400,7 @@ for (const width of [390, 770, 1000, 1400]) {
       const style = getComputedStyle(row);
       const rightEdge = row.getBoundingClientRect().right - parseFloat(style.paddingRight);
       const pill = row.querySelector<HTMLElement>(".inbox-row-pr-pill")!;
-      const badge = row.querySelector<HTMLElement>(".background-work-badge")!;
+      const badge = row.querySelector<HTMLElement>(".status[data-group='background-work']")!;
       const branch = row.querySelector<HTMLElement>(".inbox-row-branch")!;
       const sender = row.querySelector<HTMLElement>(".inbox-row-sender")!;
       return {
@@ -457,7 +457,7 @@ const measureUnderSignalPressure = (page: import("@playwright/test").Page, count
     const signals = row.querySelector<HTMLElement>(".inbox-row-signals")!;
     for (let index = 0; index < pills; index += 1) {
       const pill = document.createElement("span");
-      pill.className = "inbox-status-pill blocked injected-pressure";
+      pill.className = "status sm t-warning injected-pressure";
       pill.textContent = "Approval Required";
       signals.prepend(pill);
     }
@@ -503,14 +503,17 @@ for (const width of [901, 1000, 1200, 1400]) {
 test("the crowded extreme spends the sender completely before the branch gives up anything", async ({ page }) => {
   await useViewport(page, 1400);
   const roomy = await measureUnderSignalPressure(page, 4);
-  // A full-width desktop card has room for all of it; nothing has to yield. Compared against the
-  // UNPRESSURED width rather than against 300px: the branch measures 341px here and about 329px on
-  // CI, so a bare floor near the real value spends most of its headroom on the renderer before it
-  // says anything about the layout.
+  // A full-width desktop card keeps its whole branch: whatever line one cannot hold comes out of
+  // the sender. Since the one status recipe (#1802) gives every pill a dot and 11px type, four
+  // extra pills in the widest face cost the sender some width at 1400px, but never the branch.
+  // Compared against the UNPRESSURED width rather than against 300px: the branch measures 341px
+  // here and about 329px on CI, so a bare floor near the real value spends most of its headroom on
+  // the renderer before it says anything about the layout.
   const unpressured = await measureUnderSignalPressure(page, 0);
   expectGeometry(Math.abs(roomy.branchWidth - unpressured.branchWidth), "wide cards preserve branch width under pressure")
     .toBeLessThanOrEqual(0.5);
-  expect(roomy.senderClipped).toBe(false);
+  expect(roomy.senderWidth, "only the sender pays for signal pressure").toBeLessThanOrEqual(unpressured.senderWidth);
+  expect(roomy.senderWidth, "a wide card still shows part of the sender").toBeGreaterThan(0);
 
   await useViewport(page, TABLET_BREAKPOINT_PX + 1);
   const tight = await measureUnderSignalPressure(page, 4);
@@ -866,7 +869,7 @@ test("a sender squeezed to nothing takes its icon with it instead of painting ov
     // 770px, and the premise of this test is that the sender really has been spent.
     for (let index = 0; index < 4; index += 1) {
       const pill = document.createElement("span");
-      pill.className = "inbox-status-pill blocked";
+      pill.className = "status sm t-warning";
       pill.textContent = "Approval Required";
       signals.prepend(pill);
     }
