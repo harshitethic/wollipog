@@ -49,6 +49,7 @@ const TABLE: readonly Row[] = [
   ["automation", "running", "Running", "info"],
   ["automation", "failed", "Failed", "danger"],
   // Tool call
+  ["tool", "pending", "Pending", "neutral"],
   ["tool", "running", "Running", "info"],
   ["tool", "completed", "Completed", "success"],
   ["tool", "failed", "Failed", "danger"],
@@ -80,6 +81,9 @@ const TABLE: readonly Row[] = [
   ["pod", "conflicted", "Conflicted", "warning"],
   ["pod", "failed", "Failed", "danger"],
   // Provider account
+  // Member
+  ["member", "active", "Active", "success"],
+  ["member", "suspended", "Suspended", "danger"],
   ["provider_account", "signed_in", "Signed In", "success"],
   ["provider_account", "sign_in_required", "Sign-In Required", "warning"],
   ["provider_account", "signed_out", "Signed Out", "neutral"],
@@ -116,7 +120,7 @@ test("an unknown value reads Status Unavailable, never its raw enum or a prototy
 
 test("every label is Title Case copy, with no glyph and no CSS transform needed", () => {
   for (const domain of ["attention", "session", "machine", "project_location", "skill", "automation", "tool", "family",
-    "job", "background_work", "delivery", "notification", "workflow", "pod", "provider_account", "usage"] as const) {
+    "job", "background_work", "delivery", "notification", "workflow", "pod", "member", "provider_account", "usage"] as const) {
     for (const value of statusValues(domain)) {
       const { label, shortLabel } = statusMeta(domain, value);
       for (const text of [label, shortLabel].filter((entry): entry is string => Boolean(entry))) {
