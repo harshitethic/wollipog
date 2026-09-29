@@ -31,7 +31,7 @@ import { loadKeySet, saveKeySet, SESSION_PIN_KEY } from "../pins.js";
 import { loadSeen, markSeen, markUnread, saveSeen } from "../sessions-seen.js";
 import { useStoreActions, useStoreSelector } from "../store.js";
 import { useInstanceScope } from "../instance-scope.js";
-import { encodeResourceId, type AttentionTarget, type SessionsTab } from "../navigation.js";
+import { destination, encodeResourceId, type AttentionTarget, type SessionsTab } from "../navigation.js";
 import { useApi } from "../api-context.js";
 import { useFeedback } from "./FeedbackProvider.js";
 import { InboxList, type InboxListEntry } from "./InboxList.js";
@@ -1290,7 +1290,7 @@ export function InboxView({
         inert={expanded || undefined}
       >
         <div className="toolbar">
-          <TabList className="inbox-tabs" label="Inbox Groups">
+          <TabList className="inbox-tabs" label="Sessions Tabs">
             {splits.map((split) => {
               const active = split.key === activeSplit?.key;
               const hasMenu = split.project !== null;
@@ -1312,7 +1312,7 @@ export function InboxView({
                     className="tab"
                     onClick={() => selectSplit(split.key)}
                     onKeyDown={(event) => onTabKeyDown(event, split.key)}
-                    title="Switch Inbox Group (Tab / Shift+Tab)"
+                    title="Switch Sessions tab (Tab / Shift+Tab)"
                   >
                     {split.name}
                     <span className="count">{split.count}</span>
@@ -1351,7 +1351,7 @@ export function InboxView({
           </TabList>
           <div className="inbox-toolbar-actions">
             <span className="sr-only" aria-live="polite" aria-atomic="true">
-              {orderUpdateAvailable ? "A newer Inbox order is available." : ""}
+              {orderUpdateAvailable ? "A newer Sessions order is available." : ""}
             </span>
             {/* Leading, not beside the Reminder View: this group is pinned to the toolbar's right edge,
                 so a conditional control must grow it leftward or it moves List / Board under the
@@ -1508,7 +1508,7 @@ export function InboxView({
                     showNewSession: false,
                   }
                   : {
-                    title: "No Sessions Yet",
+                    title: `No ${destination("inbox").name} Yet`,
                     description: `Start a session in ${activeSplit.name}.`,
                     showNewSession: true,
                   }
@@ -1530,8 +1530,8 @@ export function InboxView({
         />
         )}
         {!boardMode && (
-        <footer className="inbox-activity-footer" aria-label="Inbox Status and Shortcuts">
-          <div className="inbox-activity-summary" aria-label="Inbox Activity Summary">
+        <footer className="inbox-activity-footer" aria-label="Sessions Status and Shortcuts">
+          <div className="inbox-activity-summary" aria-label="Sessions Activity Summary">
             <span>{activityCounts.running} Running</span>
             <span>{activityCounts.queued} Queued</span>
             <span>{activityCounts.starting} Starting</span>
@@ -1574,7 +1574,7 @@ export function InboxView({
           <div
             className="inbox-splitter"
             role="separator"
-            aria-label="Resize Inbox Preview"
+            aria-label="Resize Sessions Preview"
             aria-orientation="horizontal"
             aria-valuemin={25}
             aria-valuemax={75}

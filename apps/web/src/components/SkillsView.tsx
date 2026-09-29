@@ -13,6 +13,7 @@ import { Select } from "./ui/ChoiceControls.js";
 import { SkillsIcon } from "./Icons.js";
 import { Markdown } from "./Markdown.js";
 import { PageHeader } from "./PageHeader.js";
+import { destination } from "../navigation.js";
 import { SkillGitImportDialog } from "./SkillGitImportDialog.js";
 import { SkillGitAutoUpdateControls } from "./SkillGitAutoUpdate.js";
 import { SkillMachineImportDialog } from "./SkillMachineImportDialog.js";
@@ -477,8 +478,8 @@ export function SkillsView({ selectedSkillId }: { selectedSkillId?: string } = {
   return (
     <section className="page full">
       <PageHeader
-        title="Agent Skills"
-        description="Write a skill once, then choose which machines and agents get it."
+        title={destination("skills").name}
+        description={destination("skills").description}
         // Left to right; the leftmost moves into ⋯ first, so Import from Git is the last to go.
         secondary={[
           { label: "Import from Machine", onClick: () => setDialog("machine-import") },
@@ -513,7 +514,7 @@ export function SkillsView({ selectedSkillId }: { selectedSkillId?: string } = {
             <State
               compact
               icon={<SkillsIcon />}
-              title="No Skills Yet"
+              title={`No ${destination("skills").name} Yet`}
               headingLevel={3}
               actions={
                 <button type="button" className="btn primary" onClick={() => setDialog("new-skill")}>

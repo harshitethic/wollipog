@@ -161,7 +161,7 @@ test("navigating to another route clears a view error", async () => {
     // Same route: the error stays, because re-rendering is not a recovery.
     await act(async () => view.root.render(<ErrorBoundary name="Automations" resetKey="/automations"><MaybeBroken /></ErrorBoundary>));
     assert.ok(view.container.querySelector('[role="alert"]'), "the error holds until the route changes");
-    await act(async () => view.root.render(<ErrorBoundary name="Usage & Cost" resetKey="/usage"><MaybeBroken /></ErrorBoundary>));
+    await act(async () => view.root.render(<ErrorBoundary name="Usage and Cost" resetKey="/usage"><MaybeBroken /></ErrorBoundary>));
     assertNoDomNode(view.container.querySelector('[role="alert"]'));
     assert.equal(view.container.querySelector(".content")?.textContent, "Usage");
   } finally {
@@ -206,7 +206,8 @@ test("a route's error title reads as its destination, and a detail route as This
   assert.equal(viewSubjectName({ name: "board" }), "Sessions");
   assert.equal(viewSubjectName({ name: "settings", section: "about" }), "Settings");
   assert.equal(viewSubjectName({ name: "session", id: "s1" }), "This Session");
-  assert.equal(viewSubjectName({ name: "run", id: "r1" }), "This Run");
+  // A run is a Multi-Agent Run before it loads (#1945), so it is never the bare "Run".
+  assert.equal(viewSubjectName({ name: "run", id: "r1" }), "This Multi-Agent Run");
   assert.equal(viewSubjectName({ name: "pod", id: "p1" }), "This Pod");
 });
 

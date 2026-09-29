@@ -29,6 +29,7 @@ import { Checkbox, Select } from "./ui/ChoiceControls.js";
 import { agentOptions } from "./agent-options.js";
 import { OutboundEventSubscriptions } from "./OutboundEventSubscriptions.js";
 import { PageHeader } from "./PageHeader.js";
+import { destination } from "../navigation.js";
 import {
   buildSpec,
   defaults,
@@ -572,8 +573,8 @@ export function AutomationsView() {
   return (
     <section className="page">
       <PageHeader
-        title="Automations"
-        description="Create or prompt sessions on a schedule."
+        title={destination("automations").name}
+        description={destination("automations").description}
         primary={{ label: "New Automation", onClick: openNewAutomation }}
       />
       {error && <div className="automation-error" role="alert">{error}</div>}
@@ -881,7 +882,7 @@ export function AutomationsView() {
         {items.length === 0 && !showForm && (listLoaded ? (
           <State
             icon={<AutomationsIcon />}
-            title="No Automations Yet"
+            title={`No ${destination("automations").name} Yet`}
             // This screen exposed an `h3` before the conversion, and heading navigation is how a
             // screen-reader user finds a section. Losing it is not a styling change.
             headingLevel={3}
