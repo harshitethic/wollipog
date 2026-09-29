@@ -572,6 +572,162 @@ test("attach preserves a bare primary record while permitting its linked worktre
   }
 });
 
+test("archive retirement requires delivery beyond a push while preserving dirty and unpushed worktrees", { skip: !haveGit() }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "wollipog-archive-retirement-"));
+  const dataDir = join(root, "data");
+  try {
+    const { repo } = initRepoWithOrigin(root);
+    execFileSync("git", ["-C", repo, "remote", "set-head", "origin", "main"]);
+    const original = await createRequestedWorktree(repo, "s_archive", {
+      baseRef: "HEAD", branch: "fix/original",
+    }, { dataDir });
+    assert.deepEqual(await discardWorktreeIfSafe(repo, "s_archive", { ...original, source: "created" },
+      { dataDir, requireDelivered: true }), { removed: true });
+    const pushed = await createRequestedWorktree(repo, "s_archive", {
+      baseRef: "HEAD", branch: "fix/pushed-unmerged",
+    }, { dataDir });
+    writeFileSync(join(pushed.path, "change.txt"), "change\n");
+    execFileSync("git", ["-C", pushed.path, "add", "change.txt"]);
+    execFileSync("git", ["-C", pushed.path, "commit", "-m", "pushed but unmerged"]);
+    execFileSync("git", ["-C", pushed.path, "push", "-u", "origin", pushed.branch]);
+    assert.deepEqual(await discardWorktreeIfSafe(repo, "s_archive", { ...pushed, source: "created" },
+      { dataDir, requireDelivered: true }), { removed: false, reason: "not_delivered" });
+    assert.equal(existsSync(pushed.path), true);
+    writeFileSync(join(pushed.path, "dirty.txt"), "retain\n");
+    assert.deepEqual(await discardWorktreeIfSafe(repo, "s_archive", { ...pushed, source: "created" },
+      { dataDir, requireDelivered: true }), { removed: false, reason: "dirty" });
+    rmSync(join(pushed.path, "dirty.txt"));
+    writeFileSync(join(pushed.path, "later.txt"), "local\n");
+    execFileSync("git", ["-C", pushed.path, "add", "later.txt"]);
+    execFileSync("git", ["-C", pushed.path, "commit", "-m", "local only"]);
+    assert.deepEqual(await discardWorktreeIfSafe(repo, "s_archive", { ...pushed, source: "created" },
+      { dataDir, requireDelivered: true }), { removed: false, reason: "unpushed" });
+    assert.equal(existsSync(pushed.path), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("archive retirement retries unavailable forge proof but refuses a confirmed open pull request", { skip: !haveGit() }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "wollipog-archive-forge-"));
+  const dataDir = join(root, "data");
+  let manager: SessionManager | undefined;
+  try {
+    const { repo } = initRepoWithOrigin(root);
+    const store = new SessionStore(join(dataDir, "sessions"));
+    store.create({
+      sessionId: "s_archive_forge", agentId: "claude", workspaceId: "repo", repoPath: repo,
+      worktreePath: null, driver: "claude-code", command: "claude", args: [], env: {},
+      context: { kind: "native" }, agentSessionId: null, status: "idle", title: "archive forge",
+      config: {}, tokensIn: 0, tokensOut: 0, costUsd: 0, preview: null, pendingApproval: null,
+      seq: 0, createdAt: 1, updatedAt: 1,
+    });
+    manager = new SessionManager(() => {}, () => {}, store, "runner", undefined, undefined, dataDir);
+    const created = await manager.requestWorktree("s_archive_forge", { baseRef: "HEAD", branch: "fix/open-pr" });
+    const current = store.readMeta("s_archive_forge")!;
+    store.patchMeta("s_archive_forge", { worktrees: current.worktrees?.map((item) =>
+      item.id === created.worktree.id
+        ? { ...item, pullRequest: { url: "https://github.com/picoduck/wollipog/pull/1730",
+          provider: "github" as const, state: "open" as const } }
+        : item) });
+    const internals = manager as unknown as {
+      resolveWorktreePullRequestState: () => Promise<{ state: "open" } | null>;
+    };
+    internals.resolveWorktreePullRequestState = async () => null;
+    await assert.rejects(manager.discardWorktree("s_archive_forge", created.worktree.path,
+      { requireDelivered: true }), /forge state is temporarily unavailable/);
+    internals.resolveWorktreePullRequestState = async () => ({ state: "open" });
+    await assert.rejects(manager.discardWorktree("s_archive_forge", created.worktree.path,
+      { requireDelivered: true }), /the linked pull request is not verified as merged/);
+    assert.equal(existsSync(created.worktree.path), true);
+    assert.equal(new WorktreeCleanupJournal(dataDir).list().length, 0);
+  } finally {
+    manager?.shutdownAll();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("archive retirement keeps an unlinked no-upstream worktree pending through forge outage and provider exit", { skip: !haveGit() }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "wollipog-archive-unlinked-forge-"));
+  const dataDir = join(root, "data");
+  const sent: RunnerToControlPlane[] = [];
+  let manager: SessionManager | undefined;
+  try {
+    const { repo } = initRepoWithOrigin(root);
+    const store = new SessionStore(join(dataDir, "sessions"));
+    store.create({
+      sessionId: "s_archive_unlinked", agentId: "claude", workspaceId: "repo", repoPath: repo,
+      worktreePath: null, driver: "claude-code", command: "claude", args: [], env: {},
+      context: { kind: "native" }, agentSessionId: null, status: "idle", title: "archive unlinked",
+      config: {}, tokensIn: 0, tokensOut: 0, costUsd: 0, preview: null, pendingApproval: null,
+      seq: 0, createdAt: 1, updatedAt: 1,
+    });
+    manager = new SessionManager((message) => sent.push(message), () => {}, store, "runner", undefined, undefined, dataDir);
+    const created = await manager.requestWorktree("s_archive_unlinked", { baseRef: "HEAD", branch: "fix/squashed" });
+    writeFileSync(join(created.worktree.path, "change.txt"), "squashed elsewhere\n");
+    execFileSync("git", ["-C", created.worktree.path, "add", "change.txt"]);
+    execFileSync("git", ["-C", created.worktree.path, "commit", "-m", "branch head"]);
+    let ineligible = false;
+    let unavailable = false;
+    assert.equal(await mergedWorktreePullRequestForBranch(created.worktree.path, created.worktree.branch, {
+      onIneligible: () => { ineligible = true; },
+      onForgeUnavailable: () => { unavailable = true; },
+    }), null);
+    assert.equal(ineligible, true, "a local bare origin is not a GitHub forge candidate");
+    assert.equal(unavailable, false);
+    await assert.rejects(manager.discardWorktree("s_archive_unlinked", created.worktree.path,
+      { requireDelivered: true }), /the branch has no upstream/);
+    const internals = manager as unknown as {
+      discoverMergedWorktreePullRequest: typeof mergedWorktreePullRequestForBranch;
+      active: Map<string, unknown>;
+      deleteActiveSession: (sessionId: string, expected: unknown) => boolean;
+      reapWorktree: (record: WorktreeCleanupRecord) => Promise<void>;
+    };
+    let discoveryCalls = 0;
+    internals.discoverMergedWorktreePullRequest = async (_path, _branch, options) => {
+      discoveryCalls += 1;
+      options.onForgeUnavailable?.();
+      return null;
+    };
+    await assert.rejects(manager.discardWorktree("s_archive_unlinked", created.worktree.path,
+      { requireDelivered: true }), /forge state is temporarily unavailable/);
+    assert.equal(existsSync(created.worktree.path), true);
+
+    const providerOwner = "runner:provider:archive-unlinked";
+    assert.equal(store.acquireWorktreeLease("s_archive_unlinked", providerOwner), true);
+    const activeEntry = { sessionId: "s_archive_unlinked", context: { kind: "native" },
+      cwd: created.worktree.path, worktree: created.worktree, worktreeLeaseOwner: providerOwner,
+      queue: [], client: { dispose: () => {} } };
+    internals.active.set("s_archive_unlinked", activeEntry);
+    assert.deepEqual((await manager.discardWorktree("s_archive_unlinked", created.worktree.path,
+      { requireDelivered: true })).retirement, { status: "deferred", reason: "provider_active" });
+    assert.equal(internals.deleteActiveSession("s_archive_unlinked", activeEntry), true);
+    await waitForCondition(() => discoveryCalls >= 3,
+      "deferred replay did not recheck the temporarily unavailable forge");
+    assert.equal(new WorktreeCleanupJournal(dataDir).list().some((item) =>
+      item.worktreeId === created.worktree.id), true,
+    "forge outage must retain the durable archive intent for retry");
+    assert.equal(existsSync(created.worktree.path), true);
+    assert.equal(sent.filter((message) => message.type === "session_worktree_retirement_refused").length, 0);
+    const headOid = execFileSync("git", ["-C", created.worktree.path, "rev-parse", "HEAD"],
+      { encoding: "utf8" }).trim();
+    internals.discoverMergedWorktreePullRequest = async () => ({
+      url: "https://github.com/picoduck/wollipog/pull/1730", state: "merged",
+      headOid, provider: "github", kind: "pull_request",
+    });
+    const pending = new WorktreeCleanupJournal(dataDir).list().find((item) =>
+      item.worktreeId === created.worktree.id);
+    assert.ok(pending);
+    await internals.reapWorktree(pending);
+    await waitForCondition(() => !existsSync(created.worktree.path) &&
+      new WorktreeCleanupJournal(dataDir).list().every((item) => item.worktreeId !== created.worktree.id),
+    "retirement did not resume after exact merged-head proof became available");
+  } finally {
+    manager?.shutdownAll();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("safe discard removes only a clean fully-pushed runner-owned worktree", { skip: !haveGit() }, async () => {
   const root = mkdtempSync(join(tmpdir(), "wollipog-safe-discard-"));
   const dataDir = join(root, "data");
@@ -7338,9 +7494,11 @@ test("an idempotent retry applies the default branch the remote just advertised"
 test("a running session discards its own finished worktrees despite the per-session provider lease", { skip: !haveGit() }, async () => {
   const root = mkdtempSync(join(tmpdir(), "wollipog-own-lease-discard-"));
   const dataDir = join(root, "data");
+  const sent: RunnerToControlPlane[] = [];
   let manager: SessionManager | undefined;
   try {
     const { repo } = initRepoWithOrigin(root);
+    execFileSync("git", ["-C", repo, "remote", "set-head", "origin", "main"]);
     const store = new SessionStore(join(dataDir, "sessions"));
     store.create({
       sessionId: "s_own_lease", agentId: "claude", workspaceId: "repo", repoPath: repo,
@@ -7349,7 +7507,7 @@ test("a running session discards its own finished worktrees despite the per-sess
       config: {}, tokensIn: 0, tokensOut: 0, costUsd: 0, preview: null, pendingApproval: null,
       seq: 0, createdAt: 1, updatedAt: 1,
     });
-    manager = new SessionManager(() => {}, () => {}, store, "runner", undefined, undefined, dataDir);
+    manager = new SessionManager((message) => sent.push(message), () => {}, store, "runner", undefined, undefined, dataDir);
     const finished = await manager.requestWorktree("s_own_lease", { baseRef: "HEAD", branch: "fix/finished" });
     const current = await manager.requestWorktree("s_own_lease", { baseRef: "HEAD", branch: "fix/current" });
     const third = await manager.requestWorktree("s_own_lease", { baseRef: "HEAD", branch: "fix/third" });
@@ -7424,7 +7582,8 @@ test("a running session discards its own finished worktrees despite the per-sess
       queue: [],
       client: { dispose: () => {} },
     });
-    const deferredCurrent = await manager.discardWorktree("s_own_lease", current.worktree.path);
+    const deferredCurrent = await manager.discardWorktree("s_own_lease", current.worktree.path,
+      { requireDelivered: true });
     assert.deepEqual(deferredCurrent.retirement, { status: "deferred", reason: "provider_active" });
     assert.equal(existsSync(current.worktree.path), true, "active provider keeps its selected path");
     const currentEntry = activeEntries.get("s_own_lease");
@@ -7450,6 +7609,29 @@ test("a running session discards its own finished worktrees despite the per-sess
     await assert.rejects(manager.discardWorktree("s_own_lease", fifth.worktree.path), /leased by another runner process/);
     store.releaseWorktreeLease("s_own_lease", "sibling-runner:provider");
     assert.equal(existsSync(fifth.worktree.path), true);
+
+    const unsafe = await manager.requestWorktree("s_own_lease", { baseRef: "HEAD", branch: "fix/unsafe-after-provider" });
+    execFileSync("git", ["-C", unsafe.worktree.path, "push", "-u", "origin", unsafe.worktree.branch]);
+    assert.equal(store.acquireWorktreeLease("s_own_lease", providerOwner), true);
+    const unsafeEntry = { sessionId: "s_own_lease", context: { kind: "native" }, cwd: unsafe.worktree.path,
+      worktree: { path: unsafe.worktree.path, branch: unsafe.worktree.branch },
+      worktreeLeaseOwner: providerOwner, queue: [], client: { dispose: () => {} } };
+    activeEntries.set("s_own_lease", unsafeEntry);
+    const deferredUnsafe = await manager.discardWorktree("s_own_lease", unsafe.worktree.path,
+      { requireDelivered: true });
+    assert.deepEqual(deferredUnsafe.retirement, { status: "deferred", reason: "provider_active" });
+    assert.equal(new WorktreeCleanupJournal(dataDir).list().find((item) =>
+      item.worktreeId === unsafe.worktree.id)?.trigger, "archive_retirement");
+    writeFileSync(join(unsafe.worktree.path, "local.txt"), "keep\n");
+    assert.equal((manager as unknown as {
+      deleteActiveSession: (sessionId: string, expected: unknown) => boolean;
+    }).deleteActiveSession("s_own_lease", unsafeEntry), true);
+    await waitForCondition(() => new WorktreeCleanupJournal(dataDir).list().every((item) =>
+      item.worktreeId !== unsafe.worktree.id), "terminal safety refusal did not clear deferred intent");
+    assert.equal(existsSync(unsafe.worktree.path), true);
+    assert.deepEqual(sent.filter((message) => message.type === "session_worktree_retirement_refused" &&
+      message.path === unsafe.worktree.path).map((message) => message.reason),
+    ["the worktree has uncommitted changes"]);
   } finally {
     manager?.shutdownAll();
     rmSync(root, { recursive: true, force: true });

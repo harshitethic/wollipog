@@ -136,7 +136,7 @@ export interface WorktreeCleanupRecord {
    * session and its checkpoint generation remain live. */
   auxiliaryWorktreeRollback?: boolean;
   /** Exact initiating lifecycle. Startup replay preserves rather than replaces this value. */
-  trigger?: "explicit_discard" | "pull_request_reconciliation" | "session_delete" | "creation_rollback";
+  trigger?: "explicit_discard" | "archive_retirement" | "pull_request_reconciliation" | "session_delete" | "creation_rollback";
   /** Explicit discard/reconciliation retains Git safety checks; deletion/rollback keeps legacy force cleanup. */
   removalMode?: "safe" | "force";
   /** Exact approved teardown material. Runner-private and never projected to the control plane. */
@@ -1591,6 +1591,19 @@ export async function mergedWorktreePullRequestForBranch(
       return null;
     }
     const identity = { remote, merge, headOid: head };
+    if (!options.runForgeCommand) {
+      const remoteUrl = (await command(
+        context, worktreePath, ["remote", "get-url", remote || "origin"], preflightTimeoutMs,
+      )).trim();
+      const githubRemote = /^git@github\.com:/iu.test(remoteUrl) || (() => {
+        try { return new URL(remoteUrl).hostname.toLowerCase() === "github.com"; }
+        catch { return false; }
+      })();
+      if (!githubRemote) {
+        options.onIneligible?.();
+        return null;
+      }
+    }
     if (options.onForgeAttempt && !options.onForgeAttempt(identity)) return null;
     try {
       const result = await (options.runForgeCommand ?? runContextCommand)(
@@ -1603,8 +1616,9 @@ export async function mergedWorktreePullRequestForBranch(
         { cwd: worktreePath, timeoutMs: 30_000, maxBuffer: 1024 * 1024 },
       );
       return parseMergedWorktreePullRequestForBranch(result.stdout, branch, head);
-    } catch {
-      options.onForgeUnavailable?.();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") options.onIneligible?.();
+      else options.onForgeUnavailable?.();
       return null;
     }
   } catch {
@@ -1624,7 +1638,7 @@ export type SafeWorktreeDiscardResult =
     }
   | {
       removed: false;
-      reason: "detached_head" | "not_runner_owned" | "dirty" | "no_upstream" | "unpushed" | "unavailable";
+      reason: "detached_head" | "not_runner_owned" | "dirty" | "no_upstream" | "unpushed" | "not_delivered" | "unavailable";
     };
 
 export type RetainedWorktreeRefReclaimResult =
@@ -1888,6 +1902,7 @@ export async function discardWorktreeIfSafe(
   handle: WorktreeHandle & { source: "legacy" | "created" },
   options: WorktreeOptions & {
     verifiedMergedHead?: string;
+    requireDelivered?: boolean;
     beforeRemove?: () => Promise<void>;
     /** Fault-injection boundary after Git removes the worktree but before branch cleanup. */
     afterRemove?: () => Promise<void>;
@@ -2047,6 +2062,20 @@ export async function discardWorktreeIfSafe(
           checkedOutRefReasons.push("default_branch");
         }
       }
+    }
+
+    if (options.requireDelivered && options.verifiedMergedHead !== head) {
+      const defaultBranch = await readRepositoryDefaultBranch(repoPath, options);
+      let delivered = false;
+      if (defaultBranch) {
+        try {
+          const defaultRef = `refs/remotes/origin/${await validateBranch(context, repoPath, defaultBranch)}`;
+          delivered = (await command(context, repoPath, ["rev-list", "--count", `${defaultRef}..${head}`])).trim() === "0";
+        } catch {
+          // An unavailable default branch cannot prove delivery.
+        }
+      }
+      if (!delivered) return { removed: false, reason: "not_delivered" };
     }
 
     const retainedRefs: RetainedWorktreeRefCandidate[] = [];
