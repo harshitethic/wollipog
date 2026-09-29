@@ -136,6 +136,60 @@ test("session broadcasts preserve the in-flight action guard", async () => {
   }
 });
 
+test("a typed draft survives the card unmounting while another session notice shows (#1966)", async () => {
+  const session = { ...recoverySession(), id: "draft-session" };
+  const branchInput = (container: HTMLElement) => container.querySelectorAll("input")[1] as HTMLInputElement;
+  const first = await renderCard({ session });
+  const setValue = Object.getOwnPropertyDescriptor(domWindow.HTMLInputElement.prototype, "value")!.set!;
+  // React's change plugin watches the focused input through keyup here, so type as a person would.
+  await act(async () => {
+    const input = branchInput(first.container);
+    input.focus();
+    setValue.call(input, "fix/my-restored-work");
+    input.dispatchEvent(new domWindow.InputEvent("input", { bubbles: true, data: "x" }) as never);
+    input.dispatchEvent(new domWindow.KeyboardEvent("keyup", { bubbles: true, key: "k" }) as never);
+  });
+  await act(async () => first.root.unmount());
+  first.container.remove();
+
+  const creates: string[] = [];
+  const again = await renderCard({ session, onCreate: async ({ branch }) => { creates.push(branch); } });
+  const create = [...again.container.querySelectorAll("button")]
+    .find((button) => button.textContent === "Create Replacement") as HTMLButtonElement;
+  await act(async () => { create.click(); });
+  assert.deepEqual(creates, ["fix/my-restored-work"], "the remounted form creates the typed branch");
+  const fresh = await renderCard({
+    session: { ...session, worktreeRecovery: { ...session.worktreeRecovery!, recoveryId: "worktree-recovery:next" } },
+  });
+  try {
+    assert.equal(branchInput(again.container).value, "fix/my-restored-work", "the same incident keeps the draft");
+    assert.equal(branchInput(fresh.container).value, "fix/missing-recovery", "a new incident starts fresh");
+  } finally {
+    for (const view of [again, fresh]) {
+      await act(async () => view.root.unmount());
+      view.container.remove();
+    }
+  }
+});
+
+test("a selection still running from an earlier mount keeps both actions refused (#1966)", async () => {
+  const container = domWindow.document.createElement("div") as unknown as HTMLDivElement;
+  domWindow.document.body.append(container as never);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(
+      <WorktreeRecoveryCard session={recoverySession()} runnerOnline selecting
+        onCreate={async () => {}} onSelect={async () => {}} />,
+    ));
+    const buttons = [...container.querySelectorAll(".worktree-recovery-controls button.btn")] as HTMLButtonElement[];
+    assert.deepEqual(buttons.map((button) => button.textContent), ["Create Replacement", "Selecting…"]);
+    assert.ok(buttons.every((button) => button.disabled), "neither a second selection nor a create can start");
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+  }
+});
+
 test("a repeated recovery proposes a fresh replacement branch", async () => {
   const { container, root } = await renderCard({ session: recoverySession("fix/missing-recovery") });
   try {
