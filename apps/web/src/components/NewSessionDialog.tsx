@@ -82,6 +82,7 @@ import {
   SearchableCombobox,
   SegmentedControl,
   Select,
+  type PickerCreateOption,
   type SearchableComboboxOption,
   useTapOnlyPicker,
 } from "./ui/ChoiceControls.js";
@@ -213,6 +214,17 @@ export function NewSessionDialog({
   const [projectLocationId, setProjectLocationId] = useState(initialProjectLocation?.id ?? "");
   const projectSelectionChangedRef = useRef(false);
   const [creatingProject, setCreatingProject] = useState(false);
+  // Which control opened Create Project, so closing it returns focus there rather than to the
+  // other one: the button below the picker, or the picker's own no-match row.
+  const [createProjectFromPicker, setCreateProjectFromPicker] = useState(false);
+  // A Project search that finds nothing offers to create one, beside the button that already does.
+  const createProjectOption: PickerCreateOption = {
+    label: "Create Project…",
+    onSelect: () => {
+      setCreateProjectFromPicker(true);
+      setCreatingProject(true);
+    },
+  };
   const [addingLocation, setAddingLocation] = useState(false);
   // New Session stays open under Create Project and Add Location (§7.1): these return focus to the
   // button inside it that opened them.
@@ -312,6 +324,15 @@ export function NewSessionDialog({
   const retainedSessionButtonRef = useRef<HTMLButtonElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
   const projectChoiceRef = useRef<HTMLDivElement>(null);
+  // The Project control as it is when the dialog above it closes: the combobox, or on touch the
+  // Select trigger, whichever this width renders. Read then, because the width may have changed.
+  const projectPickerFocusRef = useMemo(() => ({
+    get current() {
+      return projectChoiceRef.current?.querySelector<HTMLElement>(
+        '[role="combobox"][aria-label="Project"], button[aria-label^="Project:"]',
+      ) ?? null;
+    },
+  }), []);
   const agentChoiceRef = useRef<HTMLDivElement>(null);
   const generatedFormId = useId();
   const formId = `${generatedFormId}-new-session`;
@@ -383,6 +404,8 @@ export function NewSessionDialog({
     executionTargets.find((target) => target.adapter === "host" &&
       target.workspaceStrategy === (useWorktree ? "worktree" : "in_place"));
   const agent = selectedAgentOption?.agent;
+  // Inside the Agent field (§8.4), so its left edge lines up with Project's and every other field's.
+  const agentIcon = <AgentIcon driver={agent?.driver ?? "acp"} agentName={agent?.name} size={16} />;
   const provider = agent?.driver === "claude-code" ? "claude"
     : agent?.driver === "codex" || agent?.driver === "codex-app-server" ? "codex" : null;
   const providerAccounts = (runner?.providerAccounts ?? []).filter((account) =>
@@ -1070,7 +1093,7 @@ export function NewSessionDialog({
         focusValidationProblem('button[aria-label^="Workspace:"]');
       } else if (!agentId || !selectedAgentOption || selectedAgentOption.disabled) {
         setValidationError("Pick a runner, workspace, and agent.");
-        focusValidationProblem('.agent-select [aria-haspopup="listbox"]');
+        focusValidationProblem('[role="combobox"][aria-label="Agent"], button[aria-label^="Agent:"]');
       } else if (missingRequiredAccountChoice) {
         setValidationError("Choose an account because the saved default is no longer available.");
         focusValidationProblem('button[aria-label^="Account:"]');
@@ -1256,6 +1279,9 @@ export function NewSessionDialog({
                     options={projectOptions}
                     placeholder="Choose a Project…"
                     emptyLabel="No Projects Available"
+                    searchable
+                    noun="projects"
+                    createOption={createProjectOption}
                   />
                 ) : (
                   <SearchableCombobox<string>
@@ -1267,7 +1293,9 @@ export function NewSessionDialog({
                     onChange={pickProject}
                     options={projectOptions}
                     placeholder="Choose a Project…"
-                    emptyLabel="No Matching Projects"
+                    emptyLabel="No Projects Available"
+                    noun="projects"
+                    createOption={createProjectOption}
                   />
                 )}
               </div>
@@ -1281,7 +1309,7 @@ export function NewSessionDialog({
                       ? `A Project is a durable home across Locations. ${projectAudienceVisibilitySummary(selectedProject.audience)}. New session transcripts use the Project's visibility.`
                       : "A Project is a durable home for related sessions across Locations. This control plane does not report the Project's visibility."}
                 </span>
-                <button ref={createProjectButtonRef} type="button" className="btn ghost new-session-project-control" onClick={() => setCreatingProject(true)}>Create Project…</button>
+                <button ref={createProjectButtonRef} type="button" className="btn ghost new-session-project-control" onClick={() => { setCreateProjectFromPicker(false); setCreatingProject(true); }}>Create Project…</button>
               </div>
             </>
           )}
@@ -1482,8 +1510,7 @@ export function NewSessionDialog({
 
           <div className="field">
             <label className="new-session-field-label" htmlFor={touchChoicePicker ? undefined : agentInputId}>Agent</label>
-            <div className="agent-select" ref={agentChoiceRef}>
-              <AgentIcon driver={agent?.driver ?? "acp"} agentName={agent?.name} size={15} />
+            <div ref={agentChoiceRef}>
               {touchChoicePicker ? (
                 <Select<string>
                   className="new-session-choice-control"
@@ -1493,6 +1520,9 @@ export function NewSessionDialog({
                   options={agentComboboxOptions}
                   placeholder="Choose an Agent…"
                   emptyLabel="No Agents Available"
+                  leadingIcon={agentIcon}
+                  searchable
+                  noun="agents"
                 />
               ) : (
                 <SearchableCombobox<string>
@@ -1503,7 +1533,9 @@ export function NewSessionDialog({
                   onChange={selectAgent}
                   options={agentComboboxOptions}
                   placeholder="Choose an Agent…"
-                  emptyLabel="No Matching Agents"
+                  emptyLabel="No Agents Available"
+                  leadingIcon={agentIcon}
+                  noun="agents"
                 />
               )}
             </div>
@@ -1970,7 +2002,7 @@ export function NewSessionDialog({
     {creatingProject && (
       <CreateProjectDialog
         accessScopeManagementSupported={accessScopeManagementSupported}
-        returnFocusRef={createProjectButtonRef}
+        returnFocusRef={createProjectFromPicker ? projectPickerFocusRef : createProjectButtonRef}
         onClose={() => setCreatingProject(false)}
         onCreated={(project) => {
           projectSelectionChangedRef.current = true;
