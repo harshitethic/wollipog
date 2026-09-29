@@ -238,6 +238,8 @@ export function withHoldAdviceFor<T extends Pick<SessionView, "holds" | "queueHo
 export interface SessionCommandPermissionSource {
   isSessionOwner(principal: HumanPrincipal, sessionId: string): boolean;
   isSessionDescendant(ancestorId: string, targetId: string): boolean;
+  /** Whether `principal` may read the session at all; a campaign lists only such held children. */
+  canAccessSession(principal: AuthPrincipal, sessionId: string): boolean;
   /** The records behind a projection's holds, read for every held child it lists. */
   sessionHoldRecords(ids: readonly string[]): Map<string,
     Pick<SessionView, "orchestratorPolicy" | "worktreeRecovery" | "queueHold"> & { parentSessionId: string | null }>;
@@ -269,15 +271,68 @@ export function sessionHoldReaderFor(
   return principal ? sessionHoldReader(principal, target, permissionFacts(source, principal, target.id)) : undefined;
 }
 
-/** A campaign projection whose held children's advice is written for the principal reading it:
- * an agent credential (#1863) or a person (#1867, #1875), who reads it in Held Children whether or
- * not the dashboard has loaded the child. The projection spans every campaign descendant, and only
- * a direct child's jobs are the Orchestrator's to stop. */
-export function withCampaignHoldAdviceFor<T extends Pick<OrchestratorCampaignProjection, "heldChildren">>(
-  source: SessionCommandPermissionSource,
+/** A campaign projection listing only the held children `principal` may open. A campaign's
+ * sessions start with one audience, but each can be re-scoped or filed into a Project on its own
+ * afterward, so a reader of the Orchestrator need not be a reader of every child. Without a
+ * principal (a trusted local connection) the projection is returned unchanged. */
+export function withVisibleHeldChildren<T extends Pick<OrchestratorCampaignProjection, "heldChildren">>(
+  source: Pick<SessionCommandPermissionSource, "canAccessSession">,
   principal: AuthPrincipal | null | undefined,
   projection: T,
 ): T {
+  if (!principal || !projection.heldChildren?.length) return projection;
+  const visible = projection.heldChildren.filter((child) => source.canAccessSession(principal, child.sessionId));
+  if (visible.length === projection.heldChildren.length) return projection;
+  if (visible.length) return { ...projection, heldChildren: visible };
+  const { heldChildren: _hidden, ...rest } = projection;
+  return rest as T;
+}
+
+/** A route's response with every campaign it embeds narrowed by `withVisibleHeldChildren`, whether
+ * it is a campaign projection, a session view, a list of either, or one field of the response
+ * (`{ session }`, `{ sessions }`, `{ sideChat }`, `{ campaign }`). A route that returns the view it
+ * changed does not write it for the requester, so this is applied to every response. */
+export function withVisibleCampaignChildren(
+  source: Pick<SessionCommandPermissionSource, "canAccessSession">,
+  principal: AuthPrincipal | null | undefined,
+  payload: unknown,
+): unknown {
+  if (!principal) return payload;
+  const narrowView = (value: unknown): unknown => {
+    if (typeof value !== "object" || value === null) return value;
+    if (Array.isArray((value as Partial<OrchestratorCampaignProjection>).heldChildren)) {
+      return withVisibleHeldChildren(source, principal, value as Pick<OrchestratorCampaignProjection, "heldChildren">);
+    }
+    const campaign = (value as Partial<SessionView>).orchestratorCampaign;
+    if (!campaign?.heldChildren?.length) return value;
+    const visible = withVisibleHeldChildren(source, principal, campaign);
+    return visible === campaign ? value : { ...value, orchestratorCampaign: visible };
+  };
+  const narrow = (value: unknown): unknown => {
+    if (!Array.isArray(value)) return narrowView(value);
+    const narrowed = value.map(narrowView);
+    return narrowed.some((item, index) => item !== value[index]) ? narrowed : value;
+  };
+  const top = narrow(payload);
+  if (typeof top !== "object" || top === null || Array.isArray(top)) return top;
+  let result = top as Record<string, unknown>;
+  for (const [key, value] of Object.entries(top)) {
+    const narrowed = narrow(value);
+    if (narrowed !== value) result = { ...result, [key]: narrowed };
+  }
+  return result;
+}
+
+/** A campaign projection listing only the held children the principal reading it may open, each
+ * with advice written for them: an agent credential (#1863) or a person (#1867, #1875), who reads
+ * it in Held Children whether or not the dashboard has loaded the child. The projection spans every
+ * campaign descendant, and only a direct child's jobs are the Orchestrator's to stop. */
+export function withCampaignHoldAdviceFor<T extends Pick<OrchestratorCampaignProjection, "heldChildren">>(
+  source: SessionCommandPermissionSource,
+  principal: AuthPrincipal | null | undefined,
+  campaign: T,
+): T {
+  const projection = withVisibleHeldChildren(source, principal, campaign);
   if (!principal || !projection.heldChildren?.length) return projection;
   // A child without a record is returned as the projection listed it.
   const records = source.sessionHoldRecords(projection.heldChildren.map((child) => child.sessionId));

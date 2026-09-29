@@ -167,6 +167,7 @@ import { APP_RELEASE_VERSION, RUNNER_RELEASE_TAG } from "./release-version.js";
 import { readSshConfigHosts } from "./ssh-config.js";
 import { ControlPlaneDb, GOVERNANCE_AUDIT_RETENTION_MS } from "./db.js";
 import { registerSessionLookupRoute } from "./session-lookup-route.js";
+import { registerVisibleCampaignChildrenHook } from "./visible-campaign-children-hook.js";
 import {
   sessionHoldReaderFor,
   withCampaignHoldAdviceFor,
@@ -785,6 +786,8 @@ app.addHook("preHandler", async (req) => {
   });
   requestMutationAudits.set(req, auditId);
 });
+
+registerVisibleCampaignChildrenHook(app, { db, requestPrincipal: (req) => requestPrincipals.get(req) ?? requestPrincipal(req) });
 
 // Complete authorized intents and append content-free attribution for attempts rejected by an
 // earlier auth hook. A status of 0 therefore means the process ended while the handler ran.

@@ -30,8 +30,10 @@ import {
   withHoldAdviceFor,
   withSessionCommandPermissions,
   withSessionHoldAdviceFor,
+  withVisibleCampaignChildren,
   type SessionCommandPermissionSource,
 } from "./session-command-permissions.js";
+import { registerVisibleCampaignChildrenHook } from "./visible-campaign-children-hook.js";
 
 const VIEWER = "Your Viewer role is read-only.";
 const STOP_JOB_OWNER = "Only the session owner or its controlling Orchestrator can stop its background jobs.";
@@ -260,6 +262,7 @@ test("a campaign's held children are written for the agent credential reading it
   const source: SessionCommandPermissionSource = {
     isSessionOwner: () => false,
     isSessionDescendant: (ancestor, target) => ancestor === "s_nested" && target === "s_grandchild",
+    canAccessSession: () => true,
     sessionHoldRecords: (ids) => new Map(ids.flatMap((id) => records.has(id) ? [[id, records.get(id)!] as const] : [])),
   };
   const projection = {
@@ -319,6 +322,7 @@ test("a person's Held Children advice is written for them, looking up only the o
   const source: SessionCommandPermissionSource = {
     isSessionOwner: (_principal, id) => { ownerLookups.push(id); return owned.has(id); },
     isSessionDescendant: () => false,
+    canAccessSession: () => true,
     sessionHoldRecords: (ids) => {
       recordReads.push([...ids]);
       return new Map(ids.flatMap((id) => records.has(id) ? [[id, records.get(id)!] as const] : []));
@@ -529,8 +533,8 @@ test("a person's Held Children carry queue-hold advice written for them, for a c
     assert.equal(response.statusCode, 200);
     return heldAdvice((response.json() as { session: SessionView }).session);
   };
+  // A Viewer is not listed the child they cannot open.
   const viewerAdvice = {
-    "held-private": [queueHoldRecoveryAction(stoppable, { canStopJobs: false, canRestart: false })],
     "held-shared": [queueHoldRecoveryAction(unstoppable, { canStopJobs: false, canRestart: false })],
   };
   const adminAdvice = {
@@ -564,7 +568,7 @@ test("a person's Held Children carry queue-hold advice written for them, for a c
   assert.equal(sessions.some((session) => session.id === "held-private"), false,
     "the Viewer's dashboard never loads the child it cannot see");
   assert.deepEqual(heldAdvice(sessions.find((session) => session.id === "orch")), viewerAdvice,
-    "but Held Children lists it with advice written for them");
+    "and Held Children do not list it either");
   hub.sessionChangedById("orch");
   const upsertAdvice = (messages: ControlPlaneToUi[]) => {
     const upsert = [...messages].reverse().find((message) => message.type === "session_upsert" && message.session.id === "orch");
@@ -586,6 +590,250 @@ test("a person's Held Children carry queue-hold advice written for them, for a c
   assert.deepEqual(upsertAdvice(clients.admin), serverCopy, "the admin now owns the child and may stop its job");
   hub.closeScopedUiClients();
   assert.equal(orchUpserts(), before + 1, "unchanged advice is not resent");
+});
+
+test("Held Children list only the children the reader may open, in every response shape", () => {
+  const queueHold = {
+    kind: "worktree_rebind" as const, holdId: "qh_1", since: 1, target: "/w/next", queuedPrompts: 1,
+    unfinishedBackgroundJobs: 1, canStopJobs: true as const,
+  };
+  const projection = {
+    heldChildren: ["s_a", "s_b", "s_c"].map((sessionId) => ({ sessionId, holds: sessionHolds({ queueHold }) })),
+  };
+  let open = new Set(["s_a", "s_c"]);
+  let recordReads: string[][] = [];
+  const source: SessionCommandPermissionSource = {
+    isSessionOwner: () => false,
+    isSessionDescendant: () => false,
+    canAccessSession: (_principal, id) => open.has(id),
+    sessionHoldRecords: (ids) => { recordReads.push([...ids]); return new Map(); },
+  };
+  const agent: AgentPrincipal = {
+    kind: "agent", actorId: "s_orch", credentialSessionId: "s_orch", orchestrator: true, organizationId: "org_1",
+    delegatedScope: { organizationId: "org_1", owner: { kind: "user", userId: "usr_1" } },
+  };
+  const listed = (value: { heldChildren?: Array<{ sessionId: string }> } | undefined) =>
+    value?.heldChildren?.map((child) => child.sessionId);
+  for (const principal of [human("viewer"), human("operator"), agent]) {
+    recordReads = [];
+    assert.deepEqual(listed(withCampaignHoldAdviceFor(source, principal, projection)), ["s_a", "s_c"],
+      `a ${principal.kind === "agent" ? "session credential" : principal.role} is listed only the children it may open`);
+    assert.deepEqual(recordReads, [["s_a", "s_c"]], "and no other child's record is read");
+  }
+  assert.equal(withCampaignHoldAdviceFor(source, null, projection), projection, "a trusted local read is unchanged");
+
+  open = new Set();
+  assert.equal("heldChildren" in withCampaignHoldAdviceFor(source, human("viewer"), projection), false,
+    "a reader who may open none is listed none");
+
+  // A route that returns the view it changed is narrowed too, whatever shape carries the view.
+  open = new Set(["s_b"]);
+  const view = { id: "s_orch", title: "Orchestrator", orchestratorCampaign: projection };
+  const narrowed = (payload: unknown) => withVisibleCampaignChildren(source, human("operator"), payload);
+  assert.deepEqual(listed((narrowed(view) as typeof view).orchestratorCampaign), ["s_b"]);
+  assert.deepEqual(listed((narrowed({ session: view }) as { session: typeof view }).session.orchestratorCampaign), ["s_b"]);
+  assert.deepEqual(listed((narrowed({ sessions: [view] }) as { sessions: Array<typeof view> }).sessions[0]!.orchestratorCampaign),
+    ["s_b"]);
+  assert.deepEqual(listed((narrowed([view]) as Array<typeof view>)[0]!.orchestratorCampaign), ["s_b"]);
+  assert.deepEqual(listed((narrowed({ sideChat: view }) as { sideChat: typeof view }).sideChat.orchestratorCampaign), ["s_b"]);
+  // verify_campaign_child returns the campaign projection itself beside the child it verified.
+  assert.deepEqual(listed((narrowed({ campaign: projection, child: { id: "s_b" } }) as { campaign: typeof projection }).campaign),
+    ["s_b"]);
+  assert.deepEqual(listed(narrowed(projection) as typeof projection), ["s_b"]);
+  assert.equal((narrowed(view) as typeof view).title, "Orchestrator", "the rest of the view is kept");
+  const unrelated = { ok: true };
+  assert.equal(narrowed(unrelated), unrelated, "a response without a campaign is returned as it was");
+  open = new Set(["s_a", "s_b", "s_c"]);
+  assert.equal(narrowed(view), view, "a reader who may open every child is returned the same view");
+  open = new Set();
+  assert.equal(withVisibleCampaignChildren(source, null, view), view, "a trusted local response is unchanged");
+});
+
+test("readers of one Orchestrator are each listed only the held children they may open, over reads, changed views, and live updates", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "held-children-audience-"));
+  const database = join(root, "control-plane.db");
+  // Two children held identically, so each reader's advice reads the same whichever child it names.
+  const queueHold: SessionQueueHoldView = {
+    kind: "worktree_rebind", holdId: "qh-a", since: 10, target: "/w/next", queuedPrompts: 1, unfinishedBackgroundJobs: 1,
+  };
+  const recovery: WorktreeRecoveryView = {
+    recoveryId: "wr-private", detectedAt: 10, selectedPath: "/w/private-child", expectedBranch: "agent/private-child",
+    detail: "the worktree is now on branch fix/private-work instead of agent/private-child",
+  };
+  const seed = ControlPlaneDb.open(database);
+  const local = seed.localIdentityContext();
+  try {
+    seed.registerRunner({ runnerId: "r", hostname: "test", os: "linux", version: "test", agents: [], workspaces: [] }, 1, 55);
+    for (const [userId, role] of [
+      ["usr_admin", "admin"], ["usr_owner", "operator"], ["usr_operator", "operator"],
+      ["usr_viewer_a", "viewer"], ["usr_viewer_b", "viewer"],
+    ] as const) {
+      seed.createIdentityMember({ userId, displayName: userId, organizationId: local.organizationId, role, now: 2 });
+    }
+    seed.createIdentityTeam({ teamId: "team-a", organizationId: local.organizationId, name: "A",
+      memberUserIds: ["usr_owner", "usr_viewer_a"], now: 2 });
+    seed.createIdentityTeam({ teamId: "team-b", organizationId: local.organizationId, name: "B",
+      memberUserIds: ["usr_owner", "usr_viewer_b"], now: 2 });
+    const scoped = (owner: { kind: "organization"; organizationId: string } | { kind: "team"; teamId: string } |
+      { kind: "user"; userId: string }) => ({ organizationId: local.organizationId, owner });
+    seed.createSession({ id: "orch", runnerId: "r", workspaceId: null, agentId: null, title: "Orchestrator",
+      useWorktree: false, driver: "codex", config: { permissionMode: "orchestrator" },
+      orchestratorPolicy: resolveOrchestratorCampaignPolicy(DEFAULT_ORCHESTRATOR_DEFAULTS, "system_default", {}),
+      scope: scoped({ kind: "organization", organizationId: local.organizationId }), now: 3 });
+    for (const [id, scope] of [
+      ["child-a", scoped({ kind: "team", teamId: "team-a" })],
+      ["child-b", scoped({ kind: "team", teamId: "team-b" })],
+      ["child-private", scoped({ kind: "user", userId: "usr_owner" })],
+    ] as const) {
+      seed.createSession({ id, parentSessionId: "orch", runnerId: "r", workspaceId: null, agentId: null, title: id,
+        useWorktree: false, driver: "codex", config: {}, scope, now: 4 });
+    }
+  } finally { seed.close(); }
+  const raw = new DatabaseSync(database);
+  try {
+    raw.prepare("UPDATE sessions SET queue_hold=? WHERE id=?").run(JSON.stringify(queueHold), "child-a");
+    raw.prepare("UPDATE sessions SET queue_hold=? WHERE id=?").run(JSON.stringify({ ...queueHold, holdId: "qh-b" }), "child-b");
+    raw.prepare("UPDATE sessions SET worktree_recovery=? WHERE id=?").run(JSON.stringify(recovery), "child-private");
+  } finally { raw.close(); }
+  const db = ControlPlaneDb.open(database);
+  const member = (userId: string, role: HumanPrincipal["role"]): HumanPrincipal => ({
+    ...human(role, userId), organizationId: local.organizationId, organizationName: local.organizationName,
+  });
+  const principals: Record<string, HumanPrincipal> = {
+    admin: member("usr_admin", "admin"), owner: member("usr_owner", "operator"), operator: member("usr_operator", "operator"),
+    viewerA: member("usr_viewer_a", "viewer"), viewerB: member("usr_viewer_b", "viewer"),
+  };
+  const app = Fastify();
+  const requestPrincipal = (req: { headers: { authorization?: string } }) => principals[String(req.headers.authorization)] ?? null;
+  registerVisibleCampaignChildrenHook(app, { db, requestPrincipal });
+  registerSessionLookupRoute(app, { db, requestPrincipal });
+  // A route that returns the view it changed, as the control plane's session commands do.
+  app.post("/api/sessions/:id/title", async (req) => db.getSession((req.params as { id: string }).id));
+  await app.ready();
+  t.after(async () => { await app.close(); db.close(); rmSync(root, { recursive: true, force: true }); });
+
+  const listed = (session: SessionView | undefined) => session?.orchestratorCampaign?.heldChildren?.map((child) => child.sessionId);
+  const read = async (who: string) => {
+    const response = await app.inject({ method: "GET", url: "/api/sessions/lookup/by-id?id=orch", headers: { authorization: who } });
+    assert.equal(response.statusCode, 200);
+    return { session: (response.json() as { session: SessionView }).session, body: response.body };
+  };
+  const changed = async (who: string) => {
+    const response = await app.inject({ method: "POST", url: "/api/sessions/orch/title", headers: { authorization: who } });
+    return { session: response.json() as SessionView, body: response.body };
+  };
+  const everyChild = ["child-private", "child-b", "child-a"].sort();
+  assert.deepEqual(listed(db.getSession("orch") ?? undefined)?.sort(), everyChild, "the server's copy lists every held child");
+  const expected: Record<string, string[] | undefined> = {
+    admin: everyChild, owner: everyChild, operator: undefined, viewerA: ["child-a"], viewerB: ["child-b"],
+  };
+  for (const [who, children] of Object.entries(expected)) {
+    for (const response of [await read(who), await changed(who)]) {
+      assert.deepEqual(listed(response.session)?.sort(), children, `${who} is listed only the held children they may open`);
+      if (!children?.includes("child-private")) {
+        assert.doesNotMatch(response.body, /private-child|fix\/private-work|wr-private/u,
+          `nothing of a child ${who} may not open reaches them`);
+      }
+    }
+  }
+
+  // Both Viewers share a verdict on the Orchestrator and read the same advice, yet each is sent their own child.
+  const hub = new Hub(db);
+  const connect = (principal: HumanPrincipal) => {
+    const messages: ControlPlaneToUi[] = [];
+    hub.addUiClient({ send: (data: string) => messages.push(JSON.parse(data) as ControlPlaneToUi) },
+      { deviceId: principal.deviceId, principal, close: () => {} });
+    return messages;
+  };
+  const clients = { viewerA: connect(principals.viewerA!), viewerB: connect(principals.viewerB!), operator: connect(principals.operator!) };
+  const snapshotOf = (messages: ControlPlaneToUi[]) => {
+    const snapshot = messages[0];
+    return snapshot?.type === "snapshot" ? snapshot.sessions.find((session) => session.id === "orch") : undefined;
+  };
+  const upsertOf = (messages: ControlPlaneToUi[]) => {
+    const upsert = [...messages].reverse().find((message) => message.type === "session_upsert" && message.session.id === "orch");
+    return upsert?.type === "session_upsert" ? upsert.session : undefined;
+  };
+  hub.sessionChangedById("orch");
+  for (const [who, messages] of Object.entries(clients)) {
+    assert.deepEqual(listed(snapshotOf(messages)), expected[who], `${who}'s snapshot`);
+    assert.deepEqual(listed(upsertOf(messages)), expected[who], `${who}'s live update`);
+  }
+  assert.deepEqual(
+    upsertOf(clients.viewerA)?.orchestratorCampaign?.heldChildren?.map((child) => child.holds[0]?.recoveryAction),
+    upsertOf(clients.viewerB)?.orchestratorCampaign?.heldChildren?.map((child) => child.holds[0]?.recoveryAction),
+    "the two Viewers' advice reads the same",
+  );
+});
+
+test("filing a personal Orchestrator into a team Project does not list its personal held children to the team", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "held-children-team-project-"));
+  const database = join(root, "control-plane.db");
+  const recovery: WorktreeRecoveryView = {
+    recoveryId: "wr-personal", detectedAt: 10, selectedPath: "/w/personal-child", expectedBranch: "agent/personal-child",
+    detail: "the worktree is now on branch fix/personal-work instead of agent/personal-child",
+  };
+  const seed = ControlPlaneDb.open(database);
+  const local = seed.localIdentityContext();
+  let projectId = "";
+  try {
+    seed.registerRunner({
+      runnerId: "r", hostname: "test", os: "linux", version: "test", agents: [],
+      workspaces: [{ id: "ws", name: "Repo", path: "/repo" }],
+    }, 1, 55);
+    for (const [userId, role] of [["usr_owner", "operator"], ["usr_viewer", "viewer"]] as const) {
+      seed.createIdentityMember({ userId, displayName: userId, organizationId: local.organizationId, role, now: 2 });
+    }
+    seed.createIdentityTeam({ teamId: "team", organizationId: local.organizationId, name: "Team",
+      memberUserIds: ["usr_owner", "usr_viewer"], now: 2 });
+    const personal = { organizationId: local.organizationId, owner: { kind: "user" as const, userId: "usr_owner" } };
+    seed.createSession({ id: "orch", runnerId: "r", workspaceId: "ws", agentId: null, title: "Orchestrator",
+      useWorktree: false, driver: "codex", config: { permissionMode: "orchestrator" },
+      orchestratorPolicy: resolveOrchestratorCampaignPolicy(DEFAULT_ORCHESTRATOR_DEFAULTS, "system_default", {}),
+      scope: personal, now: 3 });
+    // A child starts with its parent's audience.
+    seed.createSession({ id: "child", parentSessionId: "orch", runnerId: "r", workspaceId: "ws", agentId: null, title: "child",
+      useWorktree: true, driver: "codex", config: {}, scope: personal, now: 4 });
+    const project = seed.createProject({ name: "Team Project", now: 5,
+      scope: { organizationId: local.organizationId, owner: { kind: "team", teamId: "team" } } });
+    projectId = project.id;
+    seed.addProjectLocation(project.id, { runnerId: "r", workspaceId: "ws" }, 6);
+  } finally { seed.close(); }
+  const raw = new DatabaseSync(database);
+  try {
+    raw.prepare("UPDATE sessions SET worktree_recovery=? WHERE id=?").run(JSON.stringify(recovery), "child");
+  } finally { raw.close(); }
+  const db = ControlPlaneDb.open(database);
+  const member = (userId: string, role: HumanPrincipal["role"]): HumanPrincipal => ({
+    ...human(role, userId), organizationId: local.organizationId, organizationName: local.organizationName,
+  });
+  const principals: Record<string, HumanPrincipal> = { owner: member("usr_owner", "operator"), viewer: member("usr_viewer", "viewer") };
+  const app = Fastify();
+  const requestPrincipal = (req: { headers: { authorization?: string } }) => principals[String(req.headers.authorization)] ?? null;
+  registerVisibleCampaignChildrenHook(app, { db, requestPrincipal });
+  registerSessionLookupRoute(app, { db, requestPrincipal });
+  await app.ready();
+  t.after(async () => { await app.close(); db.close(); rmSync(root, { recursive: true, force: true }); });
+
+  // The owner files only the Orchestrator, as Move to Project does; it adopts the team's audience alone.
+  const location = db.findProjectLocationForProject(projectId, "r", "ws")!;
+  assert.ok(db.setSessionProject("orch", projectId, location.id, 7, "usr_owner"));
+  assert.equal(db.sessionScope("orch")?.owner.kind, "team");
+  assert.equal(db.sessionScope("child")?.owner.kind, "user", "the child keeps its personal audience");
+  assert.equal(db.canAccessSession(principals.viewer!, "orch"), true);
+  assert.equal(db.canAccessSession(principals.viewer!, "child"), false);
+
+  const read = async (who: string) => {
+    const response = await app.inject({ method: "GET", url: "/api/sessions/lookup/by-id?id=orch", headers: { authorization: who } });
+    assert.equal(response.statusCode, 200);
+    return response;
+  };
+  const forViewer = await read("viewer");
+  assert.equal((forViewer.json() as { session: SessionView }).session.orchestratorCampaign?.heldChildren, undefined,
+    "the team's Viewer is listed no held child");
+  assert.doesNotMatch(forViewer.body, /personal-child|fix\/personal-work|wr-personal/u);
+  assert.deepEqual((await read("owner")).json().session.orchestratorCampaign?.heldChildren?.map(
+    (child: { sessionId: string }) => child.sessionId), ["child"], "its owner still is");
 });
 
 test("fork, rewind, review findings and worktree commands follow the role gate, the agent route allowlist and the worktree rules (#1864)", () => {

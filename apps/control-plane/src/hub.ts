@@ -271,11 +271,17 @@ function holdAdviceOf(session: SessionView): string[] {
   ].map((hold) => hold.recoveryAction);
 }
 
-/** What a reader was sent of a session that its principal decides: its verdict, and its hold advice,
+/** What a reader was sent of a session that its principal decides: its verdict, its hold advice,
  * since each campaign child's advice follows the reader's verdict on that child rather than on this
- * session (#1867), and a person's depends on whether they own it (#1875). */
+ * session (#1867), and a person's depends on whether they own it (#1875), and which held children it
+ * lists, since those are only the ones the reader may open. Two readers whose advice reads the same
+ * may still be listed different children. */
 function permissionsKey(session: SessionView): string {
-  return JSON.stringify([session.commandPermissions, holdAdviceOf(session)]);
+  return JSON.stringify([
+    session.commandPermissions,
+    holdAdviceOf(session),
+    (session.orchestratorCampaign?.heldChildren ?? []).map((child) => child.sessionId),
+  ]);
 }
 
 export class Hub {
