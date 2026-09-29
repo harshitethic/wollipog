@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -39,6 +39,8 @@ import {
   type ClaudeHookHost,
 } from "./hook-settings.js";
 import { runManagedWorktreeGuardDecision } from "./managed-worktree-guard.js";
+import { POLICY_HOOK_RELAY_KEY_ENV } from "./policy-hook-relay.js";
+import { winQuoteArg } from "./spawn.js";
 
 function temp<T>(fn: (dir: string) => T): T {
   const dir = mkdtempSync(join(tmpdir(), "wollipog-hooks-"));
@@ -1016,7 +1018,10 @@ test("a rewritten hook command in any file-form settings copy disables the guard
 
     const prepared = prepareClaudeHookArgs(launch.args);
     assert.equal(prepared.guardActive, false, `${copy}: an altered command is never reported as an active guard`);
-    assert.deepEqual(prepared.args, [], `${copy}: the untrusted settings document is dropped so the driver mediates`);
+    assert.equal(prepared.managerActive, true);
+    const fallback = preparedSettings(prepared.args);
+    assert.equal(guardEntries(fallback).length, 0, `${copy}: the driver mediates without the guard`);
+    assert.ok(fallback.hooks?.PostToolUse);
     assert.match(prepared.guardReason ?? "", /settings documents were modified after provisioning/u);
   }
 }));
@@ -1457,6 +1462,64 @@ test("a driver-internal spawn whose protection list has vanished is mediated", (
   assert.equal(prepareClaudeHookArgs(launch.args).guardActive, false);
 }));
 
+for (const enabled of [true, false]) {
+  for (const invalidation of ["refresh", "tripwire", "missing"] as const) {
+    test(`a ${invalidation} guard failure preserves only enabled manager hooks (enabled=${enabled})`, () => temp((dir) => {
+      const launch = provisionGuarded(dir, {}, { enabled });
+      const { file } = settingsOf(dir);
+      const persisted = [...launch.args];
+      if (invalidation === "missing") {
+        rmSync(claudeHookProtectionsPath(file));
+      } else {
+        writeFileSync(claudeHookProtectionsPath(file), JSON.stringify({ version: 1, protections: [] }));
+        if (invalidation === "refresh") {
+          assert.equal(refreshClaudeGuardProtections("sess_hook_1", PROTECTIONS, dir).state, "invalidated");
+        }
+      }
+      const prepared = prepareClaudeHookArgs(launch.args);
+      assert.equal(prepared.guardActive, false, "the driver must mediate this respawn");
+      assert.equal(prepared.managerActive, enabled);
+      assert.deepEqual(launch.args, persisted, "persisted arguments remain usable for later respawns");
+      if (enabled) {
+        const fallback = preparedSettings(prepared.args);
+        assert.equal(guardEntries(fallback).length, 0);
+        for (const event of ["PreToolUse", "PostToolUse", "UserPromptSubmit"]) {
+          assert.equal(fallback.hooks?.[event]?.length, 1);
+          assert.ok(fallback.hooks?.[event]?.[0]?.hooks[0]?.args.includes(event));
+        }
+        assert.equal(fallback.env?.MANAGER_TOKEN_FILE, claudeHookTokenPath(file));
+        const respawn = prepareClaudeHookArgs(launch.args);
+        assert.deepEqual(respawn.args, prepared.args);
+        assert.match(respawn.guardReason ?? "", /runner-held manager-only fallback/u);
+      } else {
+        assert.deepEqual(prepared.args, []);
+      }
+    }));
+  }
+}
+
+test("a distrusted guard's manager fallback uses runner-held commands even after settings tampering", () => temp((dir) => {
+  const launch = provisionGuarded(dir);
+  const { file } = settingsOf(dir);
+  const original = JSON.parse(readFileSync(file, "utf8"));
+  for (const target of [file, claudeHookTemplatePath(file), claudeHookGuardPath(file)]) {
+    const document = JSON.parse(readFileSync(target, "utf8"));
+    for (const entries of Object.values(document.hooks) as Array<Array<{ hooks: Array<{ command: string }> }>>) {
+      for (const entry of entries) for (const hook of entry.hooks) hook.command = "/bin/true";
+    }
+    writeFileSync(target, JSON.stringify(document));
+  }
+  const prepared = prepareClaudeHookArgs(launch.args);
+  assert.equal(prepared.guardActive, false);
+  assert.equal(prepared.managerActive, true);
+  const fallback = preparedSettings(prepared.args);
+  assert.equal(guardEntries(fallback).length, 0);
+  assert.deepEqual(fallback.hooks?.PostToolUse, original.hooks.PostToolUse);
+  writeFileSync(file, JSON.stringify({ hooks: { PostToolUse: [{ hooks: [{ command: "/bin/true" }] }] } }));
+  assert.deepEqual(preparedSettings(prepareClaudeHookArgs(launch.args).args).hooks?.PostToolUse, original.hooks.PostToolUse,
+    "each respawn republishes its manager copy from runner-held bytes");
+}));
+
 test("an invalidated guard does not make an open manager-hook circuit look recovered", () => temp((dir) => {
   const launch = provisionGuarded(dir);
   const { file } = settingsOf(dir);
@@ -1469,6 +1532,13 @@ test("an invalidated guard does not make an open manager-hook circuit look recov
   assert.deepEqual(prepared.args, []);
   assert.equal(prepared.circuitOpen, true, "the persisted circuit is still open");
   assert.equal(prepared.circuitOpenedAt, 100);
+  assert.equal(prepared.managerActive, false);
+  const reprobe = prepareClaudeHookArgs(launch.args, 30_101);
+  assert.equal(reprobe.guardActive, false);
+  assert.equal(reprobe.managerActive, true);
+  assert.equal(reprobe.circuitReprobePending, true);
+  assert.equal(reprobe.circuitOpenedAt, 100);
+  assert.equal(guardEntries(preparedSettings(reprobe.args)).length, 0);
 }));
 
 test("a failed launch self-test is retried only after a cooldown, a success never", () => temp((dir) => {
@@ -1499,6 +1569,43 @@ function inlineSettings(args: string[]): ReturnType<typeof settingsOf>["live"] {
   assert.ok(value.startsWith("{"), `the launch carries the document inline, not a path: ${value.slice(0, 40)}`);
   return JSON.parse(value);
 }
+
+function preparedSettings(args: string[]): ReturnType<typeof settingsOf>["live"] {
+  const value = args[args.indexOf("--settings") + 1]!;
+  return JSON.parse(value.startsWith("{") ? value : readFileSync(value, "utf8"));
+}
+
+test("a file-form manager fallback keeps the sandbox-exposed path and Windows-compatible arguments", () => temp((dir) => {
+  const launch = provisionGuarded(dir);
+  const { file } = settingsOf(dir);
+  rmSync(claudeHookProtectionsPath(file));
+  const prepared = prepareClaudeHookArgs(launch.args);
+  assert.equal(prepared.managerActive, true);
+  assert.equal(prepared.guardActive, false);
+  assert.deepEqual(prepared.args, launch.args, "Seatbelt already exposes this exact settings path");
+  for (const arg of prepared.args) assert.doesNotThrow(() => winQuoteArg(arg));
+  if (process.platform !== "win32") assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.equal(guardEntries(preparedSettings(prepared.args)).length, 0);
+  assert.equal(prepareClaudeHookArgs(launch.args).guardActive, false, "publishing the fallback does not restore guard trust");
+  removeClaudeHookFiles("sess_hook_1", dir);
+  assert.equal(existsSync(file), false);
+}));
+
+test("an unwritable manager fallback drops its hooks without claiming a circuit reprobe", () => temp((dir) => {
+  const launch = provisionGuarded(dir);
+  const { file } = settingsOf(dir);
+  rmSync(claudeHookProtectionsPath(file));
+  // A directory at the destination cannot be replaced by a protected settings file.
+  rmSync(file);
+  mkdirSync(file);
+  writeHookCircuitState(claudeHookCircuitPath(file), { consecutiveFailures: 3, open: true, openedAt: 100 });
+  const prepared = prepareClaudeHookArgs(launch.args, 30_101);
+  assert.deepEqual(prepared.args, []);
+  assert.equal(prepared.guardActive, false);
+  assert.equal(prepared.managerActive, false);
+  assert.equal(prepared.circuitOpen, true);
+  assert.equal(prepared.circuitReprobePending, false);
+}));
 
 test("a memory-held guard launches from an inline document, and no list is written", () => temp((dir) => {
   const messages: string[] = [];
@@ -1572,6 +1679,33 @@ test("a memory-held guard survives an open manager circuit as the guard-only doc
   assert.equal(guardEntries(guardOnly).length, 1);
   // The live file is not swapped for anything: nothing on disk is launched.
   assert.ok(JSON.parse(readFileSync(file, "utf8")).hooks.PostToolUse);
+}));
+
+test("an invalidated memory guard retains manager hooks and the relay key for its respawn", () => temp((dir) => {
+  const launch = spec();
+  resetClaudeGuardState();
+  provisionClaudeHooks(launch, {
+    ...config,
+    managedWorktreeProtections: PROTECTIONS,
+    verifyGuardLaunch: guardVerifies,
+    managedWorktreeGuardSocket: MEMORY_SOCKET,
+  }, () => {}, { ...host(dir), managerHookRelay: true });
+  const before = prepareClaudeHookArgs(launch.args);
+  assert.equal(before.guardActive, true);
+  assert.equal(before.managerActive, true);
+  const file = claudeHookSettingsPath(dir, "sess_hook_1");
+  // A session may keep both guard forms alive. Tampering with its file-form list poisons both.
+  writeFileSync(claudeHookProtectionsPath(file), JSON.stringify({ version: 1, protections: PROTECTIONS }));
+  assert.equal(refreshClaudeGuardProtections("sess_hook_1", PROTECTIONS, dir).state, "refreshed");
+  writeFileSync(claudeHookProtectionsPath(file), JSON.stringify({ version: 1, protections: [] }));
+  assert.equal(refreshClaudeGuardProtections("sess_hook_1", PROTECTIONS, dir).state, "invalidated");
+  const prepared = prepareClaudeHookArgs(launch.args);
+  assert.equal(prepared.guardActive, false);
+  assert.equal(prepared.managerActive, true);
+  assert.equal(guardEntries(inlineSettings(prepared.args)).length, 0);
+  assert.ok(inlineSettings(prepared.args).hooks?.PostToolUse);
+  assert.ok(before.env?.[POLICY_HOOK_RELAY_KEY_ENV]);
+  assert.deepEqual(prepared.env, before.env, "the retained relay hooks can still authenticate");
 }));
 
 test("a memory-held list follows the live refresh, and an invalidated one refuses", () => temp((dir) => {
