@@ -4,7 +4,7 @@ import { useApi } from "../api-context.js";
 import { isPersonalIdentifier, maskedAccountTitles } from "../personal-identifiers.js";
 import { Modal } from "./common.js";
 import { PersonalIdentifier, PersonalIdentifierRevealButton, usePersonalIdentifierReveal } from "./PersonalIdentifier.js";
-import { ChoiceCards } from "./ui/ChoiceControls.js";
+import { ChoiceRows } from "./ui/ChoiceControls.js";
 
 function usageSummary(account: SessionProviderAccountOption): string {
   if (account.buckets.length === 0) return "Usage available";
@@ -127,7 +127,7 @@ export function SwitchAccountDialog({
               />
             )}
           </div>
-          <ChoiceCards<string>
+          <ChoiceRows<string>
             id={pickerId}
             label="Account"
             value={selectedId || null}
