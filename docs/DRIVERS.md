@@ -530,8 +530,14 @@ The control plane accepts it only for the exact live Claude session and exact po
 session deletion cascades the hash binding. It returns a positive or negative registration
 acknowledgement. The first sidecar waits for a positive acknowledgement before sending HTTP.
 A delayed acknowledgement from a negotiated control plane remains fail-closed; a negative
-acknowledgement opens the local circuit and emits no permission decision. Old control planes never
-receive hook settings because they do not advertise the required registered-frame capability.
+acknowledgement opens the local circuit and emits no permission decision. Until the current
+credential's registration is answered, the runner sends it again each time it registers with a
+control plane and every 2 seconds, so a frame lost in a reconnect does not leave the hook failing
+closed and its circuit open. An acknowledgement or rejection stops the retry, as does removing the
+session; a rotated credential replaces the superseded one, which is never sent again. An answer
+that names a superseded or removed credential is ignored, so it can neither ready nor revoke the
+current one. Old control planes never receive hook settings because they do not advertise the
+required registered-frame capability.
 
 The sidecar sends a content-minimized authenticated request to the exact active session. It drops
 transcript paths, cwd, prompt content, arbitrary tool input, and credential values; only provider

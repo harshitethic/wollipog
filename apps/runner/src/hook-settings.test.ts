@@ -18,12 +18,14 @@ import {
   claudeHooksEnabled,
   CLAUDE_GUARD_LAUNCH_RETRY_COOLDOWN_MS,
   describeManagedSettings,
+  isCurrentPolicyHookCredential,
   LEGACY_POLICY_HOOK_ENV,
   managedSettingsGuardSocket,
   managedWorktreeGuardMemoryProtections,
   MAX_INLINE_SETTINGS_BYTES,
   markClaudeHookCredentialRejected,
   markClaudeHookCredentialReady,
+  policyHookRegistrationsToResend,
   prepareClaudeHookArgs,
   provisionClaudeHooks,
   POLICY_HOOK_ENV,
@@ -548,6 +550,90 @@ test("explicit credential rejection re-registers and a positive acknowledgement 
       readHookCircuitState(claudeHookCircuitPath(claudeHookSettingsPath(dir, launch.sessionId))),
       { consecutiveFailures: 0, open: false },
     );
+  });
+});
+
+test("an unanswered policy-hook registration stays due for a re-send, and only its current hash", () => {
+  temp((dir) => {
+    const launch = spec({ sessionId: "sess_hook_resend" });
+    const due = (minAgeMs: number, now = Date.now()) =>
+      policyHookRegistrationsToResend(minAgeMs, now).filter((entry) => entry.sessionId === launch.sessionId);
+    const registrations: string[] = [];
+    const provision = () => provisionClaudeHooks(launch, {
+      ...config,
+      registerCredential: (_sessionId, tokenHash) => registrations.push(tokenHash),
+    }, () => {}, host(dir));
+
+    provision();
+    const [first] = registrations;
+    assert.deepEqual(due(0), [{ sessionId: launch.sessionId, tokenHash: first }],
+      "a registration the control plane never answered is sent again");
+    const sentAt = Date.now();
+    assert.equal(due(0, sentAt).length, 1);
+    assert.deepEqual(due(2_000, sentAt + 1_000), [], "each re-send restarts the wait before the next");
+    assert.equal(due(2_000, sentAt + 2_000).length, 1);
+    assert.equal(isCurrentPolicyHookCredential(dir, launch.sessionId, first!), true);
+    assert.equal(isCurrentPolicyHookCredential(dir, launch.sessionId, "0".repeat(64)), false);
+
+    markClaudeHookCredentialReady(dir, launch.sessionId, first!);
+    assert.deepEqual(due(0), [], "an acknowledged registration is not sent again");
+    provision();
+    assert.equal(registrations.length, 2);
+    assert.deepEqual(due(0), [], "re-provisioning an acknowledged credential arms no retry");
+
+    // A rotated credential replaces the superseded one, which is never sent again and is no longer
+    // the credential any answer may ready or revoke.
+    writeFileSync(claudeHookTokenPath(claudeHookSettingsPath(dir, launch.sessionId)), "not-a-credential", { mode: 0o600 });
+    provision();
+    const rotated = registrations.at(-1)!;
+    assert.notEqual(rotated, first);
+    assert.deepEqual(due(0), [{ sessionId: launch.sessionId, tokenHash: rotated }]);
+    assert.equal(isCurrentPolicyHookCredential(dir, launch.sessionId, first!), false);
+    markClaudeHookCredentialReady(dir, launch.sessionId, first!);
+    assert.equal(due(0).length, 1, "an answer for the superseded hash leaves the current one due");
+
+    markClaudeHookCredentialRejected(dir, launch.sessionId);
+    assert.deepEqual(due(0), [], "an explicit rejection stops the retry");
+    provision();
+    assert.deepEqual(due(0), [{ sessionId: launch.sessionId, tokenHash: rotated }],
+      "the next provisioning registers the rejected binding again, and so retries it again");
+
+    removeClaudeHookFiles(launch.sessionId, dir);
+    assert.deepEqual(due(0), [], "a removed session is never sent again");
+    assert.equal(isCurrentPolicyHookCredential(dir, launch.sessionId, rotated), false);
+  });
+});
+
+test("a spawn without manager hooks stops the retry; a rejectable restart or a TUI does not", () => {
+  temp((dir) => {
+    const launch = spec({ sessionId: "sess_hook_resend_blocked" });
+    const due = () => policyHookRegistrationsToResend(0).filter((entry) => entry.sessionId === launch.sessionId);
+    provisionClaudeHooks(launch, config, () => {}, host(dir));
+    assert.equal(due().length, 1);
+
+    // A native TUI alongside the provider does not replace the hook that is still waiting.
+    provisionClaudeHooks(spec({ sessionId: launch.sessionId, config: { permissionMode: "default" } }), {
+      ...config,
+      managedWorktreeProtections: [],
+      verifyGuardLaunch: () => ({ ok: true }),
+      concurrentLaunch: true,
+    }, () => {}, host(dir));
+    assert.equal(due().length, 1);
+
+    // The pre-authorization `start_session` provisioning of a hook-less restart may yet be rejected,
+    // and the running provider's hook would still be waiting.
+    provisionClaudeHooks(spec({ sessionId: launch.sessionId, config: { permissionMode: "default" } }), config,
+      () => {}, host(dir));
+    assert.equal(due().length, 1);
+
+    // The pre-spawn provisioning of a launch that carries no hook replaces that provider.
+    provisionClaudeHooks(spec({ sessionId: launch.sessionId }), {
+      ...config,
+      controlPlaneProtocolVersion: 60,
+      managedWorktreeProtections: [],
+      verifyGuardLaunch: () => ({ ok: true }),
+    }, () => {}, host(dir));
+    assert.deepEqual(due(), [], "a credential no live hook waits for is not sent again");
   });
 });
 

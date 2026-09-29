@@ -467,6 +467,7 @@ export function removeClaudeHookFiles(sessionId: string, configDir = defaultHook
   guardSockets.delete(sessionId);
   guardMemoryLists.delete(sessionId);
   managerHookMemory.delete(sessionId);
+  unacknowledgedPolicyHookRegistrations.delete(sessionId);
   try {
     const settings = claudeHookSettingsPath(configDir, sessionId);
     memorySettingsDocuments.delete(resolve(settings));
@@ -861,6 +862,11 @@ export function provisionClaudeHooks(
 
   if (managerHooksBlocked) {
     stripHookFromLaunchCapability(spec);
+    // This launch carries no manager hook, so once it replaces the provider nothing waits for the
+    // credential any more. Only the pre-spawn provisioning decides that, as it does the guard's
+    // fate below: the pre-authorization `start_session` provisioning may still be rejected, leaving
+    // the running provider's hook waiting, and a concurrent launch (#1337) replaces nothing.
+    if (guardRequested && !concurrentLaunch) unacknowledgedPolicyHookRegistrations.delete(spec.sessionId);
     if (!guard) {
       if (removeManagedSettingsArgs(spec.args, host.configDir) > 0) {
         log(`Claude hooks ${spec.sessionId}: disabled for this launch`);
@@ -995,6 +1001,7 @@ export function provisionClaudeHooks(
   if (relayed) {
     // Registered at every provisioning, as the file form does; the acknowledgement arrives as
     // `markClaudeHookCredentialReady` and the relay waits for it before its first request.
+    if (!relayed.ready) trackPolicyHookRegistration(spec.sessionId, relayed.tokenHash);
     config.registerCredential?.(spec.sessionId, relayed.tokenHash);
     writeClaudeSettingsSet(file, {
       sessionId: spec.sessionId,
@@ -1035,7 +1042,10 @@ export function provisionClaudeHooks(
   } catch {
     /* A new or rotated credential remains fenced until the control plane acknowledges it. */
   }
-  if (!credentialReady) rmSync(claudeHookReadyPath(file), { force: true });
+  if (!credentialReady) {
+    rmSync(claudeHookReadyPath(file), { force: true });
+    trackPolicyHookRegistration(spec.sessionId, tokenHash);
+  }
   config.registerCredential?.(spec.sessionId, tokenHash);
   writeClaudeSettingsSet(file, {
     sessionId: spec.sessionId,
@@ -1262,6 +1272,7 @@ export function managerHookRelayState(sessionId: string, key: string): ManagerHo
 
 export function resetClaudeGuardState(): void {
   managerHookMemory.clear();
+  unacknowledgedPolicyHookRegistrations.clear();
   guardStateDigests.clear();
   compromisedGuardSessions.clear();
   verifiedGuardLaunches.clear();
@@ -1542,6 +1553,55 @@ export async function provisionCodexGuard(
   return { args: guarded, guardActive: true };
 }
 
+/**
+ * Registrations the control plane has not answered yet, one per session and only for its current
+ * credential: provisioning a rotated credential replaces a superseded hash, and an acknowledgement,
+ * a rejection, or session removal drops it. A registration frame lost on its way to the control
+ * plane was otherwise never sent again, exactly as Agent Control's was before #1841: every hook
+ * call then failed its acknowledgement fence, and the circuit that opened kept the manager policy
+ * off for the rest of the runner's life. The runner re-sends these until they are answered.
+ */
+const unacknowledgedPolicyHookRegistrations = new Map<string, { tokenHash: string; sentAt: number }>();
+
+/** Provisioning is about to send `tokenHash`'s registration; it stays due for a re-send until answered. */
+function trackPolicyHookRegistration(sessionId: string, tokenHash: string): void {
+  unacknowledgedPolicyHookRegistrations.set(sessionId, { tokenHash, sentAt: Date.now() });
+}
+
+/** Current unacknowledged policy-hook registrations last sent at least `minAgeMs` ago, each marked
+ * as sent now: the caller re-sends every entry it receives. */
+export function policyHookRegistrationsToResend(
+  minAgeMs: number,
+  now = Date.now(),
+): Array<{ sessionId: string; tokenHash: string }> {
+  const due: Array<{ sessionId: string; tokenHash: string }> = [];
+  for (const [sessionId, registration] of unacknowledgedPolicyHookRegistrations) {
+    if (now - registration.sentAt < minAgeMs) continue;
+    registration.sentAt = now;
+    due.push({ sessionId, tokenHash: registration.tokenHash });
+  }
+  return due;
+}
+
+/**
+ * Whether `tokenHash` names the session's current policy-hook credential. Registrations are re-sent
+ * until answered, so an answer can arrive after its credential was superseded or removed; it says
+ * nothing about the current one, which it must neither ready nor revoke. No same-hash counting is
+ * needed here, unlike Agent Control: the fence is armed again only for a new hash or after an
+ * explicit rejection, and every answer reports the binding the control plane holds as it answers.
+ */
+export function isCurrentPolicyHookCredential(configDir: string, sessionId: string, tokenHash: string): boolean {
+  const relayed = managerHookMemory.get(sessionId);
+  if (relayed) return relayed.tokenHash === tokenHash;
+  try {
+    const file = claudeHookTokenPath(claudeHookSettingsPath(configDir, sessionId));
+    if (lstatSync(file).isSymbolicLink()) return false;
+    return createHash("sha256").update(readFileSync(file, "utf8")).digest("hex") === tokenHash;
+  } catch {
+    return false;
+  }
+}
+
 /** Persist the CP acknowledgement that fences the first HTTP hook request after provisioning. */
 export function markClaudeHookCredentialReady(
   configDir: string,
@@ -1549,6 +1609,9 @@ export function markClaudeHookCredentialReady(
   tokenHash: string,
 ): void {
   if (!/^[0-9a-f]{64}$/u.test(tokenHash)) throw new Error("invalid policy-hook credential hash");
+  if (unacknowledgedPolicyHookRegistrations.get(sessionId)?.tokenHash === tokenHash) {
+    unacknowledgedPolicyHookRegistrations.delete(sessionId);
+  }
   const relayed = managerHookMemory.get(sessionId);
   if (relayed) {
     // An acknowledgement of a hash the runner no longer holds (a rotation overtook it) readies
@@ -1579,6 +1642,8 @@ export function markClaudeHookCredentialRejected(
     openedAt: now,
     credentialRejected: true,
   };
+  // A rejected binding is not re-sent until it is provisioned again.
+  unacknowledgedPolicyHookRegistrations.delete(sessionId);
   const relayed = managerHookMemory.get(sessionId);
   if (relayed) {
     relayed.ready = false;

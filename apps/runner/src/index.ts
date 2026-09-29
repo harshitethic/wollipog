@@ -82,13 +82,16 @@ import {
   claudeHookSessionProtectionsPath,
   claudeHookSettingsPath,
   claudeHookTokenPath,
+  CLAUDE_HOOK_PROTOCOL_VERSION,
   claudeHooksEnabled,
   defaultClaudeHookHost,
+  isCurrentPolicyHookCredential,
   markClaudeHookCredentialReady,
   markClaudeHookCredentialRejected,
   describeManagedSettings,
   managedSettingsGuardSocket,
   provisionClaudeHooks,
+  policyHookRegistrationsToResend,
   provisionCodexGuard,
   refreshClaudeGuardProtections,
   seedManagedWorktreeGuardMemory,
@@ -279,7 +282,7 @@ import { RunnerSessionNamingCustomModel } from "./session-naming-custom-model.js
 
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
-const AGENT_CONTROL_REGISTRATION_RETRY_MS = 2_000;
+const CREDENTIAL_REGISTRATION_RETRY_MS = 2_000;
 // Half-open-socket liveness: after a laptop sleep / Wi-Fi drop / NAT rebind the control-plane socket
 // can sit readyState=OPEN with no FIN/RST, so frames written into it are silently lost until the OS
 // TCP timeout finally errors it (many minutes). Piggy-back a ws-level ping on every heartbeat and
@@ -715,6 +718,17 @@ let registered = false;
 let controlPlaneProtocolVersion: number | null = null;
 const registerPolicyHookCredential = (sessionId: string, tokenHash: string) =>
   sendUp({ type: "policy_hook_credential", sessionId, tokenHash });
+/** Re-send every current policy-hook registration still unacknowledged after `minAgeMs`. A frame
+ * lost in a reconnect is otherwise never sent again, and every hook call from that provider then
+ * fails its acknowledgement fence, as Agent Control's did before #1841. */
+const resendPolicyHookRegistrations = (minAgeMs: number) => {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !registered) return;
+  // A control plane that predates the hook transport cannot answer; a newer one gets them later.
+  if ((controlPlaneProtocolVersion ?? 0) < CLAUDE_HOOK_PROTOCOL_VERSION) return;
+  for (const { sessionId, tokenHash } of policyHookRegistrationsToResend(minAgeMs)) {
+    registerPolicyHookCredential(sessionId, tokenHash);
+  }
+};
 const registerAgentControlCredential = (sessionId: string, tokenHash: string) =>
   sendUp({ type: "agent_control_credential", sessionId, tokenHash });
 const pendingAgentControlRegistrations = new Map<string, {
@@ -1826,13 +1840,15 @@ let heartbeatPongObserved = false;
 let reportedStaleInstallationKey = "[]";
 const sessionCommandRecoveryTimer = setInterval(recoverStaleSessionCommands, 10_000);
 sessionCommandRecoveryTimer.unref?.();
-// A registration can also be lost without a reconnect (#1841). Retrying well inside the relay's
-// 10-second acknowledgement wait lets a request that is already waiting still succeed.
-const agentControlRegistrationRetryTimer = setInterval(
-  () => resendAgentControlRegistrations(AGENT_CONTROL_REGISTRATION_RETRY_MS),
-  AGENT_CONTROL_REGISTRATION_RETRY_MS,
-);
-agentControlRegistrationRetryTimer.unref?.();
+// A registration can also be lost without a reconnect (#1841). Retrying well inside the Agent
+// Control relay's 10-second acknowledgement wait lets a request that is already waiting still
+// succeed. A policy-hook call waits only 500 ms, so there the retry bounds how long the manager
+// transport stays unavailable.
+const credentialRegistrationRetryTimer = setInterval(() => {
+  resendAgentControlRegistrations(CREDENTIAL_REGISTRATION_RETRY_MS);
+  resendPolicyHookRegistrations(CREDENTIAL_REGISTRATION_RETRY_MS);
+}, CREDENTIAL_REGISTRATION_RETRY_MS);
+credentialRegistrationRetryTimer.unref?.();
 recoverStaleSessionCommands();
 
 function stopHeartbeat(): void {
@@ -1928,6 +1944,7 @@ function handleCommand(msg: ControlPlaneToRunner): void {
       flushOutbox();
       // Whatever registration the previous socket lost, this control plane has not seen (#1841).
       resendAgentControlRegistrations(0);
+      resendPolicyHookRegistrations(0);
       // Registration snapshots are sent before the control plane's protocol version is known, so
       // they conservatively omit native capability overlays. Re-publish negotiated snapshots now;
       // v65 peers continue to receive no overlay, while v66+ peers get the hook transport truth.
@@ -1976,6 +1993,9 @@ function handleCommand(msg: ControlPlaneToRunner): void {
       break;
     case "policy_hook_credential_registered":
       try {
+        // Registrations are re-sent until answered, so an answer can name a credential that was
+        // superseded or removed since. It must neither ready nor revoke the current one.
+        if (!isCurrentPolicyHookCredential(claudeHookHost.configDir, msg.sessionId, msg.tokenHash)) break;
         if (msg.accepted) {
           markClaudeHookCredentialReady(claudeHookHost.configDir, msg.sessionId, msg.tokenHash);
         } else {
@@ -3709,7 +3729,7 @@ function shutdown(exitCode = 0): void {
   bestEffort("stop heartbeat", () => stopHeartbeat());
   bestEffort("clear timers", () => {
     clearInterval(sessionCommandRecoveryTimer);
-    clearInterval(agentControlRegistrationRetryTimer);
+    clearInterval(credentialRegistrationRetryTimer);
     if (discoveryTimer) clearInterval(discoveryTimer);
     if (reconnectTimer) clearTimeout(reconnectTimer);
   });

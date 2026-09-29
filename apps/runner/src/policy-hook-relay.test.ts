@@ -21,9 +21,11 @@ import {
   claudeHookSettingsPath,
   claudeHookTokenPath,
   describeManagedSettings,
+  isCurrentPolicyHookCredential,
   managerHookRelayState,
   markClaudeHookCredentialReady,
   markClaudeHookCredentialRejected,
+  policyHookRegistrationsToResend,
   prepareClaudeHookArgs,
   provisionClaudeHooks,
   readHookCircuitState,
@@ -293,6 +295,34 @@ test("a credential rejection and its recovery leave no file behind either", () =
 
   removeClaudeHookFiles(SESSION, dir);
   assert.equal(managerHookRelayState(SESSION, key), null);
+});
+
+test("a relayed credential stays due for a re-send until the control plane answers it", () => {
+  const dir = temp();
+  resetClaudeGuardState();
+  const registered: string[] = [];
+  const launch = provisionRelayed(dir, spec(), registered);
+  const [hash] = registered;
+  assert.deepEqual(policyHookRegistrationsToResend(0), [{ sessionId: SESSION, tokenHash: hash }],
+    "the in-memory credential's registration is sent again while unanswered");
+  assert.equal(isCurrentPolicyHookCredential(dir, SESSION, hash!), true);
+  assert.equal(isCurrentPolicyHookCredential(dir, SESSION, "0".repeat(64)), false);
+
+  markClaudeHookCredentialReady(dir, SESSION, hash!);
+  assert.deepEqual(policyHookRegistrationsToResend(0), []);
+  provisionRelayed(dir, launch, registered);
+  assert.deepEqual(registered, [hash, hash], "every provisioning still registers");
+  assert.deepEqual(policyHookRegistrationsToResend(0), [], "but an acknowledged credential arms no retry");
+
+  markClaudeHookCredentialRejected(dir, SESSION);
+  assert.deepEqual(policyHookRegistrationsToResend(0), [], "a rejection stops the retry");
+  provisionRelayed(dir, launch, registered);
+  assert.deepEqual(policyHookRegistrationsToResend(0), [{ sessionId: SESSION, tokenHash: hash }]);
+
+  removeClaudeHookFiles(SESSION, dir);
+  assert.deepEqual(policyHookRegistrationsToResend(0), []);
+  assert.equal(isCurrentPolicyHookCredential(dir, SESSION, hash!), false,
+    "an answer for a removed session names no current credential");
 });
 
 test("the pre-authorization provisioning of a relaying runner keeps the credential in memory too", () => {
