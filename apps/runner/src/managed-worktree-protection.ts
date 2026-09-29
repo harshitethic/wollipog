@@ -169,6 +169,10 @@ function expandsLeadingTilde(token: ShellToken | undefined): boolean {
 function lookup(name: string, cwd: string, environment: ReadonlyMap<string, string>): string | undefined {
   if (name === "PWD" || name === "CWD") return cwd === UNKNOWN_CWD ? undefined : cwd;
   if (SHELL_MAINTAINED.has(name)) return undefined;
+  // `env` can create keys that a shell cannot reference. shell-quote may parse the
+  // whole body of `${A-.}` as a name, but the shell reads `A` with a default of `.`.
+  // Never let such a key shadow the shell's actual expansion.
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)) return undefined;
   return environment.get(name);
 }
 
@@ -656,10 +660,27 @@ function commandWords(
       while (plainWordText(tokens[index]) !== null) {
         // `env` reads its ARGV, so an assignment that arrived through an expansion
         // (`env "$ASSIGNMENT" sh -c ...`) is an assignment to it like any other.
-        const value = word(tokens[index], cwd, environment) ?? plainWordText(tokens[index])!;
+        const raw = plainWordText(tokens[index])!;
+        const resolved = word(tokens[index], cwd, environment);
+        const value = resolved ?? raw;
+        // A variable may be quoted (one argv word) or unquoted (several fields), and
+        // shell-quote does not preserve which. The new, broader assignment rule could
+        // swallow a command in the split reading. Existing shell-identifier assignments
+        // and ordinary env arguments keep their previous classification.
+        const newlyRecognizedAssignment = !value.startsWith("-") && /^[^=\0]*=/u.test(value) &&
+          !/^[A-Za-z_][A-Za-z0-9_]*=/u.test(value);
+        if (newlyRecognizedAssignment && raw.includes("\0")) {
+          const fields = resolved === null ? null : expansionFields(raw, resolved, cwd, environment);
+          if (fields === null || fields.length !== 1 || fields[0] !== resolved) {
+            throw new UnclassifiableCommandError("env argument has ambiguous field splitting");
+          }
+        }
         // Like a prefix assignment, this builds the environment of the command `env` runs; it is
         // not in effect while the shell expands the words of this very command.
-        if (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(value)) {
+        // `env` accepts even an empty name, and otherwise any name without `=` or NUL;
+        // the shell prefix above has the stricter identifier rule.
+        // Keep option-looking words out: long options can carry their own `=` values.
+        if (!value.startsWith("-") && /^[^=\0]*=/u.test(value)) {
           const equals = value.indexOf("=");
           childEnvironment.set(value.slice(0, equals), value.slice(equals + 1));
           index += 1;

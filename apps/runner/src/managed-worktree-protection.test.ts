@@ -94,6 +94,69 @@ test("raw Git and filesystem retirement forms are refused with managed-discard g
   }
 });
 
+test("env accepts assignment names that are not shell identifiers before a destructive command", () => {
+  for (const command of [
+    "env =x rm -rf .",
+    "env A-B=x rm -rf .",
+    "env A.B=x rm -rf .",
+    "env -S'A-B=x rm -rf .'",
+    "env -S'=x rm -rf .'",
+    "env -S'A.B=x rm -rf .'",
+    "env --split-string='A-B=x rm -rf .'",
+    "env --unset=PATH A-B=x rm -rf .",
+    "env --chdir=/tmp A.B=x rm -rf .",
+  ]) {
+    assert.equal(commandTargetsManagedWorktree(command, protectedPath, protection), MANAGED_WORKTREE_REFUSAL,
+      command);
+  }
+});
+
+test("env does not swallow a destructive command from a split assignment expansion", () => {
+  assert.equal(commandTargetsManagedWorktree(
+    `C='rm -rf ${protectedPath} x'; env $C=y`, protectedPath, protection,
+  ), MANAGED_WORKTREE_REFUSAL);
+  assert.equal(commandTargetsManagedWorktree("env $C=y", protectedPath, protection,
+    { C: `rm -rf ${protectedPath} x` }), MANAGED_WORKTREE_REFUSAL);
+});
+
+test("env names outside shell syntax cannot shadow a nested shell expansion", () => {
+  assert.equal(commandTargetsManagedWorktree(
+    "env A-.=/tmp/scratch sh -c 'rm -rf ${A-.}'", protectedPath, protection,
+  ), MANAGED_WORKTREE_UNRESOLVED_REFUSAL,
+  "the shell's default-value expansion must not read env's non-identifier key");
+  assert.equal(commandTargetsManagedWorktree(
+    `env 'A:-${protectedPath}=/tmp/scratch' sh -c 'rm -rf \${A:-${protectedPath}}'`,
+    protectedPath, protection,
+  ), MANAGED_WORKTREE_UNRESOLVED_REFUSAL);
+});
+
+test("ordinary expanded env arguments remain available", () => {
+  for (const command of [
+    'env FOO="$(git rev-parse HEAD)" make',
+    'env NODE_OPTIONS="$NODE_OPTIONS --inspect" node app.js',
+    'env $EDITOR notes.md',
+  ]) {
+    assert.equal(commandTargetsManagedWorktree(command, protectedPath, protection,
+      { NODE_OPTIONS: "--no-warnings", EDITOR: "code --wait" }), null, command);
+  }
+});
+
+test("env options with equals signs remain options, while shell assignments still require identifiers", () => {
+  for (const command of [
+    "env --split-string='rm -rf .'",
+    "env --unset=PATH rm -rf .",
+    `env --chdir=/tmp rm -rf ${protectedPath}`,
+  ]) {
+    assert.equal(commandTargetsManagedWorktree(command, protectedPath, protection), MANAGED_WORKTREE_REFUSAL,
+      command);
+  }
+  for (const command of ["=x rm -rf .", "A-B=x rm -rf .", "A.B=x rm -rf ."]) {
+    assert.equal(commandTargetsManagedWorktree(command, protectedPath, protection), null, command);
+  }
+  assert.equal(commandTargetsManagedWorktree("A_B=x rm -rf .", protectedPath, protection),
+    MANAGED_WORKTREE_REFUSAL);
+});
+
 test("direct writes to linked-worktree registration files are refused before redirection can run", () => {
   for (const command of [
     "printf corrupt > /projects/repo/.git/worktrees/managed/gitdir",
