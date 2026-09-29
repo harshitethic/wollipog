@@ -63,8 +63,25 @@ test("raw Git and filesystem retirement forms are refused with managed-discard g
     `mv --target-directory=/tmp/destination scratch.ts ${protectedPath}`,
     `mv --targ=/tmp/destination scratch.ts ${protectedPath}`,
     `mv scratch.ts ${protectedPath} /tmp/destination`,
+    `mv -n ${protectedPath} /tmp/moved`,
     `move -Lit ${protectedPath} -Destination /tmp/moved`,
     `move -LiteralPath ${protectedPath} -Destination /tmp/moved`,
+    `move-item ${protectedPath} /tmp/moved`,
+    `Move-Item -Path ${protectedPath} -Destination /tmp/moved`,
+    `move-item -Destination /tmp/moved -Path ${protectedPath}`,
+    `Move-Item -Dest /tmp/moved -Lit ${protectedPath}`,
+    `move-item -Lit:${protectedPath} -Dest:/tmp/moved`,
+    `Move-Item /tmp/moved -LP ${protectedPath}`,
+    `move-item -LP:${protectedPath} -Destination /tmp/moved`,
+    `Move-Item /tmp/moved -LiteralPath: ${protectedPath}`,
+    `mi -Dest /tmp/moved -Lit ${protectedPath}`,
+    `Rename-Item -Path ${protectedPath} -NewName moved`,
+    `rename-item -NewName moved -Path ${protectedPath}`,
+    `Rename-Item -New moved -Lit ${protectedPath}`,
+    `rename-item -NewName:moved -LiteralPath:${protectedPath}`,
+    `Rename-Item moved -PSPath ${protectedPath}`,
+    `ren -NewName moved -LP ${protectedPath}`,
+    `rni -NewName moved -Path ${protectedPath}`,
     "env -S'rm -rf .'",
     "env -iS'rm -rf .'",
     "env --split-str='rm -rf .'",
@@ -92,6 +109,51 @@ test("raw Git and filesystem retirement forms are refused with managed-discard g
     assert.equal(commandTargetsManagedWorktree(command, protectedPath, protection), MANAGED_WORKTREE_ESCAPE_REFUSAL,
       command);
   }
+});
+
+test("PowerShell movers refuse a protected source when the destination defaults or options precede it", () => {
+  for (const command of [
+    `Move-Item ${protectedPath}`,
+    `mi ${protectedPath}`,
+    `move ${protectedPath}`,
+    `Move-Item -Filter *.ts ${protectedPath}`,
+    `Move-Item -Fil *.ts ${protectedPath} /tmp/moved`,
+    `Move-Item -Include *.ts ${protectedPath} /tmp/moved`,
+    `Move-Item -Include *.ts ${protectedPath}`,
+    `Move-Item -ErrorAction Stop ${protectedPath} /tmp/moved`,
+    `Move-Item -ErrorAction Stop ${protectedPath}`,
+    `Move-Item -ea Stop ${protectedPath}`,
+    `Move-Item -ev failures ${protectedPath}`,
+    `Move-Item -wa Stop ${protectedPath}`,
+    `Move-Item -wv warnings ${protectedPath}`,
+    `Move-Item -infa Continue ${protectedPath}`,
+    `Move-Item -iv info ${protectedPath}`,
+    `Move-Item -ov output ${protectedPath}`,
+    `Move-Item -ob 1 ${protectedPath}`,
+    `Move-Item -pv pipeline ${protectedPath}`,
+    `Move-Item -proga Continue ${protectedPath}`,
+    `mv -in ${protectedPath} /tmp/moved`,
+    `mv -iv info ${protectedPath}`,
+    `mv -fi *.ts ${protectedPath}`,
+    `mv -iv ${protectedPath} /tmp/moved`,
+    `mv -fi ${protectedPath} /tmp/moved`,
+    `mv -iv -t /tmp/moved ${protectedPath}`,
+    `mv -fi -t /tmp/moved ${protectedPath}`,
+    `mv -iv --target-directory /tmp/moved ${protectedPath}`,
+    `mv -iv -t /tmp/moved scratch.ts ${protectedPath}`,
+  ]) {
+    assert.equal(commandTargetsManagedWorktree(command, "/projects/repo", protection), MANAGED_WORKTREE_REFUSAL,
+      command);
+  }
+  for (const command of [
+    `Move-Item -Filter *.ts src/old.ts ${protectedPath}`,
+    `Move-Item -Include *.ts src/old.ts ${protectedPath}`,
+    `mv -in src/old.ts ${protectedPath}`,
+    `mv -iv info src/old.ts ${protectedPath}`,
+    `mv -fi *.ts src/old.ts ${protectedPath}`,
+  ]) assert.equal(commandTargetsManagedWorktree(command, "/projects/repo", protection), null, command);
+  assert.equal(commandTargetsManagedWorktree("Move-Item /tmp/moved -Path:$UNKNOWN", "/projects/repo", protection),
+    MANAGED_WORKTREE_UNRESOLVED_REFUSAL);
 });
 
 test("env accepts assignment names that are not shell identifiers before a destructive command", () => {
@@ -186,11 +248,15 @@ test("normal work inside a managed worktree and unmanaged retirement remain avai
     "mv -t. ../scratch.ts",
     "mv --target-directory=. ../scratch.ts",
     "mv -S.bak src/old.ts src/new.ts",
+    `mv -n ../scratch.ts ${protectedPath}`,
     "mv --suffix=.bak src/old.ts src/new.ts",
     // PowerShell's Move-Item aliases name their arguments, so -LiteralPath is not a GNU -t cluster.
     `move -Path ../scratch.ts -Destination ${protectedPath}`,
+    `move-item -Path ../scratch.ts -Dest ${protectedPath}`,
+    `Move-Item -Dest ${protectedPath} -Lit ../scratch.ts`,
     `mv -LiteralPath ../scratch.ts -Destination ${protectedPath}`,
     "rename-item -Path src/old.ts -NewName new.ts",
+    "rename-item -NewName new.ts -Path src/old.ts",
     "env -S 'pnpm test'",
     "find . -type f -exec grep -l TODO {} +",
   ]) assert.equal(commandTargetsManagedWorktree(command, protectedPath, protection), null, command);

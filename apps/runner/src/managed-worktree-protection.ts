@@ -528,6 +528,35 @@ function moveOption(value: string): { targetDirectory: boolean; consumesNext: bo
   };
 }
 
+/** PowerShell mover parameters can appear in either order and accept prefixes or aliases. */
+function powershellMoveParameter(
+  value: string,
+  executable: string,
+): { role: "source" | "destination" | "other"; attached: string | null } | null {
+  if (!value.startsWith("-") || value.startsWith("--")) return null;
+  // `mv` and `move` also run as GNU commands. `-fi` and `-iv` have valid PowerShell readings
+  // that consume a value, so judge those readings too; otherwise keep GNU clusters intact.
+  const powerShellValueCluster = ["-fi", "-iv"].includes(value.toLowerCase());
+  if (["mv", "move"].includes(executable) && /^-[bfinuvZTtS]+$/u.test(value) &&
+      !powerShellValueCluster) return null;
+  const colon = value.indexOf(":");
+  const name = value.slice(1, colon < 0 ? undefined : colon).toLowerCase();
+  if (!name) return null;
+  const source = ["path", "literalpath"].some((parameter) => parameter.startsWith(name)) ||
+    ["lp", "pspath"].includes(name);
+  const rename = ["rename-item", "ren", "rni"].includes(executable);
+  const destination = (rename ? "newname" : "destination").startsWith(name);
+  // These value-taking options can precede a positional source. Their values must not be mistaken
+  // for the source while the real source is dropped as the destination.
+  const other = ["credential", "erroraction", "errorvariable", "informationaction", "informationvariable",
+    "outbuffer", "outvariable", "pipelinevariable", "progressaction", "warningaction", "warningvariable",
+    ...(rename ? [] : ["filter", "include", "exclude"])].some((parameter) => parameter.startsWith(name)) ||
+    ["ea", "ev", "infa", "iv", "ov", "ob", "pv", "proga", "wa", "wv"].includes(name);
+  if (!source && !destination && !other) return null;
+  return { role: source ? "source" : destination ? "destination" : "other",
+    attached: colon < 0 ? null : value.slice(colon + 1) };
+}
+
 function executableName(value: string): string {
   return value.replaceAll("\\", "/").split("/").at(-1)?.toLowerCase().replace(/\.exe$/u, "") ?? "";
 }
@@ -1365,20 +1394,45 @@ function commandVerdict(
   if (executable === "gio" && word(words[0], cwd, environment) === "trash") {
     return strongest(removerVerdicts(words.slice(1), cwd, environment, protections));
   }
-  if (["mv", "move", "rename-item"].includes(executable)) {
+  if (["mv", "move", "mi", "move-item", "ren", "rni", "rename-item"].includes(executable)) {
     let targetDirectory = false;
+    let namedDestination = false;
     let optionsEnded = false;
     const operands: ShellToken[] = [];
+    const namedSources: ShellToken[] = [];
+    const gnuClusterOperands: ShellToken[] = [];
     for (let index = 0; index < words.length; index += 1) {
       const token = words[index];
       if (token == null) continue;
       const value = word(token, cwd, environment);
+      if (value == null && powershellMoveParameter(wordText(token) ?? "", executable)?.role === "source") {
+        namedSources.push(token);
+        continue;
+      }
       if (value === "--") {
         for (const operand of words.slice(index + 1)) operands.push(operand);
         optionsEnded = true;
         break;
       }
       if (value?.startsWith("-")) {
+        const parameter = powershellMoveParameter(value, executable);
+        if (parameter) {
+          // With a following option word, PowerShell cannot bind a value to -fi/-iv. Preserve the
+          // GNU reading so a subsequent -t or --target-directory still marks every operand source.
+          if (["mv", "move"].includes(executable) && ["-fi", "-iv"].includes(value.toLowerCase()) &&
+              word(words[index + 1], cwd, environment)?.startsWith("-")) continue;
+          const argument = parameter.attached == null || parameter.attached === ""
+            ? words[++index]
+            : parameter.attached;
+          if (argument != null) {
+            if (parameter.role === "source") namedSources.push(argument);
+            if (parameter.role === "destination") namedDestination = true;
+            if (["mv", "move"].includes(executable) && ["-fi", "-iv"].includes(value.toLowerCase())) {
+              gnuClusterOperands.push(argument);
+            }
+          }
+          continue;
+        }
         const option = moveOption(value);
         if (option.targetDirectory) targetDirectory = true;
         if (option.consumesNext) index += 1;
@@ -1388,7 +1442,13 @@ function commandVerdict(
     }
     // The last operand is where the files LAND unless `-t` named that directory already. Moving
     // something into a protected worktree is ordinary work; moving the worktree away is not.
-    const sources = targetDirectory ? operands : operands.slice(0, -1);
+    const positionalSources = targetDirectory || namedDestination || (namedSources.length === 0 && operands.length === 1)
+      ? operands
+      : operands.slice(0, -1);
+    const gnuSources = gnuClusterOperands.length === 0 ? []
+      : targetDirectory ? [...gnuClusterOperands, ...operands]
+      : [...gnuClusterOperands, ...operands].slice(0, -1);
+    const sources = [...namedSources, ...positionalSources, ...gnuSources];
     return strongest(sources.map((source) =>
       operandVerdict(source, cwd, environment, protections, false, optionsEnded)));
   }
