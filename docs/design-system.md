@@ -1431,6 +1431,13 @@ meta (§11.3). This table lives in code as one `statusMeta(domain, value) → {l
     runner is outdated (Update Required). Machines that are online, idle, or offline with nothing
     running are normal and draw nothing.
   - Every other destination: nothing.
+  - The phone's More tab (#2110): while any destination in its sheet has a mark, one
+    `.rail-attention-dot` on its icon's shoulder, in the most severe tone among them (`t-danger`
+    when a Sessions badge behind it is red, `t-warning` otherwise). Never a count: a sum would mix
+    sessions with machines. Its accessible name stays "More Destinations" (or "…, <destination>
+    selected"); its description names each destination behind it with its breakdown, in sheet
+    order: "Sessions: 12 waiting on you, 3 stalled. Connections: 1 machine needs an update". A
+    destination on the bar contributes nothing to it.
 
   The mark sits on the icon's shoulder in the 64px rail and on a phone tab, and inline after the
   name in the labelled rail and the More sheet. Its icon box (`.rail-icon`) is wider than the glyph,
@@ -1442,7 +1449,15 @@ meta (§11.3). This table lives in code as one `statusMeta(domain, value) → {l
   item's description and the rail tooltip's second line.
 - Inline by default, in the text flow of a list-foot row, a menu row or a tab. `.count-badge.on-icon`
   places it on an icon's top-right shoulder (the icon's wrapper is the positioned box), growing
-  away from the icon, with a 2px ring in `--count-badge-ring`. That property defaults to
+  away from the icon, with 2px sides rather than 4px (one digit stays a 16px circle, two are about 17px
+  wide) and a 2px ring in `--count-badge-ring`. On the 64px rail a count too wide for the room
+  beside the glyph grows back over the icon box's corner instead, so the badge and its ring end at
+  the rail's border and never cross it, in every tier (#2110). Grown back, its lower corner would
+  reach the glyph's shoulder, so it also rises by twice the distance it grew back plus 1px, up to
+  7px. A count that fits does not move. Two digits fit in most faces and rise about 3px in a wide
+  one (DejaVu Sans); three digits rise the full 7px, clear of the glyph, with their ring leaving the
+  item's top edge by 4px to 10px, over the gap and the empty foot of the item above. That is the
+  one case where the ring leaves its item. A phone tab has room to grow away as usual. That property defaults to
   `--bg-elev`; a surface that is not `--bg-elev` (a selected rail item on `--surface-selected`)
   sets it once on an ancestor rather than redrawing the badge. Forced colors drops the ring's
   box-shadow, so there a 2px `Canvas` outline redraws it.
@@ -1776,7 +1791,7 @@ so it is the Restart to Install Update confirmation (§13.1), never a banner or 
 | Element | Phone behavior |
 | --- | --- |
 | Rail | Bottom tab bar, 56px + safe area, **labeled** (24px icon + 11px label). Default slots: Sessions, Projects, Connections, Automations, More. Experimental destinations never take a primary slot by default. Active: accent icon and label plus a tinted pill behind the icon (not a bar below it). `phoneBarViews()` in `rail-preferences.ts` is the one source for the slots: an optional per-instance `phoneBar` list replaces the default, and a hidden or turned-off slot is filled in place by the next visible non-experimental destination in rail order. From 600px the tabs keep a 480px centered measure. |
-| More | A real bottom sheet with a scrim and a "More" title; rows 48px with icons; Settings last after a separator. It holds every other visible destination in rail order. A tap opens it focused on the sheet itself, with no ring; closing it hands focus back to More only from the keyboard (Escape, or Enter on a row). At 420px tall and below the rows form two columns, so every row fits a 568×320 screen. |
+| More | A real bottom sheet with a scrim and a "More" title; rows 48px with icons; Settings last after a separator. It holds every other visible destination in rail order. A tap opens it focused on the sheet itself, with no ring; closing it hands focus back to More only from the keyboard (Escape, or Enter on a row). At 420px tall and below the rows form two columns, so every row fits a 568×320 screen. While a destination in the sheet needs the user, the More tab carries one mark for them all (§11.4). |
 | App bar | 48px: ‹ Back (on detail routes) or nothing, title 16/600 (truncates), trailing icons (search, primary `+`, ⋯). Icons are 36px visual with 44px hit areas, as in the settled phone session header. No page description. |
 | Page header actions | Primary as `+` icon (accessible name "New Skill"), all others in ⋯ sheet. |
 | Master-detail | Two routes (§6.2). |
