@@ -9556,12 +9556,14 @@ button.file-head.source-path-link {
   border-top: 1px solid var(--border);
 }
 /* A Checkbox row (§8.4): the 16px box, its label 8px to the right, and the whole row as the
-   target. At least 32px tall, 44px on a coarse pointer, through the dense row token. */
+   target. At least 32px tall, 44px on a coarse pointer, through the dense row token. Items sit at
+   the top of their track and the box is one label line tall, so a wrapped label keeps its box on
+   the first line; the tracks themselves are centred, so a one-line row stays centred. */
 .checkbox {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-content: center;
-  align-items: center;
+  align-items: start;
   column-gap: var(--space-2);
   min-width: 0;
   min-height: var(--row-h-dense);
@@ -9569,6 +9571,7 @@ button.file-head.source-path-link {
   font: var(--type-body);
   cursor: pointer;
 }
+.checkbox > .checkbox-mark { height: 20px; }
 .checkbox-label { overflow-wrap: anywhere; }
 /* The helper sits under the label, so the box stays on the label's line. */
 .checkbox-helper { grid-column: 2; color: var(--text-dim); font: var(--type-small); }
@@ -11560,8 +11563,11 @@ body.shell-dock-dragging * {
   align-items: baseline;
   white-space: pre;
 }
+/* Centred on the row, not on the text baseline: a 16px box standing on the baseline rose above the
+   18px line and made every row with a box taller than a row without one. */
 .diff-line-select {
   display: inline-flex;
+  align-self: center;
   width: auto;
   min-width: 24px;
   gap: 3px;
@@ -11569,7 +11575,6 @@ body.shell-dock-dragging * {
   justify-content: center;
   user-select: none;
 }
-.diff-line-select input { margin: 0; width: 13px; height: 13px; }
 .diff-split-row {
   display: grid;
   grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr);
