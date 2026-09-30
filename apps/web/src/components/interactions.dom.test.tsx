@@ -310,6 +310,57 @@ test("StrictMode simulated cleanup cannot move focus behind an open palette", as
   container.remove();
 });
 
+test("closing the palette after its opener was removed hands focus to the page title (#1978)", async () => {
+  // The phone app bar's Search unmounts when the window widens past 760px while the palette is open.
+  const happyTitle = domWindow.document.createElement("h1");
+  const happyInvoker = domWindow.document.createElement("button");
+  const happyContainer = domWindow.document.createElement("div");
+  happyTitle.id = "page-title";
+  happyTitle.tabIndex = -1;
+  domWindow.document.body.append(happyTitle, happyInvoker, happyContainer);
+  const invoker = happyInvoker as unknown as HTMLButtonElement;
+  const container = happyContainer as unknown as HTMLDivElement;
+  invoker.focus();
+  const root = createRoot(container);
+  await act(async () => {
+    root.render(<StrictFocusHarness returnTo={invoker} />);
+    await tick();
+  });
+  invoker.remove();
+  await act(async () => {
+    root.unmount();
+    await tick();
+  });
+  assert.ok(domWindow.document.activeElement === happyTitle, "focus is on the page title, not <body>");
+  happyTitle.remove();
+  container.remove();
+});
+
+test("a palette reopened at once keeps focus; the closed one's restore does not take it back (#1978)", async () => {
+  const happyInvoker = domWindow.document.createElement("button");
+  const happyContainer = domWindow.document.createElement("div");
+  domWindow.document.body.append(happyInvoker, happyContainer);
+  const invoker = happyInvoker as unknown as HTMLButtonElement;
+  const container = happyContainer as unknown as HTMLDivElement;
+  invoker.focus();
+  const root = createRoot(container);
+  const palette = (key: string) => (
+    <div role="dialog" aria-modal="true" key={key}><StrictFocusHarness returnTo={invoker} /></div>
+  );
+  await act(async () => {
+    root.render(palette("first"));
+    await tick();
+  });
+  // Close and reopen in one commit, before the first palette's zero-delay restore has run.
+  await act(async () => { root.render(palette("second")); });
+  await act(async () => { await tick(); });
+  assert.equal(domWindow.document.activeElement?.getAttribute("aria-label"), "Palette input",
+    "focus stays in the open palette, where Escape can reach it");
+  await act(async () => { root.unmount(); });
+  invoker.remove();
+  container.remove();
+});
+
 function approvalSession(requestId: string | null): SessionView {
   return {
     id: "session-1",
