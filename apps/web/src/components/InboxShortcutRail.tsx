@@ -1,4 +1,4 @@
-import { useId } from "react";
+import { useId, useLayoutEffect, useRef, type RefObject } from "react";
 import type { SessionView } from "@wollipog/protocol";
 import { sessionArchiveActionLabel } from "../archive-actions.js";
 import { sessionArchiveActionRefusal, sessionCommandRefusal } from "../session-command-permissions.js";
@@ -51,6 +51,50 @@ function ShortcutButton({ label, shortcut, disabled, disabledReason, onClick }: 
   );
 }
 
+/**
+ * What the Sessions footer gives up, in order, so that no shortcut is cut off (#1969): first the
+ * keycaps (each button's tooltip still names its key), then the Running, Queued and Starting counts
+ * (still read aloud; Blocked and Stalled stay). The footer's width follows the rail, the labelled
+ * rail and the compact tier, and what the shortcuts need follows the session (Approve and Deny,
+ * Snooze, the Archive label), so it is measured rather than set by breakpoints. Each pass starts
+ * from the full footer, inside one layout pass, so the answer never depends on the previous one.
+ * React does not own the attribute. The rail still scrolls as a last resort.
+ */
+export const SHORTCUT_FIT_STEPS = ["keys", "counts"] as const;
+
+function useShortcutsFit(railRef: RefObject<HTMLDivElement | null>, hasSession: boolean, hasApprovals: boolean) {
+  useLayoutEffect(() => {
+    const rail = railRef.current;
+    const footer = rail?.parentElement;
+    if (!rail || !footer) return;
+    const fit = () => {
+      footer.removeAttribute("data-fit");
+      for (const step of SHORTCUT_FIT_STEPS) {
+        if (rail.scrollWidth <= rail.clientWidth) return;
+        footer.setAttribute("data-fit", step);
+      }
+    };
+    fit();
+    // The footer's width, the counts' text and each shortcut group's labels are what move the answer.
+    // None of them is sized by the answer except the counts, and a pass ends where it began.
+    const resizes = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(fit);
+    resizes?.observe(footer);
+    for (const part of footer.querySelectorAll(".inbox-activity-summary, .inbox-shortcut-rail > span")) {
+      resizes?.observe(part);
+    }
+    // A count hidden by the answer is a fixed 1px box, so "10 Running" becoming "9 Running" resizes
+    // nothing observed, yet it may be what lets the counts show again. Their text is watched instead.
+    const summary = footer.querySelector(".inbox-activity-summary");
+    const edits = summary && typeof MutationObserver !== "undefined" ? new MutationObserver(fit) : null;
+    if (summary) edits?.observe(summary, { characterData: true, childList: true, subtree: true });
+    return () => {
+      resizes?.disconnect();
+      edits?.disconnect();
+      footer.removeAttribute("data-fit");
+    };
+  }, [railRef, hasSession, hasApprovals]);
+}
+
 export function InboxShortcutRail({
   session,
   pinned,
@@ -67,6 +111,8 @@ export function InboxShortcutRail({
   onArchive,
   onSnooze,
 }: InboxShortcutRailProps) {
+  const railRef = useRef<HTMLDivElement>(null);
+  useShortcutsFit(railRef, session !== null, Boolean(session?.pendingApproval));
   if (!session) {
     return <div className="inbox-shortcut-rail is-empty" aria-label="Selected Session Shortcuts" />;
   }
@@ -76,7 +122,7 @@ export function InboxShortcutRail({
   const archiveRefusal = sessionArchiveActionRefusal(session);
 
   return (
-    <div className="inbox-shortcut-rail" role="group" aria-label={`Shortcuts for ${session.title}`}>
+    <div ref={railRef} className="inbox-shortcut-rail" role="group" aria-label={`Shortcuts for ${session.title}`}>
       {session.pendingApproval && (
         <span className="inbox-shortcut-context" role="group" aria-label="Approval Shortcuts">
           <ShortcutButton
