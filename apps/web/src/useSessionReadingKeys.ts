@@ -49,18 +49,24 @@ const ACTION_BINDINGS: ReadonlyArray<[
   ["session-reading-reply", "reply"],
 ];
 
-function xtermOwnsFocus(targetDocument: Document): boolean {
+/** A terminal owns every key: xterm, or the pipe-mode shell input with its own ↑/↓ history. */
+function terminalOwnsFocus(targetDocument: Document): boolean {
   const active = targetDocument.activeElement;
-  return active instanceof Element && Boolean(active.closest(".xterm"));
+  return active instanceof Element && Boolean(active.closest(".xterm, .shell-input"));
 }
 
 function nativeControlOwnsFocus(targetDocument: Document): boolean {
   const active = targetDocument.activeElement;
   if (!(active instanceof HTMLElement)) return false;
-  // Text inputs deliberately remain eligible for modifier bindings (Ctrl+J/K); bare bindings
-  // are rejected by matchesShortcut's typing-context guard. Other controls keep all keys.
+  // Text inputs deliberately remain eligible for modifier bindings (Alt+↑/↓); bare bindings
+  // are rejected by matchesShortcut's typing-context guard. Other controls keep all keys,
+  // including composite widgets that move their own selection with Alt+arrows. A combobox (the
+  // composer is one) owns its keys only while its list is open.
   return active.matches(
-    'button, a[href], select, [role="button"], [role="link"], [role="radio"], [role="checkbox"], [role="switch"], [role="menuitem"]',
+    'button, a[href], select, [role="button"], [role="link"], [role="radio"], [role="checkbox"], [role="switch"], ' +
+      '[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="listbox"], [role="option"], ' +
+      '[role="combobox"][aria-expanded="true"], [role="tab"], [role="grid"], [role="tree"], [role="treeitem"], ' +
+      '[role="slider"], [role="spinbutton"], [role="separator"]',
   );
 }
 
@@ -79,8 +85,9 @@ function scrollTo(scroll: HTMLElement | null, top: number): void {
 }
 
 /**
- * The sole Session Reading keyboard listener. Capture phase intentionally lets this contextual
- * scope shadow global Ctrl+K search before the global bubble listener observes the event.
+ * The sole Session Reading keyboard listener. Capture phase lets this contextual scope own its
+ * keys before the transcript bridge and the global bubble listeners see them, so none of its
+ * bindings may share keys with a global one; the registry's co-active binding test enforces that.
  */
 export function useSessionReadingKeys({
   enabled,
@@ -102,7 +109,7 @@ export function useSessionReadingKeys({
     }
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || shortcutLayerActive(document) || xtermOwnsFocus(document)) {
+      if (event.defaultPrevented || shortcutLayerActive(document) || terminalOwnsFocus(document)) {
         sequenceRef.current = null;
         return;
       }
