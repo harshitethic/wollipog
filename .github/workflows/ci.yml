@@ -144,21 +144,25 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.action == 'ready_for_review' || github.event.pull_request.draft == false
     name: Browser End-to-End Tests
     runs-on: ubuntu-22.04
-    # Browser shards now take up to fifteen minutes, including dependency and browser setup.
-    # Leave headroom for ordinary runner variation and cleanup so passing suites are not
-    # cancelled at the old fifteen-minute cap. Keep execution bounded below the old thirty.
+    # Measured on 2026-09-30 over 310 passing jobs, four shards took a median 14 minutes and at most
+    # 16.6 (995 seconds, setup included): past the fifteen-minute budget, which cancelled shards
+    # whose tests had all passed (#2067). Five shards cut the median to 11.4 minutes over three runs;
+    # the slowest took 16.3 (975 seconds: a slow dependency install plus shard 1's production pass).
+    # Playwright splits by test count, not time, so which shard is slowest moves as files are added.
+    # Twenty-five keeps over eight minutes spare for a slow runner, and stays below the old thirty so
+    # a doubling of the suite is a loud failure rather than a creep towards the cap (#842).
     timeout-minutes: 25
     strategy:
       # Every shard reports. With fail-fast the first real failure cancels its siblings, and the
       # aggregator below reads a cancelled job as a budget hit — so one broken test would be
-      # announced as three timeouts, which is the opposite of a useful signal.
+      # announced as four timeouts, which is the opposite of a useful signal.
       fail-fast: false
       matrix:
         # The shard COUNT is duplicated in the --shard denominator below because GitHub offers no
         # way to read the matrix length from inside the job. scripts/workflow-pr-event-contract.test.mjs
-        # asserts the two agree: a matrix of four against --shard=i/3 overruns, and a matrix of
-        # three against --shard=i/4 silently drops a quarter of the suite and still reports green.
-        shard: [1, 2, 3, 4]
+        # asserts the two agree: a matrix of five against --shard=i/4 overruns, and a matrix of
+        # four against --shard=i/5 silently drops a fifth of the suite and still reports green.
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -204,10 +208,10 @@ jobs:
         run: pnpm exec playwright install-deps chromium
 
       - name: Remote-Instance Browser End-to-End Tests
-        run: pnpm test:e2e --shard=${{ matrix.shard }}/4
+        run: pnpm test:e2e --shard=${{ matrix.shard }}/5
 
       # The production pass is thirty-three seconds and does not shard: it builds the app once and
-      # loads it once. Running it on every shard would be four copies of the same evidence.
+      # loads it once. Running it on every shard would be five copies of the same evidence.
       - name: Validate Web Production Build
         if: matrix.shard == 1
         run: pnpm --filter @wollipog/web build
