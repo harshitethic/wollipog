@@ -1565,8 +1565,8 @@ session conditions `{ key, severity: "danger" | "warning" | "info", rank, title,
 exactly one: the most severe, then the lowest rank.
 
 - Ranks live in one table, `SESSION_NOTICE_RANK`: worktree missing 1, conversation quarantined 2,
-  worktree setup failed 3, account switch failed 4, skills unavailable 8, setup suggestion 9. A new
-  entry adds its rank there.
+  worktree setup failed 3, invalid worktree setup configuration 4, account switch failed 5, skills
+  unavailable 8, setup suggestion 9. A new entry adds its rank there.
 - The others are a `.btn.sm.ghost` "+N More" in the shown notice's title row. It opens a menu (§9.1)
   of their tone icons and one-line titles; choosing one shows it until the set of conditions changes,
   and focus moves to the new notice's "+N More".
@@ -1576,6 +1576,16 @@ exactly one: the most severe, then the lowest rank.
   session's configured account).
 - Every session notice above the composer is an entry of this slot: the Composer epic's composer
   errors, attachment notes and queued-message errors join it rather than building a second slot.
+- A session notice says whether this session can take its next turn. A campaign notice describes an
+  Orchestrator campaign instead: Campaign Continuation (the delivery of the campaign's durable events
+  to the Orchestrator) and Held Children (the roster of child sessions that cannot start their next
+  turn). They are not entries of this slot, and a new notice about the campaign follows the same
+  rule. They sit directly under the session bar of the Orchestrator's session, Campaign Continuation
+  first and then Held Children, and never collapse into "+N More". The reasons: Held Children lists
+  other sessions, each with its own hold and recovery action, which one `Notice` body cannot hold;
+  Campaign Continuation's pending, running and held states are neutral progress, a tone the slot does
+  not have; and a failed continuation whose automatic retries have stopped needs a person, so it must
+  not wait behind a danger condition's "+N More".
 - A condition nothing waits on is info, compact and dismissible: skills that a container or cloud
   session cannot use (the dismissal is kept per session on the device, and the Pinned Summary keeps
   a Skills: Not Available row) and the Project setup suggestion (dismissed for the Project on the

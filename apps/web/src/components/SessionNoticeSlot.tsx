@@ -23,6 +23,10 @@ import { ToneIcon } from "./Notice.js";
  * spreads them: the composer sorts those reasons with `compareSessionNotices`, so its placeholder
  * names the condition this slot shows first (#2037). The Approvals epic's request dock takes the
  * slot ahead of every entry while a request is pending; it is not an entry.
+ *
+ * NOT AN ENTRY. A campaign notice describes an Orchestrator campaign rather than whether this
+ * session can take its next turn: Campaign Continuation and Held Children. They stay under the
+ * session bar, in that order, and never collapse into "+N More" (§13.2; #2036).
  */
 
 export type SessionNoticeSeverity = "danger" | "warning" | "info";
@@ -54,7 +58,8 @@ export const SESSION_NOTICE_RANK = {
   worktreeMissing: 1,
   historyQuarantine: 2,
   worktreeSetupFailed: 3,
-  accountSwitchFailed: 4,
+  worktreeSetupConfigInvalid: 4,
+  accountSwitchFailed: 5,
   skillsUnavailable: 8,
   setupSuggestion: 9,
 } as const;
