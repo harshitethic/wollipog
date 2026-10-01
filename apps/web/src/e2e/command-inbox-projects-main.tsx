@@ -41,7 +41,7 @@ import {
 import { api, type ApiClient } from "../api.js";
 import { ApiProvider } from "../api-context.js";
 import { FeedbackProvider, useFeedback, type ToastOptions } from "../components/FeedbackProvider.js";
-import { DockBottomIcon, PanelRightIcon, PinnedPanelIcon } from "../components/Icons.js";
+import { CommandLineIcon, InfoIcon, PanelRightIcon } from "../components/Icons.js";
 import { InboxView } from "../components/InboxView.js";
 import { NewSessionDialog, type NewSessionPreset } from "../components/NewSessionDialog.js";
 import { PodDetail } from "../components/PodsView.js";
@@ -2272,6 +2272,8 @@ declare global {
       settleDeferredCancelTurn(): void;
       setRunnerProtocolVersion(version: number): void;
       setRunnerStatus(status: RunnerView["status"]): void;
+      /** The editors the fixture machine advertises; none by default, so Open is Open Folder. */
+      setRunnerEditors(editors: NonNullable<RunnerView["editors"]>): void;
       setOrchestratorAgentFixture(options: {
         context: "native" | "wsl";
         permissionModes: string[];
@@ -2514,6 +2516,10 @@ window.__WOLLIPOG_PROJECT_INBOX_E2E__ = {
     runner.status = status;
     socket?.push(snapshot());
   },
+  setRunnerEditors(editors) {
+    runner.editors = editors;
+    socket?.push(snapshot());
+  },
   setOrchestratorAgentFixture(options) {
     const agent = runner.agents[0]!;
     const capabilities = agent.capabilities;
@@ -2716,9 +2722,11 @@ function FixtureSurface() {
         <>
           {/* Production's glyphs and small size, so the phone top bar's icon rule has an icon to size
               (#2081) and each toggle borrows its 44px touch target (#2146). */}
-          <button type="button" className="icon-btn sm" aria-label="Toggle Pinned Summary"><PinnedPanelIcon size={16} /></button>
-          <button type="button" className="icon-btn sm" aria-label="Show Terminal"><DockBottomIcon size={16} /></button>
-          <button type="button" className="icon-btn sm" aria-label="Show Side Panel"><PanelRightIcon size={16} /></button>
+          <div className="panel-toggles" role="group" aria-label="Panels">
+            <button type="button" className="icon-btn sm" aria-label="Pinned Summary" aria-pressed="false"><InfoIcon size={16} /></button>
+            <button type="button" className="icon-btn sm" aria-label="Terminal" aria-pressed="false"><CommandLineIcon size={16} /></button>
+            <button type="button" className="icon-btn sm" aria-label="Side Panel" aria-pressed="false"><PanelRightIcon size={16} /></button>
+          </div>
         </>
       )}
       sessionTitle={sessionDisplayTitle(sessions.get(view.id)?.title ?? "") || "Session"}
