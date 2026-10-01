@@ -3,7 +3,9 @@ import { isTerminal, type SessionStatus, type SessionView } from "@wollipog/prot
 import { useApi } from "../api-context.js";
 import { ARCHIVE_SEARCH_EVENT, pendingArchiveSearch, takeArchiveSearch } from "../archive-search-handoff.js";
 import { sessionUnarchiveRestarts, unarchiveAndRestartFailureMessage } from "../archive-actions.js";
+import { pendingQueuedPromptCount } from "../session-actions.js";
 import { sessionCommandRefusal } from "../session-command-permissions.js";
+import { deleteSessionMessage, stopArchivedSessionMessage } from "../session-confirmation-copy.js";
 import {
   archiveSessionMetadata,
   canonicalLifecycleLabel,
@@ -410,9 +412,12 @@ export function ArchivedSessionsView() {
   };
 
   const stop = async (session: SessionView) => {
+    // The live copy carries the runner's queue, which the archive page's REST rows can lack (a steer
+    // converted to a queued prompt exists only on the runner), and it is what the session header counts.
+    const queued = (liveSessionsRef.current.get(session.id) ?? session).queued;
     const approved = await confirm({
       title: "Stop Session",
-      message: `${session.title ? `“${session.title}”` : "This session"} stops and discards every queued message. It stays in Archived Sessions with its transcript.`,
+      message: stopArchivedSessionMessage(session.title, pendingQueuedPromptCount(queued)),
       confirmLabel: "Stop Session",
       tone: "danger",
     });
@@ -431,7 +436,7 @@ export function ArchivedSessionsView() {
   const deleteSession = async (session: SessionView) => {
     const approved = await confirm({
       title: "Delete Session",
-      message: `${session.title ? `“${session.title}”` : "This session"} and its history are permanently removed. This cannot be undone.`,
+      message: deleteSessionMessage(session.title),
       confirmLabel: "Delete Session",
       tone: "danger",
     });
