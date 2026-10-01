@@ -368,6 +368,8 @@ export interface DurableCommandLifecycle {
   readonly commandId: string;
   queued(error?: string, code?: DurableSessionCommandErrorCode): void;
   started(userEventSeq?: number): void;
+  beginSteering?(): void;
+  steeringRejected?(): void;
   completed(): void;
   failed(error: string, code?: DurableSessionCommandErrorCode): void;
   uncertain(error: string): void;
@@ -8250,10 +8252,15 @@ export class SessionManager {
     for (const operation of this.steeringRegistry.get(sessionId)?.values() ?? []) {
       operation.resolveLifecycle();
       if (!operation.settled) {
+        // Replacement already returned this source to its FIFO. Clearing the old steering
+        // operation must leave that command's queued lifecycle available to the new launch.
+        const durable = operation.sourceRestored ? undefined : operation.source?.durable;
+        const uncertain = Boolean(durable && operation.providerStarted);
+        if (durable && !uncertain) durable.failed(message, "COMMAND_CANCELLED");
         this.settleSteering(operation, this.makeSteeringResult(
           operation.request,
-          "rejected",
-          "policy_blocked",
+          uncertain ? "uncertain" : "rejected",
+          uncertain ? "transport_uncertain" : "policy_blocked",
           { message },
         ));
       }
@@ -8288,7 +8295,8 @@ export class SessionManager {
   ): boolean {
     if (durable && this.store.readEvents(sessionId).some((event) =>
       recoveredQuestion
-        ? event.payload.kind === "question_resolved" && event.payload.commandId === durable.commandId
+        ? (event.payload.kind === "question_resolved" || event.payload.kind === "user_message") &&
+          event.payload.commandId === durable.commandId
         : event.payload.kind === "user_message" && event.payload.commandId === durable.commandId)) {
       // The correlated turn marker is written and fsynced before `started`. If a journal write
       // failed at that boundary, replaying could submit the provider turn twice. Fail visibly into
@@ -8797,7 +8805,7 @@ export class SessionManager {
         ? operation.resolution
         : { ...base, applied: false, reason: "resolution_action_conflict" };
     }
-    if (!operation.settled || operation.result?.disposition !== "uncertain") {
+    if (operation.resolved || !operation.settled || operation.result?.disposition !== "uncertain") {
       return { ...base, applied: false, reason: "attempt_not_uncertain" };
     }
 
@@ -8994,7 +9002,9 @@ export class SessionManager {
       };
     }
     if (!prompt) return { eligible: true };
-    if (prompt.durable || prompt.sessionCommand || prompt.syntheticRecovery) {
+    if ((prompt.durable && (!prompt.recoveredQuestion?.pendingQuestion.async ||
+        !prompt.durable.beginSteering || !prompt.durable.steeringRejected)) ||
+        prompt.sessionCommand || prompt.syntheticRecovery) {
       return {
         eligible: false,
         reason: "configuration_mismatch",
@@ -9114,6 +9124,7 @@ export class SessionManager {
       return this.handleDefiniteSteeringFailure(operation, "policy_blocked", "session lifecycle discarded the promotion");
     }
 
+    operation.source?.durable?.beginSteering?.();
     operation.providerStarted = true;
     const [steeringImages, steeringReferenceText] = materialized.value!;
     const providerPromise = entry.client.steer({
@@ -9124,6 +9135,11 @@ export class SessionManager {
     });
     const provider = await this.awaitSteeringDeadline(providerPromise, operation.deadlineAt, operation.lifecyclePromise);
     if (provider.cancelled) {
+      if (operation.source?.durable) {
+        return this.makeSteeringResult(request, "uncertain", "transport_uncertain", {
+          message: "session lifecycle changed during async answer steering",
+        });
+      }
       return this.handleDefiniteSteeringFailure(operation, "policy_blocked", "session lifecycle discarded steering");
     }
     if (provider.timedOut) {
@@ -9152,12 +9168,14 @@ export class SessionManager {
       return this.handleDefiniteSteeringFailure(operation, "provider_rejected", outcome.reason);
     }
 
+    source?.durable?.started();
     const persisted = this.appendAcceptedSteeringEvent(
       request.sessionId,
       request.turnId,
       request.submissionId,
       displayText,
       imageInputs,
+      source?.durable,
     );
     if (!persisted) {
       return this.makeSteeringResult(request, "uncertain", "history_integrity_failure", {
@@ -9295,6 +9313,7 @@ export class SessionManager {
     message?: string,
   ): SteeringResult {
     if (operation.source) {
+      if (operation.providerStarted) operation.source.durable?.steeringRejected?.();
       this.restorePromotedPrompt(operation);
       return this.makeSteeringResult(operation.request, "rejected", reason, { message });
     }
@@ -9407,6 +9426,7 @@ export class SessionManager {
     submissionId: string,
     text: string,
     images: PromptImageInput[],
+    durable?: DurableCommandLifecycle,
   ): boolean {
     if (this.active.get(sessionId)?.historyIntegrityFailure) return false;
     try {
@@ -9417,6 +9437,7 @@ export class SessionManager {
         turnId,
         submissionId,
         deliveryIntent: "steer",
+        ...(durable ? { commandId: durable.commandId } : {}),
       };
       const stored = this.store.appendEvent(sessionId, payload);
       if (!stored) throw new Error("session metadata disappeared before steering history append");
@@ -9472,7 +9493,16 @@ export class SessionManager {
       const source = operation.source;
       const entry = this.active.get(operation.request.sessionId);
       if (source && entry) this.reservedPromotions(entry).delete(source.id);
+      source?.durable?.completed();
       operation.source = undefined;
+    } else if (result.disposition === "uncertain" && operation.source?.durable) {
+      // A durable answer has its own terminal receipt. Never offer Queue Again on the steering
+      // reservation: its journal is terminal and provider delivery may already have happened.
+      operation.source.durable.uncertain(result.message ?? "async answer steering delivery is uncertain");
+      const entry = this.active.get(operation.request.sessionId) ?? operation.fenceEntry;
+      if (entry) this.reservedPromotions(entry).delete(operation.source.id);
+      operation.source = undefined;
+      operation.resolved = true;
     }
     operation.resolve(result);
     // Promise continuations (the index handler emits the correlated result) run before this queued
@@ -14634,19 +14664,87 @@ export class SessionManager {
         pendingQuestion,
       };
     }
-    this.prompt(
+    let deliveryStarted = false;
+    let refused = false;
+    const answerLifecycle: DurableCommandLifecycle = recoveredQuestion.pendingQuestion.async ? {
+      commandId: durable.commandId,
+      queued: (error, code) => durable.queued(error, code),
+      ...(durable.beginSteering ? { beginSteering: () => durable.beginSteering!() } : {}),
+      ...(durable.steeringRejected ? { steeringRejected: () => durable.steeringRejected!() } : {}),
+      started: (seq) => { deliveryStarted = true; durable.started(seq); },
+      completed: () => durable.completed(),
+      uncertain: (error) => durable.uncertain(error),
+      failed: (error, code) => {
+        durable.failed(error, code);
+        if (!deliveryStarted) {
+          refused = true;
+          this.restoreUndeliveredAsyncQuestion(sessionId, recoveredQuestion, durable.commandId);
+        }
+      },
+    } : durable;
+    const accepted = this.prompt(
       sessionId,
       retained?.text ?? recoveredQuestionContinuationText(requestId, recoveredQuestion.pendingQuestion, answers),
       retained?.images ?? [],
       retained?.slashCommand,
       retained?.config,
-      durable,
+      answerLifecycle,
       false,
       retained?.ordinal,
       true,
       undefined,
       recoveredQuestion,
     );
+    if (!accepted || refused || !recoveredQuestion.pendingQuestion.async) return;
+    // "Submitted" resolves the user's input, not provider delivery. No commandId/startsTurn is
+    // written here: only the later command-tagged delivery event proves provider submission.
+    if (!this.emitEvent(sessionId, {
+      kind: "question_resolved", requestId, occurrenceId: recoveryId, answered: true,
+      resolutionReason: "submitted",
+      ...(resolvedByParentSessionId ? { resolvedByParentSessionId } : {}),
+    })) return;
+    this.store.flush(sessionId);
+
+    const entry = this.active.get(sessionId);
+    const queued = entry?.queue.find((prompt) => prompt.durable?.commandId === durable.commandId);
+    if (!entry || !queued || !this.steeringEligibility(entry, queued).eligible) return;
+    void this.steerSession({
+      sessionId, turnId: entry.activeTurnId!, submissionId: durable.commandId,
+      promotePromptId: queued.id,
+    }).then((result) => {
+      this.log(JSON.stringify({
+        event: "async_answer_delivery", sessionId, commandId: durable.commandId,
+        disposition: result.disposition, reason: result.reason,
+      }));
+    });
+  }
+
+  /** A known pre-provider failure permits a fresh durable retry of this occurrence. Re-emit the
+   * question only after its submission-only resolution, so history recovery sees it as pending. */
+  private restoreUndeliveredAsyncQuestion(
+    sessionId: string,
+    recovered: NonNullable<QueuedPrompt["recoveredQuestion"]>,
+    commandId: string,
+  ): void {
+    try {
+      const meta = this.store.readMeta(sessionId);
+      if (!meta || isTerminal(meta.status) || meta.providerHistoryBlock) return;
+      if (this.store.readEvents(sessionId).some((event) =>
+        (event.payload.kind === "question_resolved" || event.payload.kind === "user_message") &&
+        event.payload.commandId === commandId)) return;
+      const current = pendingRequests(meta.pendingApproval).find((request) => request.requestId === recovered.requestId);
+      if (current && current.occurrenceId !== recovered.recoveryId) return;
+      if (!current && !this.emitEvent(sessionId, {
+        kind: "question_request", async: true, requestId: recovered.requestId,
+        occurrenceId: recovered.recoveryId, questions: recovered.pendingQuestion.questions ?? [],
+        ...(recovered.pendingQuestion.ownerToolUseId ? { ownerToolUseId: recovered.pendingQuestion.ownerToolUseId } : {}),
+      }, undefined, true)) return;
+      this.store.flush(sessionId);
+      const updated = this.store.readMeta(sessionId);
+      if (updated) this.send({ type: "session_runtime_updated", snapshot: this.snapshot(updated) });
+    } catch (error) {
+      this.log(`undelivered async question restoration failed for ${sessionId}: ${errText(error)}`);
+    }
   }
 
   /** Stop refreshing and release a session's lock (idempotent). */
@@ -15191,6 +15289,7 @@ export class SessionManager {
     sessionId: string,
     payload: SessionEventPayload,
     durable?: DurableCommandLifecycle,
+    preserveAsyncQuestionOccurrence = false,
   ): ReturnType<SessionStore["appendEvent"]> | undefined {
     if ((payload.kind === "user_message" || payload.kind === "agent_message" ||
         payload.kind === "agent_thought" || payload.kind === "tool_call") &&
@@ -15221,7 +15320,9 @@ export class SessionManager {
       // so delegated Parent Control can compare-and-set the exact pending occurrence.
       const identifiedPayload: SessionEventPayload =
         payload.kind === "permission_request" || payload.kind === "question_request"
-          ? { ...payload, occurrenceId: `request_${randomUUID().replaceAll("-", "")}` }
+          ? { ...payload, occurrenceId: preserveAsyncQuestionOccurrence &&
+              payload.kind === "question_request" && payload.async && payload.occurrenceId
+              ? payload.occurrenceId : `request_${randomUUID().replaceAll("-", "")}` }
           : payload;
       // Persist to the box store (the source of truth) and stamp the runner-owned seq/ts onto the
       // live message so every dashboard's cache agrees. No lifecycle caller may observe a rejected
@@ -17166,6 +17267,10 @@ export class SessionManager {
     commandId: string,
     recoveredQuestion: NonNullable<QueuedPrompt["recoveredQuestion"]>,
   ): void {
+    if (recoveredQuestion.pendingQuestion.async) {
+      this.restoreUndeliveredAsyncQuestion(sessionId, recoveredQuestion, commandId);
+      return;
+    }
     try {
       const resolved = this.store.readEvents(sessionId).some((event) =>
         event.payload.kind === "question_resolved" &&
