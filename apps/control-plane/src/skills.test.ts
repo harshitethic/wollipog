@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   SKILL_MAX_FILES,
+  skillMarkdownFromFields,
   type AgentDefinition,
   type ResourceScope,
   type RunnerMetadata,
@@ -49,6 +50,31 @@ test("readSkillFrontmatter bounds values and tolerates a BOM", () => {
     content: `---\nname: wide\ndescription: ${"😀".repeat(600)}\n---\n` }] });
   assert.ok(wide.ok);
   assert.ok(wide.description!.length <= 1024);
+});
+
+test("readSkillFrontmatter reads back exactly the name and description of a SKILL.md built from fields", () => {
+  // The New Skill dialog writes this frontmatter. An import (from a machine, Git, or a folder with
+  // no Description) sends no explicit description, so the reader alone decides what is stored.
+  const descriptions = [
+    "Use when: the user asks for a review, or 'checks' a PR.",
+    "Line one: colons.\nLine two \"quoted\" and C:\\temp\\new.",
+    "Tab\there, \u0085NEL and \u2028LS.",
+  ];
+  for (const name of ["code-review", "1.5", "true"]) {
+    for (const description of descriptions) {
+      const content = skillMarkdownFromFields({ name, description, body: "Review the diff." });
+      assert.deepEqual(readSkillFrontmatter(content), { name, description }, `${name}: ${JSON.stringify(description)}`);
+      const imported = validateSkillPayload({ name, files: [{ path: "SKILL.md", content, encoding: "utf8" }] });
+      assert.ok(imported.ok, imported.ok ? "" : imported.error);
+      assert.equal(imported.description, description, "an import without an explicit description stores it exactly");
+    }
+  }
+});
+
+test("readSkillFrontmatter keeps a double-quoted value that is not JSON as written", () => {
+  assert.deepEqual(readSkillFrontmatter('---\nname: "my-skill"\ndescription: "C:\\path\\to it"\n---\n'),
+    { name: "my-skill", description: "C:\\path\\to it" });
+  assert.deepEqual(readSkillFrontmatter("---\ndescription: 'single ''quoted'''\n---\n"), { description: "single ''quoted''" });
 });
 
 /* ------------------------------- Validation ------------------------------ */
