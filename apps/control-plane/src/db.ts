@@ -7644,6 +7644,28 @@ export class ControlPlaneDb {
     return row ? this.skillView(row) : null;
   }
 
+  /**
+   * Where a new latest version of this skill deploys (#2129): its direct assignments and its
+   * group's, counted, and a digest of them that changes whenever one is added, removed, retargeted,
+   * enabled, disabled or otherwise edited. An edit counts because the edit time decides which of two
+   * equal rules wins. A review's preview reports both from this one read, so its consent names the
+   * assignments its digest describes; the matching accept carries the digest back and is refused
+   * instead of deploying where nobody consented. A skill that does not exist yet has no assignments.
+   */
+  skillDeploymentImpact(skillId: string | null): { assignmentCount: number; deploymentImpact: string } {
+    const rows = skillId ? this.stmt(`SELECT 'skill' AS kind, id, scope_kind, runner_id, agent_selector, enabled, updated_at
+        FROM skill_assignments WHERE skill_id=?
+      UNION ALL
+      SELECT 'group' AS kind, a.id, a.scope_kind, a.runner_id, a.agent_selector, a.enabled, a.updated_at
+        FROM skill_group_assignments a JOIN skills s ON s.group_id=a.group_id WHERE s.id=?
+      ORDER BY kind, id`).all(skillId, skillId) as Array<{
+        kind: string; id: string; scope_kind: string; runner_id: string | null; agent_selector: string; enabled: number; updated_at: number;
+      }> : [];
+    const targets = rows.map((row) =>
+      [row.kind, row.id, row.scope_kind, row.runner_id, row.agent_selector, Number(row.enabled), Number(row.updated_at)]);
+    return { assignmentCount: rows.length, deploymentImpact: createHash("sha256").update(JSON.stringify(targets)).digest("hex") };
+  }
+
   listSkills(): SkillView[] {
     const rows = this.stmt(
       "SELECT id, name, description, group_id, source, latest_version_id, created_at, updated_at FROM skills ORDER BY name",
