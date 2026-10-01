@@ -26,6 +26,7 @@ import {
   RunnerConnectionLimits,
   runnerAuthTimeoutMs,
 } from "./runner-channel.js";
+import { RunnerFrameQueue, runnerFrameBypassesInventory, setRunnerReceivePressure } from "./runner-frame-queue.js";
 import { installStartupReadinessGate } from "./startup-readiness.js";
 import { WorktreeCreateCoordinator } from "./worktree-create-coordinator.js";
 import { legacyPeerWorktreeRetirement } from "./worktree-retirement.js";
@@ -1096,10 +1097,29 @@ app.register(async (instance) => {
     terminate: () => socket.terminate(),
   };
 
-  socket.on("message", (raw: Buffer) => {
-    const msg = parseMessage<RunnerToControlPlane>(raw.toString());
-    if (!msg) return;
-
+  let runtimeAttentionBatch: ReturnType<SessionsService["beginRunnerAttentionBatch"]> | undefined;
+  let runtimeAttentionFrames = 0;
+  let runtimeAttentionStarted = 0;
+  let reconcilingInventory = false;
+  const deferNewCredentialBinding = (msg: Extract<RunnerToControlPlane,
+    { type: "agent_control_credential" | "policy_hook_credential" }>) => {
+    if (!reconcilingInventory || typeof msg.sessionId !== "string" ||
+        db.sessionReconciliationVersion(msg.sessionId) !== null) return false;
+    // An early ACK can prompt a valid binding before its first inventory row exists. Existing
+    // bindings bypass inventory immediately; new ones retain the old post-materialization order.
+    // Called only inside the guarded handler so a persistence error cannot escape the listener.
+    frameQueue.enqueue(msg, Buffer.byteLength(JSON.stringify(msg)));
+    return true;
+  };
+  const currentSocket = () => Boolean(runnerId && socket.readyState === 1 &&
+    hub.isCurrentRunnerSocket(runnerId, runnerClient) && credentialId &&
+    db.isRunnerCredentialActive(runnerId, credentialId));
+  const flushRuntimeAttention = async () => {
+    if (!runtimeAttentionBatch || !runnerId) return;
+    await svc.flushRunnerAttention(runnerId, currentSocket);
+    runtimeAttentionBatch = undefined;
+  };
+  const handleRunnerFrame = async (msg: RunnerToControlPlane) => {
     // A malformed frame (missing/mistyped fields survive the cast-only parseMessage) or a
     // transient persistence error must not escape this listener: an uncaught throw here becomes a
     // fatal uncaughtException that drops EVERY runner/session/dashboard connection. Isolate the
@@ -1118,6 +1138,14 @@ app.register(async (instance) => {
         socket.close(1008, "runner credential is no longer active");
         return;
       }
+    }
+
+    if (runtimeAttentionBatch && !runnerFrameBypassesInventory(msg.type) &&
+        (msg.type !== "session_runtime_updated" || runtimeAttentionFrames >= 1024 ||
+          performance.now() - runtimeAttentionStarted >= 1000)) {
+      await flushRuntimeAttention();
+      // The socket may have been replaced while its campaign publications yielded.
+      if (msg.type !== "register" && !currentSocket()) return;
     }
 
     switch (msg.type) {
@@ -1174,6 +1202,7 @@ app.register(async (instance) => {
             : undefined,
         );
         hub.clearRunnerQueues(runnerId); // a fresh connection has no in-flight queues — drop stale ones
+        if (Array.isArray(msg.sessionSnapshots)) frameQueue.reserveInventory(msg.sessionSnapshots.length);
         send(socket, {
           type: "registered",
           ok: true,
@@ -1213,7 +1242,15 @@ app.register(async (instance) => {
         // Phase 2: hydrate from the box's session snapshots (the source of truth) when present —
         // this subsumes reconcile and lets a dashboard see sessions it didn't create. Fall back to
         // reconcile for pre-Phase-2 runners.
-        if (msg.sessionSnapshots) svc.hydrateRunnerSessions(runnerId, msg.sessionSnapshots);
+        if (msg.sessionSnapshots) {
+          reconcilingInventory = true;
+          try {
+            const completed = await svc.hydrateRunnerSessionsCooperatively(runnerId, msg.sessionSnapshots, {
+              isCurrent: currentSocket,
+            });
+            if (!completed) return;
+          } finally { reconcilingInventory = false; }
+        }
         else svc.reconcileRunnerSessions(runnerId, msg.liveSessions ?? []);
         svc.reconcileArchivedCampaignWorktrees(runnerId);
         svc.recoverWorkflowRunner(runnerId);
@@ -1226,11 +1263,8 @@ app.register(async (instance) => {
         // Registration completes with the machine's authoritative desired skill set so a fresh
         // (or reconnected) runner converges without waiting for the next library mutation.
         pushSkillsSync(runnerId);
-        // Registration reconciliation is synchronous and can legitimately outlast a heartbeat
-        // interval on a runner with many live sessions. The runner starts heartbeats as soon as it
-        // receives `registered`, but those frames cannot be handled until this callback yields.
-        // Refresh liveness at that yield boundary so the sweep measures silence after registration,
-        // rather than charging the runner for time the control plane spent reconciling its state.
+        // Heartbeats bypass the bounded FIFO during cooperative registration. Refresh once more
+        // at completion; live frames following the inventory are applied afterward, in order.
         db.touch(runnerId, Date.now());
         app.log.info(
           `runner online: ${runnerId} (${msg.runner.hostname}, ${msg.runner.os}) ` +
@@ -1257,6 +1291,7 @@ app.register(async (instance) => {
         break;
       case "policy_hook_credential":
         {
+          if (deferNewCredentialBinding(msg)) break;
           const accepted = db.setPolicyHookCredential(msg.sessionId, runnerId!, msg.tokenHash, Date.now());
           send(socket, {
             type: "policy_hook_credential_registered",
@@ -1290,6 +1325,7 @@ app.register(async (instance) => {
         break;
       case "agent_control_credential":
         {
+          if (deferNewCredentialBinding(msg)) break;
           const accepted = db.setAgentControlCredential(msg.sessionId, runnerId!, msg.tokenHash, Date.now());
           send(socket, {
             type: "agent_control_credential_registered",
@@ -1306,7 +1342,13 @@ app.register(async (instance) => {
       case "session_runtime_updated":
         {
           const startedAt = performance.now();
-          svc.applySessionRuntimeUpdate(runnerId!, msg.snapshot);
+          if (!runtimeAttentionBatch) {
+            runtimeAttentionBatch = svc.beginRunnerAttentionBatch(runnerId!);
+            runtimeAttentionFrames = 0;
+            runtimeAttentionStarted = performance.now();
+          }
+          runtimeAttentionFrames++;
+          svc.applySessionRuntimeUpdate(runnerId!, msg.snapshot, runtimeAttentionBatch);
           const durationMs = performance.now() - startedAt;
           if (durationMs >= 250) {
             app.log.warn({
@@ -1654,9 +1696,29 @@ app.register(async (instance) => {
         /* socket already tearing down */
       }
     }
+  };
+
+  const frameQueue = new RunnerFrameQueue<RunnerToControlPlane>(handleRunnerFrame, () => {
+    app.log.warn({ event: "runner_frame_queue_closed", entryPoint: "runner_socket", runnerId },
+      "runner replay exceeded its bounded queue or failed");
+    socket.terminate();
+  }, undefined, flushRuntimeAttention, (paused) => {
+    if (!setRunnerReceivePressure(socket, paused)) return;
+    app.log.debug({ event: "runner_frame_backpressure", entryPoint: "runner_socket", runnerId, paused },
+      "runner receive flow control changed");
+  });
+  socket.on("message", (raw: Buffer) => {
+    const msg = parseMessage<RunnerToControlPlane>(raw.toString());
+    if (!msg) return;
+    // Validate both on arrival and at application time; neither unauthenticated nor replaced
+    // sockets can accumulate messages that later gain authority.
+    if (msg.type !== "register" && (!runnerId || !hub.isCurrentRunnerSocket(runnerId, runnerClient))) return;
+    if (runnerFrameBypassesInventory(msg.type)) void handleRunnerFrame(msg);
+    else frameQueue.enqueue(msg, raw.byteLength);
   });
 
   const onGone = () => {
+    frameQueue.close();
     if (authenticationTimer) {
       clearTimeout(authenticationTimer);
       authenticationTimer = undefined;
