@@ -16,7 +16,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
+const previousMask = process.umask(0o077);
+after(() => process.umask(previousMask));
 import { providerLaunchNeedsSharedHomeLease, ProviderHomeLeaseRegistry } from "./provider-home-lease.js";
 import type { SpawnIsolation } from "./spawn.js";
 
@@ -40,7 +42,7 @@ function leasePaths(home: string) {
 
 function writeLegacyLease(home: string, overrides: Record<string, unknown> = {}): string {
   const { lock } = leasePaths(home);
-  mkdirSync(lock, { recursive: true });
+  mkdirSync(lock, { recursive: true, mode: 0o700 });
   writeFileSync(join(lock, "lease.json"), `${JSON.stringify({
     version: 1,
     ownerHash: OWNER_A,
@@ -62,7 +64,7 @@ function journalRecords(home: string): Array<Record<string, unknown>> {
 
 function writePartialJournal(home: string, shape: "lease" | "next" | "disconnected") {
   const { lock } = leasePaths(home);
-  mkdirSync(lock, { recursive: true });
+  mkdirSync(lock, { recursive: true, mode: 0o700 });
   const genesis = {
     version: 2, state: "active", ownerHash: OWNER_A, leaseId: LEGACY_ID,
     previousLeaseId: null, previousRecordHash: null, pid: 101, hostname: "host-a",
@@ -318,7 +320,9 @@ test("a new process reclaims a killed initializer or active holder without files
     let stderr = "";
     child.stderr.on("data", (chunk) => { stderr += String(chunk); });
     const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
-    const deadline = Date.now() + 5_000;
+    // The first real Windows bootstrap includes compiling and execution-probing the fixed
+    // helper. Wait for the actual publication marker before killing; protocol limits stay fixed.
+    const deadline = Date.now() + 30_000;
     while (!existsSync(ready) && child.exitCode === null && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -526,7 +530,7 @@ test("a released genesis record is rejected as fabricated handoff state", (t) =>
   // A genesis is only ever published `active` (release appends a `next-*` record), so a lone
   // released genesis would skip every hostname/owner/liveness check if it were trusted.
   const { lock } = leasePaths(home);
-  mkdirSync(lock, { recursive: true });
+  mkdirSync(lock, { recursive: true, mode: 0o700 });
   writeFileSync(join(lock, `lease-${LEGACY_ID}.json`), `${JSON.stringify({
     version: 2,
     state: "released",
@@ -820,7 +824,7 @@ test("unexpected, orphaned, malformed, oversized, and symlinked lease state fail
     if (scenario === "lock-symlink") {
       const external = join(home, "external-lock");
       mkdirSync(external);
-      mkdirSync(root, { recursive: true });
+      mkdirSync(root, { recursive: true, mode: 0o700 });
       symlinkSync(external, lock, "dir");
     } else {
       writeLegacyLease(home);
@@ -847,17 +851,26 @@ test("unexpected, orphaned, malformed, oversized, and symlinked lease state fail
 test("a long journal remains valid and never empties across repeated orderly handoffs", (t) => {
   const home = mkdtempSync(join(tmpdir(), "wollipog-provider-home-long-chain-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  for (let pid = 100; pid < 164; pid++) {
-    const registry = new ProviderHomeLeaseRegistry(pid % 2 === 0 ? OWNER_A : OWNER_B, {
-      pid,
-      hostname: "host-a",
-      isProcessAlive: () => false,
-    });
-    registry.acquire(request(home));
-    registry.releaseAll();
+  for (let pass = 0; pass < 64; pass++) {
+    const registry = new ProviderHomeLeaseRegistry(pass % 2 === 0 ? OWNER_A : OWNER_B);
+    try { registry.acquire(request(home)); registry.releaseAll(); }
+    catch (error) {
+      // Fixture records contain no provider credentials. Keep physical retirement witnesses
+      // visible on actual-platform failures instead of losing them in the public remedy.
+      const { root, lock } = leasePaths(home);
+      t.diagnostic(`failed handoff ${pass}: ${String(error)}`);
+      for (const directory of [root, lock]) for (const name of readdirSync(directory)) {
+        if (name === "mutable-home.lock") continue;
+        const raw = readFileSync(join(directory, name), "utf8");
+        t.diagnostic(`${directory === root ? "root" : "lock"}/${name}: ${raw}`);
+      }
+      throw error;
+    }
     assert.ok(readdirSync(leasePaths(home).lock).length > 0);
+    assert.deepEqual(registry.getDiagnostics(), []);
   }
-  assert.equal(readdirSync(leasePaths(home).lock).length, 129);
+  assert.ok(readdirSync(leasePaths(home).lock).length <= 34);
+  assert.equal(JSON.parse(readFileSync(join(leasePaths(home).root, "mutable-home.recovery.json"), "utf8")).version, 4);
 });
 
 test("a predecessor modified after publication invalidates its hash-linked successor", (t) => {
@@ -872,7 +885,13 @@ test("a predecessor modified after publication invalidates its hash-linked succe
   const later = new ProviderHomeLeaseRegistry(OWNER_A, {
     pid: 303, hostname: "host-a", isProcessAlive: () => false,
   });
-  assert.throws(() => later.acquire(request(home)), /unexpected entries/);
+  assert.throws(() => later.acquire(request(home)), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /unexpected entries/);
+    assert.ok(error.message.includes(lock), "the remedy uses the stable HOME path");
+    assert.doesNotMatch(error.message, /\/proc\/self\/fd\//);
+    return true;
+  });
 });
 
 test("hard-linked record substitution is detected after the link target is modified", (t) => {
@@ -948,7 +967,7 @@ test("the whole effective HOME is shared across providers and relative HOME fail
 test("an incomplete provider-home lease fails closed with actionable recovery guidance", (t) => {
   const home = mkdtempSync(join(tmpdir(), "wollipog-provider-home-incomplete-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  mkdirSync(leasePaths(home).lock, { recursive: true });
+  mkdirSync(leasePaths(home).lock, { recursive: true, mode: 0o700 });
   const registry = new ProviderHomeLeaseRegistry(OWNER_A);
   assert.throws(() => registry.acquire(request(home)), /incomplete.*proving no provider process.*quarantine/);
 });

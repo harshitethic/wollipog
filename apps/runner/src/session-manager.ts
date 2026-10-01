@@ -1485,7 +1485,10 @@ export class SessionManager {
         if (other.sessionId !== meta.sessionId && isOrchestratorLaunch(other)) this.refreshGuardFor(other);
       }
     });
-    this.providerHomeLeases = runnerOwnerHash ? new ProviderHomeLeaseRegistry(runnerOwnerHash) : undefined;
+    this.providerHomeLeases = runnerOwnerHash ? new ProviderHomeLeaseRegistry(runnerOwnerHash, {
+      onDiagnostic: (diagnostic) => this.log(JSON.stringify(diagnostic)),
+      helperDataDir: dataDir ?? join(store.rootPath(), ".runner-data"),
+    }) : undefined;
     this.stateDir = dataDir ?? join(store.rootPath(), ".runner-data");
     this.cleanupJournal = new WorktreeCleanupJournal(this.stateDir);
     this.worktreeSetupTrust = new WorktreeSetupTrustStore(this.stateDir);
