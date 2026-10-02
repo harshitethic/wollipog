@@ -17,9 +17,14 @@ const owner = "a".repeat(64);
 const nativeModule = new URL("./provider-home-lease.ts", import.meta.url).href;
 const boundaries = ["before-guard", "guard-temp-written", "guard-file-durable", "guard-published", "guard-durable", "before-candidate", "candidate-written", "candidate-file-durable", "candidate-durable", "before-selection", "selection-published", "selection-durable", "before-retire", "after-retire", "retirement-durable"];
 
-function fixture(t: TestContext): string {
+function fixture(t: Pick<TestContext, "after">, reapers: Array<() => Promise<void>> = []): string {
   const home = fs.mkdtempSync(join(tmpdir(), "wollipog-canonical-checkpoint-"));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(async () => {
+    // Parent timeouts can start this hook before a child's async after-hook ends.
+    // Share its idempotent reaper rather than depending on hook nesting order.
+    await Promise.all(reapers.map(reap => reap()));
+    fs.rmSync(home, { recursive: true, force: true });
+  });
   return home;
 }
 function paths(home: string) {
@@ -123,9 +128,11 @@ function storage(home: string) {
   const entries = [root, lock].flatMap((directory) => fs.readdirSync(directory).filter((name) => name !== "mutable-home.lock").map((name) => join(directory, name)));
   return { records: entries.length, bytes: entries.reduce((n, path) => n + fs.statSync(path).size, 0) };
 }
-async function ready(child: ChildProcess, path: string, output: () => string) {
+async function ready(child: ChildProcess, path: string, output: () => string, signal?: AbortSignal) {
   const deadline = Date.now() + 15_000;
   while (!fs.existsSync(path)) {
+    signal?.throwIfAborted();
+    assert.equal(child.signalCode, null, output());
     assert.equal(child.exitCode, null, output());
     assert.ok(Date.now() < deadline, `barrier timeout: ${output()}`);
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -251,16 +258,119 @@ os.close(home_fd)`)], { env: { ...process.env, HOME: helperHome }, encoding: "ut
   }
 });
 
+// Keep the original aggregate budgets and give each named case a 45s budget
+// (normal cases measured 2-6s). Report the active phase on cancellation.
+function crashPhases(t: TestContext) {
+  let active: { name: string; started: number } | undefined;
+  const interrupted = () => {
+    // A completed/cancelled node:test context can discard late diagnostics.
+    // Emit at abort time so the stalled phase survives cancellation reporting.
+    if (active) console.error(`[lease-crash] ${t.name}: interrupted during ${active.name} after ${Math.round(performance.now() - active.started)}ms`);
+  };
+  t.signal.addEventListener("abort", interrupted, { once: true });
+  t.after(() => t.signal.removeEventListener("abort", interrupted));
+  return async <T>(name: string, run: () => T | Promise<T>): Promise<T> => {
+    t.signal.throwIfAborted();
+    active = { name, started: performance.now() };
+    try { return await run(); }
+    catch (cause) { throw new Error(`${t.name}: ${name} failed after ${Math.round(performance.now() - active.started)}ms`, { cause }); }
+    finally {
+      t.diagnostic(`${t.name}: ${name} ${Math.round(performance.now() - active.started)}ms`);
+      active = undefined;
+    }
+  };
+}
+
+function crashWriter(t: Pick<TestContext, "signal" | "after">, home: string, command: string, args: string[], reapers: Array<() => Promise<void>> = []) {
+  t.signal.throwIfAborted();
+  const child = spawn(command, args, { env: { ...process.env, HOME: home }, stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  const capture = (chunk: Buffer) => { output = (output + String(chunk)).slice(-8192); };
+  child.stdout.on("data", capture); child.stderr.on("data", capture);
+  child.on("error", error => capture(Buffer.from(String(error))));
+  const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
+  let reaping: Promise<void> | undefined;
+  const reap = () => reaping ??= (async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await closed;
+  })();
+  reapers.push(reap);
+  t.after(reap);
+  return { child, output: () => output };
+}
+
+function recoveredHandoffs(home: string, passes: number) {
+  const before = fs.readFileSync(paths(home).anchor);
+  // Repeated native passes account for most fixture time. Exercise the same
+  // number of real handoffs in one Python process, then read/release natively.
+  // The separate long-run matrix still covers 64 native/helper/mixed passes.
+  const result = spawnSync("python3", ["-c", program(`
+home_fd, _ = open_root(os.environ["HOME"])
+try:
+    for _ in range(${passes - 1}):
+        lease = acquire_lease(home_fd, "${owner}")
+        release_lease(lease)
+        assert not diagnostics, diagnostics
+finally: os.close(home_fd)
+print(${passes - 1})`)], { env: { ...process.env, HOME: home }, encoding: "utf8", timeout: 30_000 });
+  assert.equal(result.status, 0, String(result.stderr));
+  assert.equal(String(result.stdout).trim(), String(passes - 1), "every subsequent helper handoff completed");
+  assert.equal(nativePass(home).getDiagnostics().length, 0, "native reader accepts the recovered and compacted journal");
+  assert.notDeepEqual(fs.readFileSync(paths(home).anchor), before, "subsequent handoffs complete another checkpoint");
+}
+
+test("crash fixture refuses a writer after cancellation between phases", { skip: process.platform !== "linux" }, (t) => {
+  const reapers: Array<() => Promise<void>> = [];
+  const home = fixture(t, reapers);
+  const cancelled = new AbortController();
+  const reason = new Error("fixture cancelled between writers");
+  cancelled.abort(reason);
+  // Model the same late call after an awaited kill phase. Keep real teardown
+  // registered on the parent so a reverted spawn guard cannot leak the probe.
+  const context = { signal: cancelled.signal, after: t.after.bind(t) };
+  assert.throws(() => crashWriter(context, home, process.execPath,
+    ["-e", "setInterval(() => {}, 1000)"], reapers), error => error === reason);
+});
+
+test("crash fixture teardown reaps an unfinished writer before returning", { skip: process.platform !== "linux" }, async (t) => {
+  const reapers: Array<() => Promise<void>> = [];
+  const home = fixture(t, reapers);
+  let writer: ChildProcess | undefined;
+  await t.test("unfinished synthetic writer", (t) => {
+    writer = crashWriter(t, home, "python3", ["-c", "import time; time.sleep(60)"], reapers).child;
+  });
+  assert.equal(writer!.signalCode, "SIGKILL");
+});
+
+test("crash fixture parent awaits writer close before removing HOME", { skip: process.platform !== "linux" }, async (t) => {
+  const reapers: Array<() => Promise<void>> = [];
+  const parentHooks: Array<() => Promise<void>> = [];
+  // Run the real fixture's parent hook first, as node:test does on a parent timeout.
+  const parent = { after: (hook: () => Promise<void>) => { parentHooks.push(hook); } };
+  const home = fixture(parent, reapers);
+  t.after(() => parentHooks[0]!());
+  const { child } = crashWriter(t, home, "python3", ["-c", "import time; time.sleep(60)"], reapers);
+  let homeExistedAtClose = false;
+  child.once("close", () => { homeExistedAtClose = fs.existsSync(home); });
+  await parentHooks[0]!();
+  assert.equal(child.signalCode, "SIGKILL", "parent cleanup reaps its writer");
+  assert.equal(homeExistedAtClose, true, "HOME exists until the writer has closed");
+  assert.equal(fs.existsSync(home), false);
+});
+
 test("SIGKILL at every native/helper checkpoint boundary recovers across readers", { timeout: 180_000, skip: process.platform !== "linux" }, async (t) => {
   for (const writer of ["native", "helper"] as const) for (const boundary of boundaries) {
-    const home = fixture(t);
-    seed(home);
-    const marker = join(home, "ready");
-    let output = "";
-    const hold = `if (stage === ${JSON.stringify(boundary)}) { writeFileSync(${JSON.stringify(marker)}, "ready"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0); }`;
-    const script = join(home, "writer.mts");
-    fs.writeFileSync(script, `import { ProviderHomeLeaseRegistry } from ${JSON.stringify(nativeModule)};\nimport { writeFileSync } from "node:fs";\nconst registry = new ProviderHomeLeaseRegistry(${JSON.stringify(owner)}, { nativeCheckpointBarrierForTest: { boundary: ${JSON.stringify(boundary)}, marker: ${JSON.stringify(marker)} } });\nregistry.acquireHome(${JSON.stringify(home)});\nregistry.releaseAll();`);
-    const helper = program(`
+    // Parent teardown removes HOME only after the child's async teardown reaps its writer.
+    if (t.signal.aborted) return;
+    const reapers: Array<() => Promise<void>> = [];
+    const home = fixture(t, reapers);
+    await t.test(`${writer}/${boundary}`, { timeout: 45_000 }, async (t) => {
+      const phase = crashPhases(t);
+      await phase("seed", () => seed(home));
+      const marker = join(home, "ready");
+      const script = join(home, "writer.mts");
+      fs.writeFileSync(script, `import { ProviderHomeLeaseRegistry } from ${JSON.stringify(nativeModule)};\nimport { writeFileSync } from "node:fs";\nconst registry = new ProviderHomeLeaseRegistry(${JSON.stringify(owner)}, { nativeCheckpointBarrierForTest: { boundary: ${JSON.stringify(boundary)}, marker: ${JSON.stringify(marker)} } });\nregistry.acquireHome(${JSON.stringify(home)});\nregistry.releaseAll();`);
+      const helper = program(`
 def checkpoint_boundary(stage):
     if stage == ${JSON.stringify(boundary)}:
         with open(${JSON.stringify(marker)}, "w") as stream: stream.write("ready")
@@ -269,56 +379,67 @@ home_fd, _ = open_root(os.environ["HOME"])
 lease = acquire_lease(home_fd, "${owner}")
 release_lease(lease)
 os.close(home_fd)`);
-    const child = writer === "native" ? spawn(process.execPath, ["--import", "tsx", script]) :
-      spawn("python3", ["-c", helper], { env: { ...process.env, HOME: home } });
-    child.stdout?.on("data", (chunk) => { output += chunk; });
-    child.stderr?.on("data", (chunk) => { output += chunk; });
-    t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
-    await ready(child, marker, () => output);
-    const before = evidence(home);
-    // While alive, the same owner and the other reader refuse; no implicit cleanup runs.
-    assert.throws(() => new ProviderHomeLeaseRegistry(owner).acquireHome(home), /already in use/);
-    assert.notEqual(helperPass(home).status, 0);
-    assert.deepEqual(evidence(home), before);
-    await kill(child);
-    if (writer === "native") {
-      const recovered = helperPass(home);
-      assert.equal(recovered.status, 0, `${writer}/${boundary}: ${String(recovered.stderr)}`);
-    } else nativePass(home);
-    for (let i = 0; i < 10; i++) nativePass(home);
-    assert.ok(storage(home).records <= 36, `${writer}/${boundary} did not return to bounded storage`);
-    assert.equal(fs.readdirSync(paths(home).root).filter((name) => name.includes("checkpoint.pending")).length, 0);
+      const { child, output } = crashWriter(t, home, writer === "native" ? process.execPath : "python3",
+        writer === "native" ? ["--import", "tsx", script] : ["-c", helper], reapers);
+      await phase("writer barrier", () => ready(child, marker, output, t.signal));
+      await phase("live-owner refusal and evidence preservation", () => {
+        const before = evidence(home);
+        // While alive, the same owner and the other reader refuse; no implicit cleanup runs.
+        assert.throws(() => new ProviderHomeLeaseRegistry(owner).acquireHome(home), /already in use/);
+        assert.notEqual(helperPass(home).status, 0);
+        assert.deepEqual(evidence(home), before);
+      });
+      await phase("kill writer", () => kill(child));
+      await phase("cross-reader recovery", () => {
+        if (writer === "native") {
+          const recovered = helperPass(home);
+          assert.equal(recovered.status, 0, `${writer}/${boundary}: ${String(recovered.stderr)}`);
+        } else nativePass(home);
+      });
+      await phase("10 subsequent handoffs", () => recoveredHandoffs(home, 10));
+      await phase("bounded storage and staging cleanup", () => {
+        assert.ok(storage(home).records <= 36, `${writer}/${boundary} did not return to bounded storage`);
+        assert.equal(fs.readdirSync(paths(home).root).filter((name) => name.includes("checkpoint.pending")).length, 0);
+      });
+    });
   }
 });
 
 test("repeated killed candidate publishers recover without exhausting bounded staging", { timeout: 120_000, skip: process.platform !== "linux" }, async (t) => {
   for (const sequence of [["native", "native"], ["helper", "helper"], ["native", "helper"], ["helper", "native"]]) {
-    const home = fixture(t);
-    seed(home);
-    for (const writer of sequence) {
-      const marker = join(home, "ready");
-      fs.rmSync(marker, { force: true });
-      let output = "";
-      const script = join(home, "writer.mts");
-      fs.writeFileSync(script, `import { ProviderHomeLeaseRegistry } from ${JSON.stringify(nativeModule)};\nimport { writeFileSync } from "node:fs";\nnew ProviderHomeLeaseRegistry(${JSON.stringify(owner)}, { nativeCheckpointBarrierForTest: { boundary: "candidate-durable", marker: ${JSON.stringify(marker)} } }).acquireHome(${JSON.stringify(home)});`);
-      const helper = program(`
+    if (t.signal.aborted) return;
+    const reapers: Array<() => Promise<void>> = [];
+    const home = fixture(t, reapers);
+    await t.test(sequence.join("/"), { timeout: 45_000 }, async (t) => {
+      const phase = crashPhases(t);
+      await phase("seed", () => seed(home));
+      for (const [index, writer] of sequence.entries()) {
+        t.signal.throwIfAborted();
+        const marker = join(home, "ready");
+        fs.rmSync(marker, { force: true });
+        const script = join(home, "writer.mts");
+        fs.writeFileSync(script, `import { ProviderHomeLeaseRegistry } from ${JSON.stringify(nativeModule)};\nimport { writeFileSync } from "node:fs";\nnew ProviderHomeLeaseRegistry(${JSON.stringify(owner)}, { nativeCheckpointBarrierForTest: { boundary: "candidate-durable", marker: ${JSON.stringify(marker)} } }).acquireHome(${JSON.stringify(home)});`);
+        const helper = program(`
 def checkpoint_boundary(stage):
     if stage == "candidate-durable":
         with open(${JSON.stringify(marker)}, "w") as stream: stream.write("ready")
         while True: time.sleep(1)
 home_fd, _ = open_root(os.environ["HOME"])
 acquire_lease(home_fd, "${owner}")`);
-      const child = writer === "native" ? spawn(process.execPath, ["--import", "tsx", script]) : spawn("python3", ["-c", helper], { env: { ...process.env, HOME: home } });
-      child.stdout?.on("data", (chunk) => { output += chunk; });
-      child.stderr?.on("data", (chunk) => { output += chunk; });
-      t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
-      await ready(child, marker, () => output);
-      await kill(child);
-    }
-    assert.equal(nativePass(home).getDiagnostics().length, 0, `${sequence.join("/")} must recover completed candidates`);
-    for (let i = 0; i < 64; i++) nativePass(home);
-    assert.ok(storage(home).records <= 36);
-    assert.equal(fs.readdirSync(paths(home).root).filter((name) => name.includes("checkpoint.pending")).length, 0);
+        const { child, output } = crashWriter(t, home, writer === "native" ? process.execPath : "python3",
+          writer === "native" ? ["--import", "tsx", script] : ["-c", helper], reapers);
+        await phase(`writer ${index + 1} (${writer}) candidate-durable barrier`, () => ready(child, marker, output, t.signal));
+        await phase(`kill writer ${index + 1} (${writer})`, () => kill(child));
+      }
+      await phase("native recovery", () => {
+        assert.equal(nativePass(home).getDiagnostics().length, 0, `${sequence.join("/")} must recover completed candidates`);
+      });
+      await phase("64 subsequent handoffs", () => recoveredHandoffs(home, 64));
+      await phase("bounded storage and staging cleanup", () => {
+        assert.ok(storage(home).records <= 36);
+        assert.equal(fs.readdirSync(paths(home).root).filter((name) => name.includes("checkpoint.pending")).length, 0);
+      });
+    });
   }
 });
 
