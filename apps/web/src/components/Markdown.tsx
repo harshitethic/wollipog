@@ -4,6 +4,7 @@ import React, {
   memo,
   useContext,
   useEffect,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
@@ -25,7 +26,7 @@ import {
   type HighlightNode,
 } from "../markdown-highlight.js";
 import { CopyButton } from "./common.js";
-import { CheckIcon, WrapLinesIcon } from "./Icons.js";
+import { CheckIcon, ImageIcon, ImageOffIcon, WrapLinesIcon } from "./Icons.js";
 
 type MarkdownComponents = NonNullable<ComponentProps<typeof ReactMarkdown>["components"]>;
 type RemarkPlugins = NonNullable<ComponentProps<typeof ReactMarkdown>["remarkPlugins"]>;
@@ -80,6 +81,14 @@ interface MarkdownRenderContext {
   highlight: boolean;
   highlighter: CodeHighlighter | null;
 }
+
+/**
+ * Where media renders. In phrasing content (a heading or emphasis) a `<figure>` is not allowed, so
+ * media keeps the same layout built from spans with `role="figure"`. Inside a link it also drops
+ * its own Open action, because an anchor cannot hold another; the surrounding link is the action.
+ */
+type MediaHost = "flow" | "phrasing" | "link";
+const MediaHostContext = createContext<MediaHost>("flow");
 
 const MarkdownContext = createContext<MarkdownRenderContext>({
   inlineMedia: false,
@@ -292,37 +301,93 @@ export function transcriptMediaLabel(
   return kind === "image" ? "Image" : "Video";
 }
 
-function TranscriptMediaEmbed({ href, kind, label, imageAlt }: {
+const SIGNED_URL_DATE = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/;
+
+/** When a signed URL stops working, read from its own query string; null when it names no expiry. */
+export function transcriptMediaExpiry(href: string): number | null {
+  let params: URLSearchParams;
+  try {
+    params = new URL(href).searchParams;
+  } catch {
+    return null;
+  }
+  // S3 and GCS V4: a signing time plus a lifetime in seconds.
+  for (const prefix of ["X-Amz", "X-Goog"]) {
+    const date = SIGNED_URL_DATE.exec(params.get(`${prefix}-Date`) ?? "");
+    const lifetime = Number(params.get(`${prefix}-Expires`) ?? Number.NaN);
+    if (date && Number.isFinite(lifetime)) {
+      const [year, month, day, hour, minute, second] = date.slice(1).map(Number) as [number, number, number, number, number, number];
+      return Date.UTC(year, month - 1, day, hour, minute, second) + lifetime * 1000;
+    }
+  }
+  // S3 V2 and CloudFront: epoch seconds. Azure SAS: an ISO 8601 end time.
+  const epoch = params.get("Expires");
+  if (epoch && /^\d+$/.test(epoch)) return Number(epoch) * 1000;
+  const sasEnd = Date.parse(params.get("se") ?? "");
+  return Number.isFinite(sasEnd) ? sasEnd : null;
+}
+
+/** A video's length as `m:ss` or `h:mm:ss`; null while unknown (a live or unindexed stream). */
+export function formatTranscriptMediaDuration(seconds: number): string | null {
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  const whole = Math.round(seconds);
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const rest = String(whole % 60).padStart(2, "0");
+  return hours > 0 ? `${hours}:${String(minutes).padStart(2, "0")}:${rest}` : `${minutes}:${rest}`;
+}
+
+type TranscriptMediaState =
+  | { phase: "pending" }
+  | { phase: "loaded"; meta: string | null }
+  | { phase: "failed" };
+
+/**
+ * A captioned figure for transcript media (docs/design-system.md §2.3, §11.3, §18): the image or
+ * video, then its name, its size or length once known, and Open Full Size. The signed URL is only
+ * ever the href and the source, never visible text. Until the row settles no media mounts and the
+ * caption offers Open Link; a failed fetch collapses the figure to that caption with its reason.
+ */
+function TranscriptMediaFigure({ href, kind, label, settled, imageAlt }: {
   href: string;
   kind: TranscriptMediaKind;
   label: string;
+  settled: boolean;
   imageAlt?: string;
 }) {
-  const [loadState, setLoadState] = useState<"pending" | "loaded" | "failed">("pending");
-  if (loadState === "failed") return null;
+  const [state, setState] = useState<TranscriptMediaState>({ phase: "pending" });
+  const nameId = useId();
+  const failed = state.phase === "failed";
+  const meta = state.phase === "loaded" ? state.meta : null;
+  const expiry = failed ? transcriptMediaExpiry(href) : null;
+  const reason = expiry !== null && expiry <= Date.now() ? "Link expired" : `Couldn't load this ${kind}`;
+  const showMedia = settled && !failed;
+  const host = useContext(MediaHostContext);
+  const phrasing = host !== "flow";
+  const Figure = phrasing ? "span" : "figure";
+  const Caption = phrasing ? "span" : "figcaption";
 
   return (
-    <span className="md-media-embed">
-      {kind === "image" ? (
-        <a
-          className="md-media-image-link"
-          href={loadState === "loaded" ? href : undefined}
-          target={loadState === "loaded" ? "_blank" : undefined}
-          rel={loadState === "loaded" ? "noopener noreferrer" : undefined}
-          aria-label={loadState === "loaded" ? `Open ${label} Full Size` : undefined}
-          aria-hidden={loadState === "loaded" ? undefined : true}
-        >
-          <img
-            className="md-media-image"
-            src={href}
-            alt={imageAlt ?? label}
-            loading="lazy"
-            decoding="async"
-            data-load-state={loadState}
-            onLoad={() => setLoadState("loaded")}
-            onError={() => setLoadState("failed")}
-          />
-        </a>
+    <Figure
+      className="md-media"
+      data-media-state={settled ? state.phase : "unsettled"}
+      role={phrasing ? "figure" : undefined}
+      aria-labelledby={phrasing ? nameId : undefined}
+    >
+      {showMedia && (kind === "image" ? (
+        <img
+          className="md-media-image"
+          src={href}
+          alt={imageAlt ?? label}
+          loading="lazy"
+          decoding="async"
+          data-load-state={state.phase}
+          onLoad={(event) => {
+            const { naturalWidth, naturalHeight } = event.currentTarget;
+            setState({ phase: "loaded", meta: naturalWidth && naturalHeight ? `${naturalWidth} × ${naturalHeight}` : null });
+          }}
+          onError={() => setState({ phase: "failed" })}
+        />
       ) : (
         <video
           className="md-media-video"
@@ -331,11 +396,32 @@ function TranscriptMediaEmbed({ href, kind, label, imageAlt }: {
           controls
           playsInline
           preload="metadata"
-          onLoadedMetadata={() => setLoadState("loaded")}
-          onError={() => setLoadState("failed")}
+          onLoadedMetadata={(event) => setState({
+            phase: "loaded",
+            meta: formatTranscriptMediaDuration(event.currentTarget.duration),
+          })}
+          // An unindexed recording reports an unknown length at first and learns it later.
+          onDurationChange={(event) => {
+            const meta = formatTranscriptMediaDuration(event.currentTarget.duration);
+            setState((current) => current.phase === "loaded" ? { phase: "loaded", meta } : current);
+          }}
+          onError={() => setState({ phase: "failed" })}
         />
-      )}
-    </span>
+      ))}
+      <Caption className="md-media-cap">
+        <span className="md-media-title">
+          {failed && <ImageOffIcon size={14} />}
+          <span className="md-media-name" id={nameId}>{label}</span>
+        </span>
+        {meta && <span className="md-media-meta">{meta}</span>}
+        {failed && <span className="md-media-meta">{reason}</span>}
+        {host !== "link" && (
+          <a className="link" href={href} target="_blank" rel="noopener noreferrer" aria-describedby={nameId}>
+            {showMedia ? "Open Full Size" : "Open Link"}
+          </a>
+        )}
+      </Caption>
+    </Figure>
   );
 }
 
@@ -368,6 +454,15 @@ function isGeneratedUrlLabel(label: string, href: string): boolean {
   }
 }
 
+/** A link's text as its author wrote it, reading a linked image's alt text as that image's words. */
+function linkAuthorText(node: ReactNode): string {
+  if (Array.isArray(node)) return node.map(linkAuthorText).join("");
+  if (isValidElement<{ alt?: unknown; children?: ReactNode }>(node)) {
+    return typeof node.props.alt === "string" ? node.props.alt : linkAuthorText(node.props.children);
+  }
+  return reactNodeText(node);
+}
+
 function MarkdownLink({ href, children, inlineMedia, mediaSettled, compactUrls }: ComponentProps<"a"> & {
   inlineMedia: boolean;
   mediaSettled: boolean;
@@ -375,19 +470,24 @@ function MarkdownLink({ href, children, inlineMedia, mediaSettled, compactUrls }
 }) {
   const kind = inlineMedia ? transcriptMediaKind(href) : null;
   const childText = reactNodeText(children).trim();
-  const label = kind && href ? transcriptMediaLabel(href, kind, childText) : childText || href || "media";
+  if (kind && href) {
+    return (
+      <TranscriptMediaFigure
+        key={href}
+        href={href}
+        kind={kind}
+        label={transcriptMediaLabel(href, kind, linkAuthorText(children))}
+        settled={mediaSettled}
+      />
+    );
+  }
   const visibleChildren = compactUrls && href && isGeneratedUrlLabel(childText, href)
     ? compactMarkdownUrlLabel(href)
     : children;
   return (
-    <>
-      <a href={href} target="_blank" rel="noopener noreferrer">
-        {visibleChildren}
-      </a>
-      {kind && href && mediaSettled && (
-        <TranscriptMediaEmbed key={href} href={href} kind={kind} label={label} />
-      )}
-    </>
+    <a href={href} target="_blank" rel="noopener noreferrer">
+      <MediaHostContext.Provider value="link">{visibleChildren}</MediaHostContext.Provider>
+    </a>
   );
 }
 
@@ -404,21 +504,96 @@ function MarkdownImage({ src, alt }: ComponentProps<"img">) {
   const { inlineMedia, mediaSettled } = useContext(MarkdownContext);
   const href = typeof src === "string" ? src : undefined;
   const kind = inlineMedia ? transcriptMediaKind(href) : null;
-  const label = kind && href ? transcriptMediaLabel(href, kind, alt) : alt || href || "image";
-  if (kind === "image" && href && mediaSettled) {
+  if (kind === "image" && href) {
     return (
-      <>
-        <a className="md-img-link" href={href} target="_blank" rel="noopener noreferrer">🖼 {label}</a>
-        <TranscriptMediaEmbed key={href} href={href} kind="image" label={label} imageAlt={alt} />
-      </>
+      <TranscriptMediaFigure
+        key={href}
+        href={href}
+        kind="image"
+        label={transcriptMediaLabel(href, kind, alt)}
+        settled={mediaSettled}
+        imageAlt={alt}
+      />
     );
   }
+  const label = kind && href ? transcriptMediaLabel(href, kind, alt) : alt || href || "image";
   return (
-    <a className="md-img-link" href={href} target="_blank" rel="noopener noreferrer">🖼 {label}</a>
+    <a className="md-img-link" href={href} target="_blank" rel="noopener noreferrer">
+      <ImageIcon size={14} />
+      {label}
+    </a>
   );
 }
 
+/** Whether a rendered paragraph child becomes a media figure rather than phrasing content. */
+function isMediaChild(child: ReactNode, inlineMedia: boolean): boolean {
+  if (!inlineMedia || !isValidElement<{ href?: unknown; src?: unknown }>(child)) return false;
+  const { href, src } = child.props;
+  if (child.type === MarkdownAnchor) return transcriptMediaKind(typeof href === "string" ? href : undefined) !== null;
+  if (child.type === MarkdownImage) return transcriptMediaKind(typeof src === "string" ? src : undefined) === "image";
+  return false;
+}
+
+/** Line breaks and blank text at a run's edge would only pad the paragraph around a figure. */
+function isEdgeSpace(child: ReactNode): boolean {
+  if (typeof child === "string") return child.trim() === "";
+  return isValidElement(child) && child.type === "br";
+}
+
+/**
+ * A figure is flow content and cannot sit inside a `<p>`. A paragraph holding transcript media
+ * splits into its text runs, each still a paragraph, and the figures between them, in order.
+ */
+function MarkdownParagraph({ children, node: _node, ...props }: ComponentProps<"p"> & { node?: unknown }) {
+  const { inlineMedia } = useContext(MarkdownContext);
+  const items = React.Children.toArray(children);
+  if (!items.some((child) => isMediaChild(child, inlineMedia))) return <p {...props}>{children}</p>;
+
+  const blocks: ReactNode[] = [];
+  let run: ReactNode[] = [];
+  const flush = () => {
+    let first = 0;
+    let last = run.length;
+    while (first < last && isEdgeSpace(run[first])) first += 1;
+    while (last > first && isEdgeSpace(run[last - 1])) last -= 1;
+    if (last > first) blocks.push(<p key={`text-${blocks.length}`} {...props}>{run.slice(first, last)}</p>);
+    run = [];
+  };
+  for (const child of items) {
+    if (isMediaChild(child, inlineMedia)) {
+      flush();
+      blocks.push(child);
+    } else {
+      run.push(child);
+    }
+  }
+  flush();
+  return <>{blocks}</>;
+}
+
+type PhrasingTag = "em" | "strong" | "del" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6";
+
+/** An element whose content model is phrasing, so media inside it cannot be a `<figure>`. */
+function phrasingElement(Tag: PhrasingTag) {
+  return function PhrasingElement({ node: _node, children, ...props }: Omit<ComponentProps<"em">, "ref"> & { node?: unknown }) {
+    const host = useContext(MediaHostContext);
+    // Emphasis inside a link stays inside that link.
+    const inner = host === "link" ? host : "phrasing";
+    return <Tag {...props}><MediaHostContext.Provider value={inner}>{children}</MediaHostContext.Provider></Tag>;
+  };
+}
+
 const MARKDOWN_COMPONENTS: MarkdownComponents = {
+  p: MarkdownParagraph,
+  em: phrasingElement("em"),
+  strong: phrasingElement("strong"),
+  del: phrasingElement("del"),
+  h1: phrasingElement("h1"),
+  h2: phrasingElement("h2"),
+  h3: phrasingElement("h3"),
+  h4: phrasingElement("h4"),
+  h5: phrasingElement("h5"),
+  h6: phrasingElement("h6"),
   pre: CodeBlockPre,
   code: MarkdownCode,
   table: MarkdownTable,
@@ -470,7 +645,7 @@ export type MarkdownProfile = "document" | "inline";
  *
  * Security: transcript content is semi-untrusted. Callers must explicitly opt into inline media;
  * even then only HTTPS URLs with known image/video path extensions become `<img>`/`<video>` fetches.
- * Raw HTML stays disabled and all media retains a plain external link as its failure fallback.
+ * Raw HTML stays disabled, and every media figure keeps a plain external link in its caption.
  *
  * Memoized on `children`: agent bubbles re-render on every streaming chunk, and re-parsing a long
  * message each tick is wasteful — the same text string skips the markdown pipeline.
