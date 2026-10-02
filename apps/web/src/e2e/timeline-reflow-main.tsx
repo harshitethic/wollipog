@@ -9,6 +9,7 @@ import {
   type VirtualScrollAnchor,
 } from "../components/MeasuredVirtualList.js";
 import { useFollowTail } from "../useFollowTail.js";
+import { TranscriptTailControl, transcriptTailView } from "../components/TranscriptTailControl.js";
 import "../styles.css";
 
 const sentence = "A long transcript message must wrap naturally when the side panel narrows the reader, without colliding with the next message or its timestamp. ";
@@ -297,6 +298,7 @@ function Fixture() {
     contentRevision: `${sessionId}:${currentHistoryPrepend}:${currentHistoryReplacement}:${currentHistoryLimit ?? "all"}:${headStreamTicks}:${tailStreamTicks}:${liveReplyTicks}`,
     sessionId,
     persistenceScope: "timeline-reflow-e2e",
+    rows: items,
   });
   const resizeTailAfterAnchorWindow = useCallback(() => {
     let frames = 12;
@@ -405,6 +407,22 @@ function Fixture() {
             />
           </VirtualMeasurementCommitTestProvider>
         </div>
+        {/* The real floating control (#2153), so painted-frame tests cover it coming and going. */}
+        {followTailEnabled && (
+          <TranscriptTailControl
+            view={transcriptTailView({
+              hasTail: items.length > 0,
+              offscreenNotSent: 0,
+              recovering: false,
+              following: followTail.isFollowing,
+              newRows: followTail.newRowCount,
+            })}
+            shortcut="End"
+            onJump={followTail.follow}
+            onShowNotSent={() => {}}
+            onFocusLost={() => scrollRef.current?.focus({ preventScroll: true })}
+          />
+        )}
         {/* Stands in for the auto-growing composer: a sibling below the reader in the same flex
             column, so its height changes resize the transcript viewport exactly like a draft
             wrapping onto more lines (and shrinking back) does in SessionDetail. */}
@@ -489,7 +507,7 @@ function Fixture() {
         <button type="button" data-testid="shrink-composer" onClick={() => setComposerHeight(0)}>Shrink Composer</button>
         {followTailEnabled && <button type="button" data-testid="pause-follow" onClick={followTail.pause}>Pause</button>}
         {followTailEnabled && <button type="button" data-testid="preview-follow" onClick={followTail.preview}>Preview</button>}
-        {followTailEnabled && <button type="button" data-testid="resume-follow" onClick={followTail.follow}>Follow Live Output</button>}
+        {followTailEnabled && <button type="button" data-testid="resume-follow" onClick={followTail.follow}>Jump to Latest</button>}
         <button type="button" data-testid="remount" onClick={() => setHistoryEpoch((epoch) => epoch + 1)}>Remount</button>
       </nav>
       <output data-testid="reveal-outcome" hidden>{revealOutcome}</output>
