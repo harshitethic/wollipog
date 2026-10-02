@@ -179,7 +179,9 @@ export interface ReconcileSkillsOptions {
   /** Acquire the runner's shared provider-HOME lease after store materialization and before any
    * canonical or harness link mutation. The registry intentionally retains the lease until
    * runner shutdown, matching provider-launch ownership semantics. */
-  acquireProviderHomeLease?: () => void;
+  acquireProviderHomeLease?: () => void | Promise<void>;
+  /** Repeat authoritative desired-state/account checks after an asynchronous ownership wait. */
+  isCurrent?: () => boolean;
   /** Runner-local store retention. Production supplies validated config; defaults preserve a
    * useful re-enable window and a shorter version-switch grace period. */
   removedSkillRetentionMs?: number;
@@ -1603,8 +1605,12 @@ export async function reconcileSkills(options: ReconcileSkillsOptions): Promise<
         !targetsForPass(entry).every((target) => wslAgentIds.has(target.agentId)));
   if (leaseNeeded && options.acquireProviderHomeLease) {
     try {
-      options.acquireProviderHomeLease();
+      await options.acquireProviderHomeLease();
     } catch (error) {
+      if (options.isCurrent && !options.isCurrent()) {
+        return scopedResult({ deployed: [], unmanaged: [], removedLinks: [],
+          error: "Skill synchronization was superseded while waiting for provider-home ownership." }, options.providerAccountId);
+      }
       const detail = `Provider-home lease unavailable: ${errText(error)}`;
       const scanDetail =
         "Unmanaged symlink inventory is limited to entry names because targets were not followed.";
@@ -1671,6 +1677,10 @@ export async function reconcileSkills(options: ReconcileSkillsOptions): Promise<
         ...(scan && drift ? { movableCopies: movableCopies(scan, drift.report) } : {}),
       }, options.providerAccountId);
     }
+  }
+  if (options.isCurrent && !options.isCurrent()) {
+    return scopedResult({ deployed: [], unmanaged: [], removedLinks: [],
+      error: "Skill synchronization was superseded while waiting for provider-home ownership." }, options.providerAccountId);
   }
   const canonicalDir = canonicalSkillsDir(home);
   const manifestPath = linkManifestPath(dataDir);
