@@ -80,6 +80,9 @@ export type TimelineItem =
       deliveryIntent?: "steer";
       /** The turn's provider-reported usage, stamped when its parentless token_usage lands. */
       turnUsage?: TurnUsage;
+      /** Runner-recorded time of the turn's latest usage report; a terminal report can land after
+       * the last visible row, and only the first report stamps `durationMs`. */
+      lastUsageAt?: number;
       commandInvocation?: {
         invocationId: string;
         submissionId: string;
@@ -197,9 +200,22 @@ export type TimelineItem =
   /** A content-safe policy-hook outcome. Current histories use the runner event sequence as `id`;
    * legacy histories synthesize a negative id from the audit and anchor it chronologically. */
   | { kind: "governance_decision"; id: number; decision: GovernanceDecision }
-  | { kind: "checkpoint"; id: number; turn: number }
+  | {
+      kind: "checkpoint";
+      id: number;
+      turn: number;
+      /** For an automatic continuation the runner started without a prompt: the runner-recorded
+       * time of its latest usage report, which would otherwise land on the earlier prompt. */
+      lastUsageAt?: number;
+    }
   | { kind: "checkpoint_restored"; id: number; turn: number }
-  | { kind: "conversation_checkpoint"; id: number; turn: number }
+  | {
+      kind: "conversation_checkpoint";
+      id: number;
+      turn: number;
+      /** An automatic continuation's latest usage-report time, when it has no file checkpoint. */
+      lastUsageAt?: number;
+    }
   | { kind: "conversation_forked"; id: number; sourceSessionId: string; turn: number; handoff?: { sourceAgent: string; destinationAgent: string; disclosure: string } }
   | { kind: "provider_account_switched"; id: number; providerAccountId: string; providerAccountLabel: string; automatic?: boolean };
 
@@ -354,6 +370,21 @@ function nativePolicyHookDecision(ev: SessionEvent): GovernanceDecision | null {
     ...(payload.governancePolicyId ? { policyId: payload.governancePolicyId } : {}),
     timestamp: ev.ts,
   };
+}
+
+const TURN_NEUTRAL_KINDS = new Set<TimelineItem["kind"]>([
+  "user_message",
+  "conversation_checkpoint",
+  "checkpoint_restored",
+  "conversation_forked",
+  "provider_account_switched",
+]);
+
+/** Top-level activity that, after a completed turn, means the runner began another without a
+ * prompt (resumed background work). Prompts, conversation checkpoints, history dividers and nested
+ * subagent output (which belongs to its parent tool's turn) never do. */
+export function isTurnActivity(item: TimelineItem): boolean {
+  return !TURN_NEUTRAL_KINDS.has(item.kind) && !("parentToolUseId" in item && item.parentToolUseId);
 }
 
 /** A rendered row is either a standalone item or a collapsible block of "work" (reasoning + tools). */
@@ -591,9 +622,38 @@ export class TimelineBuilder {
   private readonly planIndex = new Map<string, number>();
   private readonly pendingSubagentRollups = new Map<string, SubagentRollup>();
   private activeUserIndex: number | null = null;
+
+  private turnActivitySinceCompletion(): boolean {
+    if (this.usageOwnerCompletedAt == null) return false;
+    for (let index = this.usageOwnerCompletedAt; index < this.items.length; index += 1) {
+      if (isTurnActivity(this.items[index]!)) return true;
+    }
+    return false;
+  }
+
+  /** Records a usage report's time on the checkpoint anchoring an automatic continuation. */
+  private stampUsageAt(index: number, at: number): void {
+    const item = this.items[index];
+    if ((item?.kind !== "checkpoint" && item?.kind !== "conversation_checkpoint") ||
+        (item.lastUsageAt != null && item.lastUsageAt >= at)) return;
+    this.items[index] = { ...item, lastUsageAt: at };
+    this.markDirty(index);
+  }
   /** Kept independently from duration closure: terminal usage can arrive before the durable
    * conversation checkpoint that proves this user message completed and is fork-addressable. */
   private pendingConversationUserIndex: number | null = null;
+  /** Which turn a usage report's timing belongs to: the active prompt, or an automatic continuation
+   * the runner started without one (resumed background work, or activity before the loaded page's
+   * first prompt). A continuation is anchored on its file checkpoint, else on its conversation
+   * checkpoint; until either exists its latest usage time waits in `pendingUsageAt`. Usage counters
+   * keep merging into the active prompt regardless. */
+  private usageOwner:
+    | { kind: "prompt" }
+    | { kind: "continuation"; anchor: number | null; pendingUsageAt: number | null }
+    | null = null;
+  /** Item count just after the owner's conversation checkpoint. A report with nothing new since
+   * still belongs to that completed turn; anything new means a continuation began. */
+  private usageOwnerCompletedAt: number | null = null;
   // ID-less providers retain the historical contiguous-only behavior. Identified provider items
   // may interleave, so they use a separate bounded LRU set until completion or a real boundary.
   private lastText: { kind: string; index: number; parent?: string } | null = null;
@@ -819,6 +879,8 @@ export class TimelineBuilder {
         if (p.deliveryIntent !== "steer") {
           this.activeUserIndex = userIndex;
           this.pendingConversationUserIndex = userIndex;
+          this.usageOwner = { kind: "prompt" };
+          this.usageOwnerCompletedAt = null;
         }
         this.markDirty(userIndex);
         break;
@@ -989,6 +1051,16 @@ export class TimelineBuilder {
       }
       case "token_usage": {
         if (!p.parentToolUseId) {
+          if (this.usageOwner == null || this.turnActivitySinceCompletion()) {
+            this.usageOwner = { kind: "continuation", anchor: null, pendingUsageAt: null };
+            this.usageOwnerCompletedAt = null;
+          }
+          const owner = this.usageOwner;
+          const continued = owner.kind === "continuation";
+          if (owner.kind === "continuation" && Number.isFinite(ev.ts)) {
+            if (owner.anchor != null) this.stampUsageAt(owner.anchor, ev.ts);
+            else owner.pendingUsageAt = Math.max(owner.pendingUsageAt ?? ev.ts, ev.ts);
+          }
           if (this.activeUserIndex != null) {
             const item = this.items[this.activeUserIndex];
             if (item?.kind === "user_message") {
@@ -999,15 +1071,21 @@ export class TimelineBuilder {
                 Number.isFinite(ev.ts) && ev.ts >= item.createdAt
                 ? ev.ts - item.createdAt
                 : undefined;
-              const durationMs = item.durationMs == null ? (providerDuration ?? observedDuration) : undefined;
+              // A continuation's report still adds its usage to the prompt (as before), but not its
+              // timing: the prompt's own turn finished before the continuation began.
+              const durationMs = !continued && item.durationMs == null ? (providerDuration ?? observedDuration) : undefined;
               const turnUsage = turnUsageFrom(p);
-              if (durationMs != null || turnUsage) {
+              const usageAt = !continued && Number.isFinite(ev.ts) && (item.lastUsageAt == null || ev.ts > item.lastUsageAt)
+                ? ev.ts
+                : undefined;
+              if (durationMs != null || turnUsage || usageAt != null) {
                 this.items[this.activeUserIndex] = {
                   ...item,
                   ...(durationMs != null
                     ? { durationMs, durationSource: providerDuration != null ? "provider" as const : "observed" as const }
                     : {}),
                   ...(turnUsage ? { turnUsage: mergeTurnUsage(item.turnUsage, turnUsage) } : {}),
+                  ...(usageAt != null ? { lastUsageAt: usageAt } : {}),
                 };
                 this.markDirty(this.activeUserIndex);
               }
@@ -1168,16 +1246,29 @@ export class TimelineBuilder {
         }
         break;
       }
-      case "checkpoint":
+      case "checkpoint": {
         this.breakText();
-        this.markDirty(this.items.push({ kind: "checkpoint", id: ev.seq, turn: p.turn }) - 1);
+        const index = this.items.push({ kind: "checkpoint", id: ev.seq, turn: p.turn }) - 1;
+        this.markDirty(index);
+        // A prompt's own checkpoint directly follows it; any other opens an automatic continuation.
+        if (this.activeUserIndex == null || index - 1 !== this.activeUserIndex) {
+          const previous = this.usageOwner;
+          this.usageOwner = { kind: "continuation", anchor: index, pendingUsageAt: null };
+          if (previous?.kind === "continuation" && previous.anchor == null && this.usageOwnerCompletedAt == null &&
+              previous.pendingUsageAt != null) {
+            this.stampUsageAt(index, previous.pendingUsageAt);
+          }
+          this.usageOwnerCompletedAt = null;
+        }
         break;
+      }
       case "checkpoint_restored":
         this.breakText();
         this.markDirty(this.items.push({ kind: "checkpoint_restored", id: ev.seq, turn: p.turn }) - 1);
         break;
-      case "conversation_checkpoint":
+      case "conversation_checkpoint": {
         this.breakText();
+        const promptTurn = this.pendingConversationUserIndex != null;
         if (this.pendingConversationUserIndex != null) {
           const item = this.items[this.pendingConversationUserIndex];
           if (item?.kind === "user_message") {
@@ -1186,8 +1277,20 @@ export class TimelineBuilder {
           }
           this.pendingConversationUserIndex = null;
         }
-        this.markDirty(this.items.push({ kind: "conversation_checkpoint", id: ev.seq, turn: p.turn }) - 1);
+        const index = this.items.push({ kind: "conversation_checkpoint", id: ev.seq, turn: p.turn }) - 1;
+        this.markDirty(index);
+        const owner = this.usageOwner;
+        if (!(promptTurn && owner?.kind === "prompt" && this.usageOwnerCompletedAt == null)) {
+          // A continuation's turn completes here (including one whose start lies before the loaded
+          // page). It keeps its file checkpoint as anchor, or takes this one.
+          const inProgress = owner?.kind === "continuation" && this.usageOwnerCompletedAt == null ? owner : null;
+          const anchor = inProgress?.anchor ?? index;
+          if (inProgress?.anchor == null && inProgress?.pendingUsageAt != null) this.stampUsageAt(index, inProgress.pendingUsageAt);
+          this.usageOwner = { kind: "continuation", anchor, pendingUsageAt: null };
+        }
+        this.usageOwnerCompletedAt = this.items.length;
         break;
+      }
       case "conversation_forked":
         this.breakText();
         this.markDirty(this.items.push({ kind: "conversation_forked", id: ev.seq, sourceSessionId: p.sourceSessionId, turn: p.turn, ...(p.handoff ? { handoff: p.handoff } : {}) }) - 1);

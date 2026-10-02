@@ -3,7 +3,7 @@ import test from "node:test";
 import * as React from "react";
 import type { SessionEventPayload, SessionView } from "@wollipog/protocol";
 import { renderToStaticMarkup } from "react-dom/server";
-import { groupTimeline, SubagentTreeProjector, TimelineBuilder, type TimelineItem } from "../timeline.js";
+import { deriveTimeline, groupTimeline, SubagentTreeProjector, TimelineBuilder, type TimelineItem } from "../timeline.js";
 import {
   automaticSubagentOpen,
   automaticSubagentOpenAfterChange,
@@ -12,7 +12,13 @@ import {
   estimateTimelineRow,
   flattenTimelineRows,
   IncrementalTimelineRows,
+  layoutTurns,
   stabilizeTimelineRowKeys,
+  summarizeTimelineTurns,
+  TIMELINE_ROW_GAP,
+  TIMELINE_TURN_GAP,
+  turnResponseText,
+  turnSpanDescription,
   stabilizeWorkGroupKeys,
   permissionResolutionLabel,
   timelineFileSourceLocation,
@@ -69,6 +75,7 @@ test("auto-approved reviews expose an exact count and highest risk while expande
   assert.deepEqual(collapsed[0], {
     kind: "work_summary",
     key: workKey,
+    firstItemId: items[0]!.id,
     tools: 1,
     edits: 0,
     thoughts: 0,
@@ -336,7 +343,7 @@ test("delegated question and approval histories identify the controlling parent"
   assert.match(html, /Approved by Parent parent-session/);
 });
 
-test("completed turn messages own compact rewind, fork, and handoff actions", () => {
+test("each settled turn's footer owns fork and handoff while its prompt keeps rewind", () => {
   const html = renderToStaticMarkup(React.createElement(EventTimeline, {
     items: [
       { kind: "user_message", id: 1, text: "First question" },
@@ -364,8 +371,12 @@ test("completed turn messages own compact rewind, fork, and handoff actions", ()
     "plain historical forks use the shared Lucide fork glyph");
   assert.equal((html.match(/lucide-share/g) ?? []).length, 2,
     "Hand Off uses a distinct shared glyph");
-  assert.match(html, /aria-label="Copy assistant message"[\s\S]*?aria-label="Fork Conversation After This Turn/,
-    "Fork follows Copy in assistant metadata");
+  assert.match(html, /aria-label="Copy Reply"[\s\S]*?aria-label="Fork Conversation After This Turn/,
+    "Fork follows Copy in the turn footer");
+  assert.equal((html.match(/class="tl-turn-footer"/g) ?? []).length, 2, "one footer per settled turn");
+  assert.match(html, /<span class="tl-turn-label">Turn 1<\/span>[\s\S]*<span class="tl-turn-label">Turn 2<\/span>/);
+  assert.match(html, /aria-label="Message Actions"[^>]*>[\s\S]*?aria-label="Rewind Files to Before This Turn"/,
+    "Rewind stays beside the prompt it rewinds to");
   assert.match(html, /<details class="tl-message-action-unavailable">[\s\S]*?Claude Code can fork only its latest completed conversation checkpoint\./);
   // light-theme.test.ts holds the unavailable summary to the 3:1 glyph floor, which is sound only
   // while it renders the icon alone: its name is the aria-label and its reason the sibling span.
@@ -381,19 +392,21 @@ test("completed turn messages own compact rewind, fork, and handoff actions", ()
     "checkpoint dividers no longer own heavy text actions");
 });
 
-test("checkpoint dividers expose symmetric turn boundary labels", () => {
-  const html = renderToStaticMarkup(React.createElement(EventTimeline, {
-    items: [
-      { kind: "checkpoint", id: 1, turn: 19 },
-      { kind: "conversation_checkpoint", id: 2, turn: 19 },
-    ],
-  }));
+test("checkpoints stay in the model but render no Start Turn or End Turn separator", () => {
+  const items: TimelineItem[] = [
+    { kind: "user_message", id: 1, text: "Prompt" },
+    { kind: "checkpoint", id: 2, turn: 19 },
+    { kind: "agent_message", id: 3, text: "Answer" },
+    { kind: "conversation_checkpoint", id: 4, turn: 19 },
+  ];
+  const html = renderToStaticMarkup(React.createElement(EventTimeline, { items }));
 
-  assert.match(html, /role="separator" aria-label="Start Turn 19" title="Files snapshot taken at the start of turn 19"/);
-  assert.match(html, /<span class="checkpoint-label">Start Turn 19<\/span>/);
-  assert.match(html, /role="separator" aria-label="End Turn 19" title="Conversation and files saved at the end of turn 19"/);
-  assert.match(html, /<span class="checkpoint-label">End Turn 19<\/span>/);
-  assert.doesNotMatch(html, />after turn 19<|>Turn 19</);
+  assert.doesNotMatch(html, /Start Turn|End Turn|role="separator"/);
+  assert.equal((html.match(/role="listitem"/g) ?? []).length, 2, "the checkpoints occupy no row");
+  const rows = flattenTimelineRows(groupTimeline(items), new Map());
+  assert.deepEqual(rows.map((row) => row.key), ["item:user_message:1", "item:agent_message:3"]);
+  assert.deepEqual([...userRewindTurns(items)], [[1, 19]], "rewind still reads the file checkpoint");
+  assert.deepEqual([...assistantForkTurns(items)], [[3, 19]], "fork still reads the conversation checkpoint");
 });
 
 test("rewind, fork, and handoff dividers expose concise accessible semantics", () => {
@@ -1160,22 +1173,296 @@ test("an old nested progressive edit patches its indexed parent child", () => {
   assert.equal(updated.rows.some((row) => row.kind === "item" && row.item.kind === "file_edit" && row.item.diff === "second"), true);
 });
 
-test("message rows expose semantic recorded times, honest duration, and contextual copy actions", () => {
+test("message rows carry no time; the turn footer holds one clock time, its span and contextual copy", () => {
   const html = renderToStaticMarkup(React.createElement(EventTimeline, {
     items: [
-      { kind: "user_message", id: 1, text: "raw user text", createdAt: 1_700_000_000_000, durationMs: 1_250, durationSource: "observed" },
-      { kind: "agent_message", id: 2, text: "**raw assistant text**", createdAt: 1_700_000_001_000 },
+      { kind: "user_message", id: 1, text: "raw user text", createdAt: 1_700_000_000_000, durationMs: 26_000, durationSource: "provider" },
+      { kind: "agent_message", id: 2, text: "**raw assistant text**", createdAt: 1_700_000_001_000, lastActivityAt: 1_700_000_026_000 },
     ],
   }));
-  assert.equal((html.match(/<time /g) ?? []).length, 2);
-  assert.match(html, /dateTime="2023-11-14T22:13:20\.000Z"/);
-  assert.match(html, /title="Recorded /);
-  assert.match(html, /title="Approximate runner-recorded activity span"/);
-  assert.match(html, />~1\.3s<\/span>/);
-  assert.match(html, /aria-label="Approximate runner-recorded activity span, 1\.3s"/);
-  assert.match(html, /aria-label="Copy user message"/);
-  assert.match(html, /aria-label="Copy assistant message"/);
+  assert.equal((html.match(/<time /g) ?? []).length, 1, "only the footer shows a time");
+  assert.match(html, /<div class="tl-turn-footer"[^>]*>[\s\S]*<time dateTime="2023-11-14T22:13:46\.000Z"/,
+    "the footer's clock is when the turn finished");
+  assert.match(html, /role="tooltip">Started [^<]+, finished [^<]+ \(26s\)<\/span>/);
+  assert.doesNotMatch(html.replace(/<span[^>]*role="tooltip">[^<]*<\/span>/, ""), /Recorded|Started|Last Activity|→|Ago/,
+    "outside the footer's tooltip, no row names a time range or timestamp label");
+  assert.match(html, /aria-label="Copy Message"/);
+  assert.match(html, /aria-label="Copy Reply"/);
   assert.match(html, /<strong>raw assistant text<\/strong>/);
+});
+
+test("turn summaries read the checkpoint number, span, usage, response and fork point", () => {
+  const items: TimelineItem[] = [
+    { kind: "agent_message", id: 1, text: "Before any prompt" },
+    {
+      kind: "user_message", id: 2, text: "first", createdAt: 1_000, turn: 3,
+      turnUsage: { inputTokens: 100, outputTokens: 20, cachedInputTokens: 0, cacheCreationTokens: 0, costUsd: 0.5 },
+    },
+    { kind: "checkpoint", id: 3, turn: 3 },
+    { kind: "agent_message", id: 4, text: "Working on it.", createdAt: 2_000 },
+    { kind: "tool_call", id: 5, toolCallId: "t", title: "Run", status: "completed", text: "", startedAt: 3_000, completedAt: 9_000 },
+    { kind: "agent_message", id: 6, text: "nested", parentToolUseId: "t", createdAt: 4_000 },
+    { kind: "agent_message", id: 7, text: "Done.", createdAt: 8_000 },
+    { kind: "conversation_checkpoint", id: 8, turn: 3 },
+    { kind: "checkpoint_restored", id: 9, turn: 2 },
+    { kind: "user_message", id: 10, text: "second", createdAt: 20_000, durationMs: 5_000 },
+    { kind: "user_message", id: 11, text: "steer", deliveryIntent: "steer", createdAt: 21_000 },
+  ];
+  const { segments } = summarizeTimelineTurns(items, assistantForkTurns(items));
+  assert.deepEqual(segments.map((segment) => segment.key), [null, 2, 10], "a steering message does not open a turn");
+  const first = segments[1]!;
+  assert.equal(first.turn, 3);
+  assert.equal(first.startedAt, 1_000);
+  assert.equal(first.finishedAt, 9_000, "the latest recorded activity, nested work included");
+  assert.equal(turnResponseText(first), "Working on it.\n\nDone.", "only top-level agent messages are copied");
+  assert.equal(first.forkTurn, 3);
+  assert.equal(first.usage?.costUsd, 0.5);
+  assert.equal(first.hasAgentContent, true);
+  const second = segments[2]!;
+  assert.equal(second.hasAgentContent, false, "a prompt and a steer are not agent work");
+  assert.equal(second.finishedAt, 25_000, "the recorded duration outlasts the last visible row (the steer at 21s)");
+  assert.equal(segments[0]!.turn, undefined);
+});
+
+test("one footer follows each settled turn, before trailing history dividers, and never a running one", () => {
+  const items: TimelineItem[] = [
+    { kind: "agent_message", id: 1, text: "Subagent-style output before any prompt" },
+    { kind: "user_message", id: 2, text: "first" },
+    { kind: "agent_message", id: 3, text: "answer" },
+    { kind: "conversation_checkpoint", id: 4, turn: 1 },
+    { kind: "checkpoint_restored", id: 5, turn: 1 },
+    { kind: "user_message", id: 6, text: "second" },
+    { kind: "agent_thought", id: 7, text: "thinking" },
+    { kind: "tool_call", id: 8, toolCallId: "t", title: "Run", status: "completed", text: "" },
+  ];
+  const rows = flattenTimelineRows(groupTimeline(items), new Map());
+  const turns = summarizeTimelineTurns(items, assistantForkTurns(items));
+  const settled = layoutTurns(rows, turns, false);
+  assert.deepEqual([...settled.footers.keys()], ["item:agent_message:3", "work:user_message:6"],
+    "the first footer sits before the rewind divider; unnumbered pre-prompt output gets none");
+  assert.equal(settled.footers.get("item:agent_message:3")!.turn, 1);
+  assert.deepEqual([...layoutTurns(rows, turns, true).footers.keys()], ["item:agent_message:3"],
+    "the running turn has no footer");
+
+  const gaps = rows.map((_, index) => settled.turnStarts.has(rows[index + 1]?.key ?? "") ? TIMELINE_TURN_GAP : TIMELINE_ROW_GAP);
+  assert.deepEqual(gaps, [32, 12, 12, 32, 12, 12], "32px opens each new turn, 12px everywhere inside one");
+});
+
+test("an automatic continuation without a prompt is its own turn with its own footer and actions", () => {
+  // Resumed background work: the runner emits a notice and a new numbered checkpoint, no prompt.
+  const items: TimelineItem[] = [
+    { kind: "user_message", id: 1, text: "Start the migration" },
+    { kind: "checkpoint", id: 2, turn: 1 },
+    { kind: "agent_message", id: 3, text: "Started; it continues in the background." },
+    { kind: "conversation_checkpoint", id: 4, turn: 1 },
+    { kind: "stderr", id: 5, text: "Runner resumed orphaned background work automatically." },
+    { kind: "checkpoint", id: 6, turn: 2 },
+    { kind: "agent_message", id: 7, text: "The migration finished." },
+    { kind: "conversation_checkpoint", id: 8, turn: 2 },
+  ];
+  const turns = summarizeTimelineTurns(items, assistantForkTurns(items));
+  assert.deepEqual(turns.segments.map((segment) => [segment.key, segment.turn, segment.forkTurn]),
+    [[null, undefined, undefined], [1, 1, 1], [5, 2, 2]]);
+  const rows = flattenTimelineRows(groupTimeline(items), new Map());
+  const settled = layoutTurns(rows, turns, false);
+  assert.deepEqual([...settled.footers.values()].map((footer) => footer.turn), [1, 2]);
+  assert.deepEqual([...layoutTurns(rows, turns, true).footers.values()].map((footer) => footer.turn), [1],
+    "while the continuation runs, the earlier turn keeps its footer");
+  assert.ok(settled.turnStarts.has(rows.find((row) => row.kind === "work_summary")!.key),
+    "the continuation opens 32px below the earlier turn");
+
+  const html = renderToStaticMarkup(React.createElement(EventTimeline, {
+    items,
+    onFork: () => {},
+    forkAvailabilityByTurn: new Map([1, 2].map((turn) => [turn, { available: true as const, forkTurn: turn }])),
+  }));
+  assert.equal((html.match(/aria-label="Fork Conversation After This Turn"/g) ?? []).length, 2);
+});
+
+test("a continuation's usage report times the continuation, not the turn before it", () => {
+  const event = (seq: number, ts: number, payload: SessionEventPayload) => ({ id: seq, sessionId: "s", seq, ts, payload });
+  const items = deriveTimeline([
+    event(1, 0, { kind: "user_message", text: "Start it" }),
+    event(2, 1, { kind: "checkpoint", turn: 1, tree: "a" } as SessionEventPayload),
+    event(3, 2_000, { kind: "agent_message", text: "Started.", final: true }),
+    event(4, 3_000, { kind: "token_usage", inputTokens: 10, outputTokens: 2 }),
+    event(5, 3_001, { kind: "conversation_checkpoint", turn: 1 }),
+    event(6, 10_000, { kind: "stderr", text: "Runner resumed orphaned background work automatically." }),
+    event(7, 10_001, { kind: "checkpoint", turn: 2, tree: "b" } as SessionEventPayload),
+    event(8, 12_000, { kind: "agent_message", text: "Finished.", final: true }),
+    event(9, 14_000, { kind: "token_usage", inputTokens: 20, outputTokens: 4 }),
+    event(10, 14_001, { kind: "conversation_checkpoint", turn: 2 }),
+  ]);
+  const { segments } = summarizeTimelineTurns(items, assistantForkTurns(items));
+  assert.deepEqual(segments.slice(1).map((segment) => [segment.turn, segment.finishedAt]), [[1, 3_000], [2, 14_000]]);
+  assert.equal(segments[1]!.durationMs, 3_000, "the prompt's duration is its own turn's");
+
+  // The file checkpoint is best effort; a continuation without one is timed the same way.
+  const withoutCheckpoint = deriveTimeline([
+    event(1, 0, { kind: "user_message", text: "Start it" }),
+    event(3, 2_000, { kind: "agent_message", text: "Started.", final: true }),
+    event(4, 3_000, { kind: "token_usage", inputTokens: 10, outputTokens: 2 }),
+    event(5, 3_001, { kind: "conversation_checkpoint", turn: 1 }),
+    event(6, 10_000, { kind: "stderr", text: "Runner resumed orphaned background work automatically." }),
+    event(8, 12_000, { kind: "agent_message", text: "Finished.", final: true }),
+    event(9, 14_000, { kind: "token_usage", inputTokens: 20, outputTokens: 4 }),
+    event(10, 14_001, { kind: "conversation_checkpoint", turn: 2 }),
+  ]);
+  const unanchored = summarizeTimelineTurns(withoutCheckpoint, assistantForkTurns(withoutCheckpoint)).segments;
+  assert.deepEqual(unanchored.slice(1).map((segment) => [segment.turn, segment.finishedAt]), [[1, 3_000], [2, 14_000]]);
+
+  // A terminal report landing just after the prompt's own conversation checkpoint is still its turn's.
+  const lateReport = deriveTimeline([
+    event(1, 0, { kind: "user_message", text: "Run it" }),
+    event(2, 2_000, { kind: "agent_message", text: "Done.", final: true }),
+    event(3, 2_001, { kind: "conversation_checkpoint", turn: 1 }),
+    event(4, 5_000, { kind: "token_usage", inputTokens: 10, outputTokens: 2 }),
+  ]);
+  assert.equal(summarizeTimelineTurns(lateReport, new Map()).segments[1]!.finishedAt, 5_000);
+
+  // The same late ordering for a continuation, with and without its file checkpoint.
+  for (const fileCheckpoint of [true, false]) {
+    const late = deriveTimeline([
+      event(1, 0, { kind: "user_message", text: "Start it" }),
+      event(3, 2_000, { kind: "agent_message", text: "Started.", final: true }),
+      event(4, 3_000, { kind: "token_usage", inputTokens: 10, outputTokens: 2 }),
+      event(5, 3_001, { kind: "conversation_checkpoint", turn: 1 }),
+      event(6, 10_000, { kind: "stderr", text: "Runner resumed orphaned background work automatically." }),
+      ...(fileCheckpoint ? [event(7, 10_001, { kind: "checkpoint", turn: 2, tree: "b" } as SessionEventPayload)] : []),
+      event(8, 12_000, { kind: "agent_message", text: "Finished.", final: true }),
+      event(9, 12_001, { kind: "conversation_checkpoint", turn: 2 }),
+      event(10, 14_000, { kind: "token_usage", inputTokens: 20, outputTokens: 4 }),
+    ]);
+    assert.deepEqual(summarizeTimelineTurns(late, new Map()).segments.slice(1).map((segment) => segment.finishedAt),
+      [3_000, 14_000], `late continuation report, file checkpoint ${fileCheckpoint}`);
+  }
+
+  // A tail-first page that starts at the earlier turn's conversation checkpoint, without its prompt.
+  const page = deriveTimeline([
+    event(5, 3_001, { kind: "conversation_checkpoint", turn: 1 }),
+    event(6, 10_000, { kind: "stderr", text: "Runner resumed orphaned background work automatically." }),
+    event(8, 12_000, { kind: "agent_message", text: "Finished.", final: true }),
+    event(9, 14_000, { kind: "token_usage", inputTokens: 20, outputTokens: 4 }),
+    event(10, 14_001, { kind: "conversation_checkpoint", turn: 2 }),
+  ]);
+  const paged = summarizeTimelineTurns(page, new Map()).segments;
+  assert.deepEqual(paged.map((segment) => [segment.turn, segment.finishedAt]), [[1, undefined], [2, 14_000]]);
+});
+
+test("late subagent output stays with its parent tool's turn and never opens another", () => {
+  const event = (seq: number, ts: number, payload: SessionEventPayload) => ({ id: seq, sessionId: "s", seq, ts, payload });
+  const task = { kind: "tool_call", toolCallId: "task", title: "Agent", toolKind: "agent", status: "in_progress" } as SessionEventPayload;
+  // A detached child speaks after the prompt's conversation checkpoint, before its late usage report.
+  const detached = deriveTimeline([
+    event(1, 0, { kind: "user_message", text: "Investigate" }),
+    event(2, 1_000, task),
+    event(3, 2_000, { kind: "agent_message", text: "Delegated.", final: true }),
+    event(4, 2_100, { kind: "conversation_checkpoint", turn: 1 }),
+    event(5, 3_000, { kind: "agent_message", text: "Child note", final: true, parentToolUseId: "task" }),
+    event(6, 5_000, { kind: "token_usage", inputTokens: 10, outputTokens: 2 }),
+  ]);
+  const one = summarizeTimelineTurns(detached, new Map()).segments;
+  assert.deepEqual(one.map((segment) => segment.key), [null, 1], "the child's message opens no turn");
+  assert.equal(one[1]!.finishedAt, 5_000, "the late report still times the prompt's turn");
+
+  // A child launched in turn 1 speaks after turn 2 completed.
+  const later = deriveTimeline([
+    event(1, 0, { kind: "user_message", text: "Start a task" }),
+    event(2, 1_000, task),
+    event(3, 2_000, { kind: "agent_message", text: "Started.", final: true }),
+    event(4, 2_100, { kind: "conversation_checkpoint", turn: 1 }),
+    event(5, 10_000, { kind: "user_message", text: "Meanwhile, something else" }),
+    event(6, 12_000, { kind: "agent_message", text: "Done.", final: true }),
+    event(7, 12_100, { kind: "conversation_checkpoint", turn: 2 }),
+    event(8, 20_000, { kind: "agent_message", text: "Task finding", final: true, parentToolUseId: "task" }),
+  ]);
+  const two = summarizeTimelineTurns(later, new Map());
+  assert.deepEqual(two.segments.slice(1).map((segment) => segment.finishedAt), [20_000, 12_000]);
+  assert.equal(two.segmentOf.get(8), 1, "the finding belongs to turn 1, where its row nests");
+});
+
+test("an empty terminal usage report settles a turn that produced nothing else", () => {
+  const events = [
+    { id: 1, sessionId: "s", seq: 1, ts: 1_000, payload: { kind: "user_message", text: "Anything?" } },
+    { id: 2, sessionId: "s", seq: 2, ts: 3_000, payload: { kind: "token_usage" } },
+  ] as never[];
+  const items = deriveTimeline(events);
+  const inactive = renderToStaticMarkup(React.createElement(EventTimeline, { items, sessionActive: false }));
+  assert.equal((inactive.match(/class="tl-turn-footer"/g) ?? []).length, 1);
+  assert.match(inactive, /\(2\.0s\)/);
+  const active = renderToStaticMarkup(React.createElement(EventTimeline, { items, sessionActive: true }));
+  assert.doesNotMatch(active, /tl-turn-footer/);
+});
+
+test("the footer tooltip names the start, finish and duration it has", () => {
+  const at = (minute: number, second: number) => Date.UTC(2026, 6, 13, 0, minute, second);
+  assert.match(turnSpanDescription({ startedAt: at(25, 38), finishedAt: at(26, 4) }),
+    /^Started \d{1,2}:25:38\s?[AP]M, finished \d{1,2}:26:04\s?[AP]M \(26s\)$/);
+  assert.match(turnSpanDescription({ finishedAt: at(26, 4) }), /^Finished \d{1,2}:26:04\s?[AP]M$/);
+  assert.equal(turnSpanDescription({}), "");
+});
+
+test("a turn finishes at its terminal usage report when that lands after the last visible row", () => {
+  const at = (second: number) => Date.UTC(2026, 9, 2, 10, 0, second);
+  const event = (seq: number, ts: number, payload: SessionEventPayload) => ({ id: seq, sessionId: "s", seq, ts, payload });
+  const items = deriveTimeline([
+    event(1, at(0), { kind: "user_message", text: "Run it" }),
+    event(2, at(30), { kind: "agent_message", text: "Done.", final: true }),
+    // Codex's turn.completed reports usage half a minute after the final reply.
+    event(3, at(60), { kind: "token_usage", inputTokens: 10, outputTokens: 4 }),
+  ]);
+  const summary = summarizeTimelineTurns(items, new Map()).segments[1]!;
+  assert.equal(summary.finishedAt, at(60));
+  assert.match(turnSpanDescription(summary), /^Started \d{1,2}:00:00\s?[AP]M, finished \d{1,2}:01:00\s?[AP]M \(1m 0s\)$/,
+    "the clock, the finish and the duration agree");
+
+  // Only the first report stamps the prompt's duration; a live mid-turn report must not hide the
+  // terminal one that follows the final reply.
+  const live = deriveTimeline([
+    event(1, at(0), { kind: "user_message", text: "Run it" }),
+    event(2, at(10), { kind: "token_usage", inputTokens: 5, outputTokens: 1 }),
+    event(3, at(30), { kind: "agent_message", text: "Done.", final: true }),
+    event(4, at(60), { kind: "token_usage", inputTokens: 10, outputTokens: 4 }),
+  ]);
+  assert.equal(summarizeTimelineTurns(live, new Map()).segments[1]!.finishedAt, at(60));
+});
+
+test("a settled turn that produced only usage keeps its footer under the prompt", () => {
+  const events = [
+    { id: 1, sessionId: "s", seq: 1, ts: 1_000, payload: { kind: "user_message", text: "Compact the context" } },
+    { id: 2, sessionId: "s", seq: 2, ts: 1_001, payload: { kind: "checkpoint", turn: 4, tree: "t" } },
+    { id: 3, sessionId: "s", seq: 3, ts: 2_000, payload: { kind: "token_usage", inputTokens: 900, outputTokens: 10, costUsd: 0.01 } },
+    { id: 4, sessionId: "s", seq: 4, ts: 2_001, payload: { kind: "conversation_checkpoint", turn: 4 } },
+  ] as never[];
+  const settled = renderToStaticMarkup(React.createElement(EventTimeline, { items: deriveTimeline(events) }));
+  assert.equal((settled.match(/class="tl-turn-footer"/g) ?? []).length, 1);
+  assert.match(settled, /<span class="tl-turn-label">Turn 4<\/span>/);
+  assert.match(settled, /\$0\.01/);
+  const running = renderToStaticMarkup(React.createElement(EventTimeline, {
+    items: deriveTimeline(events.slice(0, 2)),
+    sessionActive: false,
+  }));
+  assert.doesNotMatch(running, /tl-turn-footer/, "a prompt with nothing settled yet has no footer");
+});
+
+test("replies no turn footer copies keep their own Copy", () => {
+  const subagentOutput = renderToStaticMarkup(React.createElement(EventTimeline, {
+    items: [{ kind: "agent_message", id: 1, text: "Subagent finding", parentToolUseId: "task" }],
+  }));
+  assert.equal((subagentOutput.match(/aria-label="Copy Reply"/g) ?? []).length, 1,
+    "a subagent transcript has no prompt, so no footer, and its reply keeps Copy");
+  assert.doesNotMatch(subagentOutput, /tl-turn-footer/);
+
+  const session = renderToStaticMarkup(React.createElement(EventTimeline, {
+    items: [
+      { kind: "user_message", id: 1, text: "Prompt" },
+      { kind: "agent_message", id: 2, text: "Answer" },
+      { kind: "conversation_checkpoint", id: 3, turn: 1 },
+    ],
+  }));
+  assert.equal((session.match(/aria-label="Copy Reply"/g) ?? []).length, 1,
+    "a turn's own replies are copied once, from its footer");
+  assert.match(session, /class="tl-turn-footer"[\s\S]*aria-label="Copy Reply"/);
 });
 
 test("user rows prepare deliberate resend and expose edit-in-fork only for an eligible predecessor", () => {
