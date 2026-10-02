@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import "./test-dom-events.js";
 import React, { act } from "react";
@@ -964,6 +965,46 @@ test("a fixed Child Harness on an older runner shows the protocol-v157 recovery 
   }
 });
 
+test("Orchestrator defaults without Child Harness policy name Wollipog as the thing to update", async () => {
+  const enabledRunner: RunnerView = {
+    ...runner,
+    protocolVersion: PROTOCOL_VERSION,
+    agents: runner.agents.map((agent) => ({ ...agent, capabilities: {
+      models: [], effortLevels: [], slashCommands: [], supportsImages: false, supportsApprovals: true,
+      permissionModes: ["default", "orchestrator"],
+    } })),
+  };
+  // The default fixture's Orchestrator settings advertise no `harnesses`, which is the payload of
+  // a server that predates fixed Child Harness policy.
+  const fixture = await mountFixture({ runners: [enabledRunner] });
+  try {
+    await act(async () => { await selectProject(fixture.container, project.id); });
+    await choosePermissionPreset(fixture.container, "Orchestrator");
+    const control = [...fixture.container.querySelectorAll(".orchestrator-policy-control")]
+      .find((candidate) => candidate.querySelector(":scope > span")?.textContent?.startsWith("Child Harness"));
+    assert.ok(control, "Child Harness is rendered");
+    const note = control.querySelector(":scope > small.muted")?.textContent ?? "";
+    assert.equal(note, "Update or restart Wollipog to configure fixed Child Harness policy.");
+    assert.doesNotMatch(note, RETIRED_PROJECT_TERMS);
+
+    // The Select is disabled in this state, so the Automatic option's description never opens and
+    // the note above is what a person reads. Pin that the list stays shut, then pin the option's
+    // own sentence in source, since no interaction can render it.
+    const trigger = fixture.container.querySelector<HTMLButtonElement>('[aria-label^="Child Harness:"]');
+    assert.ok(trigger, "Child Harness select is rendered");
+    assert.equal(trigger.getAttribute("aria-disabled"), "true");
+    await act(async () => { trigger.click(); });
+    assertNoDomNode(fixture.container.querySelector('[role="listbox"][aria-label="Child Harness"]'),
+      "the disabled Child Harness list does not open");
+    const source = readFileSync(new URL("./NewSessionDialog.tsx", import.meta.url), "utf8");
+    assert.ok(source.includes(': "Update Wollipog to configure a fixed Child Harness.",'),
+      "the Automatic option names Wollipog when fixed Child Harness policy is unavailable");
+    assert.doesNotMatch(source, /"Update the control plane to configure a fixed Child Harness\."/);
+  } finally {
+    await unmountFixture(fixture);
+  }
+});
+
 test("unsupported control-plane combinations explain the upgrade and block Orchestrator creation", async () => {
   const enabledRunner: RunnerView = {
     ...runner,
@@ -980,7 +1021,10 @@ test("unsupported control-plane combinations explain the upgrade and block Orche
   try {
     await act(async () => { await selectProject(fixture.container, project.id); });
     await choosePermissionPreset(fixture.container, "Orchestrator");
-    assert.match(fixture.container.textContent ?? "", /does not support campaign policy.*Update or restart/s);
+    const unavailable = fixture.container.querySelector(".orchestrator-policy-unavailable .form-error")?.textContent ?? "";
+    assert.equal(unavailable,
+      "This version of Wollipog does not support campaign policy. Update or restart Wollipog so it matches this dashboard.");
+    assert.doesNotMatch(unavailable, RETIRED_PROJECT_TERMS);
     assert.equal(createButton(fixture.container).disabled, true);
     await act(async () => { submitWithEnter(fixture.container); });
     assert.equal(fixture.requests.length, 0);
@@ -1902,7 +1946,9 @@ test("Native TUI is disabled when the control plane does not advertise atomic la
     // The reason now lives ON the refused card rather than in a sibling paragraph, so assert it
     // there — a sentence elsewhere in the dialog would satisfy the old container-wide match while
     // the control itself explained nothing.
-    assert.match(native.textContent ?? "", /requires a newer control plane/);
+    const reason = native.querySelector(".choice-row-reason")?.textContent ?? "";
+    assert.equal(reason, "Native TUI launch requires a newer version of Wollipog. Update Wollipog to use it.");
+    assert.doesNotMatch(reason, RETIRED_PROJECT_TERMS);
   } finally {
     await unmountFixture(fixture);
   }
@@ -2236,7 +2282,8 @@ test("Orchestrator is an additive role that keeps the harness's ordinary provide
     await act(async () => { await selectProject(legacyControlPlane.container, project.id); });
     await choosePermissionPreset(legacyControlPlane.container, "Orchestrator");
     const providerPermissions = legacyControlPlane.container.querySelector('[role="group"][aria-label="Provider Permissions"]')!;
-    assert.match(providerPermissions.textContent!, /Update the control plane/);
+    assert.match(providerPermissions.textContent!, /Update Wollipog to give an Orchestrator ordinary provider permissions\./);
+    assert.doesNotMatch(providerPermissions.textContent!, RETIRED_PROJECT_TERMS);
     await act(async () => { createButton(legacyControlPlane.container).click(); });
     assert.equal(legacyControlPlane.requests[0]?.role, undefined, "older control planes never receive the field");
     assert.equal(legacyControlPlane.requests[0]?.config?.permissionMode, "orchestrator",
@@ -2400,7 +2447,7 @@ test("an installation that offers only the additive role never submits the coupl
   try {
     await act(async () => { await selectProject(legacy.container, project.id); });
     await choosePermissionPreset(legacy.container, "Orchestrator");
-    assert.match(legacy.container.textContent!, /Update the control plane/);
+    assert.match(legacy.container.textContent!, /Update Wollipog to give an Orchestrator ordinary provider permissions\./);
     assert.equal(createButton(legacy.container).disabled, true,
       "the coupled preset this control plane would force is not launchable by this installation");
     assert.equal(legacy.requests.length, 0);
