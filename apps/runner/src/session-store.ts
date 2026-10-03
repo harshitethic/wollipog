@@ -155,6 +155,7 @@ export interface SessionMeta {
   title: string;
   titleSource?: SessionTitleSource;
   providerUpdatedAt?: string;
+  artifactUploads?: import("@wollipog/protocol").ArtifactUploadPreference;
   projectMemory?: import("@wollipog/protocol").SessionProjectMemory;
   config: SessionConfig;
   /** Durable one-shot fence; never evicted, so old runner commands cannot replay mutations. */
