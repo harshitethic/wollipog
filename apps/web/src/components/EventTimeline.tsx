@@ -11,11 +11,15 @@ import { type TurnUsage,
   timelineBoundaryKey,
   timelineItemIsStreaming,
   timelineSnapshotDelta,
+  withoutPromptFailedPrefix,
   type TimelineGroup,
   type TimelineItem,
   type TimelineSnapshotDelta,
 } from "../timeline.js";
 import { Markdown } from "./Markdown.js";
+import { Notice } from "./Notice.js";
+import { BusyButton } from "./ui/BusyButton.js";
+import { describeTurnError } from "../turn-error.js";
 import {
   MeasuredVirtualList,
   type VirtualRevealOutcome,
@@ -26,7 +30,7 @@ import {
 import { CopyButton } from "./common.js";
 import { accountLabelText } from "../personal-identifiers.js";
 import { GovernanceDecisionFacts } from "./GovernanceDecision.js";
-import { AccountIcon, AgentLogIcon, BotIcon, ChevronRightIcon, CopyIcon, EditIcon, EditInForkIcon, FileEditIcon, HandOffIcon, RewindFilesIcon, ThoughtIcon, ThreadForkIcon } from "./Icons.js";
+import { AccountIcon, AgentLogIcon, BotIcon, ChevronRightIcon, CopyIcon, EditIcon, EditInForkIcon, FileEditIcon, HandOffIcon, RewindFilesIcon, StopTurnIcon, ThoughtIcon, ThreadForkIcon } from "./Icons.js";
 import { markdownPlainText } from "./markdown-plain-text.js";
 import { TranscriptActionMenu, transcriptActionAvailable, type TranscriptAction } from "./TranscriptActions.js";
 import { useIsCoarsePointer } from "./useIsMobile.js";
@@ -237,7 +241,9 @@ export function userRewindTurns(items: readonly TimelineItem[]): ReadonlyMap<num
   return turns;
 }
 /** Checkpoints stay in the timeline model, where fork and rewind availability read them; the turn
- * footer replaces their Start Turn and End Turn separators, so they render no row. */
+ * footer replaces their Start Turn and End Turn separators, so they render no row. A stop keeps its
+ * row, but the row shows nothing of its own: it is the anchor for its turn's footer ("Stopped at …"),
+ * which a stop with no other row in its turn would otherwise lack. */
 export function timelineItemRendersRow(item: TimelineItem): boolean {
   return item.kind !== "checkpoint" && item.kind !== "conversation_checkpoint";
 }
@@ -269,6 +275,8 @@ export interface TurnFooterSummary {
   forkTurn?: number;
   /** The message that opened the turn, whose actions the turn menu lists under Your Message. */
   prompt?: UserMessageItem;
+  /** The turn was stopped; `at` is the stop's runner-recorded time. The event names no actor. */
+  stopped?: { at?: number };
 }
 
 export interface TurnSegment extends TurnFooterSummary {
@@ -384,6 +392,9 @@ export function summarizeTimelineTurns(
     } else if (item.kind !== "user_message" && !HISTORY_DIVIDER_KINDS.has(item.kind)) {
       target.hasAgentContent = true;
     }
+    if (item.kind === "turn_interrupted") {
+      target.stopped = Number.isFinite(item.createdAt) ? { at: item.createdAt } : {};
+    }
     if (item.kind === "agent_message" && !item.parentToolUseId) {
       if (item.text) segment.responseParts.push(item.text);
       const forkTurn = forkTurns.get(item.id);
@@ -429,8 +440,8 @@ export interface TurnLayout {
 /** Places one footer after the last row of every settled turn, before any trailing history
  * divider; a turn that produced only usage keeps its footer under its prompt. A turn that is still
  * running has none (the working indicator stands in for it), and neither has a turn no prompt
- * opened unless a checkpoint numbers it: a subagent's output or a partial page must not claim an
- * unnumbered turn. */
+ * opened unless a checkpoint numbers it or it was stopped: a subagent's output or a partial page
+ * must not claim an unnumbered turn. */
 export function layoutTurns(
   rows: readonly TimelineRenderRow[],
   turns: TimelineTurns,
@@ -445,7 +456,8 @@ export function layoutTurns(
   const close = () => {
     const segment = turns.segments[current];
     if (!segment?.footerEligible || anchorKey === null || (current === finalIndex && sessionActive)) return;
-    if (!segment.prompted && segment.turn === undefined) return;
+    // A stop is the one fact such a turn keeps: its footer says when it stopped, with no number.
+    if (!segment.prompted && segment.turn === undefined && !segment.stopped) return;
     footers.set(anchorKey, segment);
   };
   rows.forEach((row, index) => {
@@ -511,6 +523,7 @@ export const estimateTimelineRow = (row: TimelineRenderRow, pendingQuestionReque
     case "tool_call": return 28;
     case "conversation_forked": return row.item.handoff ? 76 : 52;
     case "provider_account_switched": return 52;
+    case "turn_interrupted": return 24;
     default: return 52;
   }
 };
@@ -520,8 +533,21 @@ export const estimateTimelineRow = (row: TimelineRenderRow, pendingQuestionReque
  * `onRewind` (when provided — session detail only) must be identity-stable (useCallback)
  * or it defeats the row memoization. */
 const HandoffContext = createContext<{ open: (turn: number) => void; reason?: string } | undefined>(undefined);
+
+/** Retry Turn for a failed turn's notice (#2169): re-submits the turn's prompt as a new turn. */
+export interface TurnRetryControl {
+  onRetry: (prompt: UserMessageItem) => void;
+  /** Why the session cannot take a new turn now; the button is then disabled with this reason. */
+  unavailableReason?: string;
+  /** The prompt a retry is being submitted for. */
+  pendingPromptId?: number;
+  /** Why the last retry of this prompt failed (a refused restart sends no prompt). */
+  error?: { promptId: number; message: string };
+}
+const TurnRetryContext = createContext<TurnRetryControl | undefined>(undefined);
 export const EventTimeline = memo(function EventTimeline({
   handoff,
+  turnRetry,
   items,
   onRewind,
   rewindUnavailableReason,
@@ -551,6 +577,8 @@ export const EventTimeline = memo(function EventTimeline({
   onOpenSession,
 }: {
   handoff?: { open: (turn: number) => void; reason?: string };
+  /** Retry Turn on a failed turn's notice; absent where a transcript cannot start a turn. */
+  turnRetry?: TurnRetryControl;
   items: TimelineItem[];
   onRewind?: (turn: number) => void;
   rewindUnavailableReason?: string;
@@ -597,6 +625,7 @@ export const EventTimeline = memo(function EventTimeline({
   return (
     <HandoffContext.Provider value={handoff}>
     <TimelineSessionLinkContext.Provider value={onOpenSession}>
+    <TurnRetryContext.Provider value={turnRetry}>
     <TranscriptImageCacheProvider key={effectiveHistoryKey} enabled={historyKey !== undefined}>
     <EventTimelineBody
       key={effectiveHistoryKey}
@@ -627,6 +656,7 @@ export const EventTimeline = memo(function EventTimeline({
       workspaceRoot={workspaceRoot}
     />
     </TranscriptImageCacheProvider>
+    </TurnRetryContext.Provider>
     </TimelineSessionLinkContext.Provider>
     </HandoffContext.Provider>
   );
@@ -700,9 +730,10 @@ function EventTimelineBody({
   const forkTurns = useMemo(() => assistantForkTurns(items), [items]);
   const rewindTurns = useMemo(() => userRewindTurns(items), [items]);
   // Rows are patched in place between revisions, so the revision (not the array) keys this pass.
+  const turns = useMemo(() => summarizeTimelineTurns(items, forkTurns), [items, forkTurns]);
   const { footers: turnFooters, turnStarts, standaloneReplies } = useMemo(
-    () => layoutTurns(rows, summarizeTimelineTurns(items, forkTurns), sessionActive),
-    [rows, projection.revision, items, forkTurns, sessionActive],
+    () => layoutTurns(rows, turns, sessionActive),
+    [rows, projection.revision, turns, sessionActive],
   );
   // Prompts a settled turn's More Turn Actions already lists; on a coarse pointer every other user
   // message (a steer, a running or footerless turn's prompt) keeps a menu of its own.
@@ -798,12 +829,15 @@ function EventTimelineBody({
   };
   const renderRow = (row: TimelineRenderRow, state: VirtualRowState) => {
     const footer = turnFooters.get(row.key);
-    const content = renderRowContent(row, state);
+    // A stop's row is only its turn's footer, sitting where the footer would under the row before.
+    const stopRow = row.kind === "item" && row.item.kind === "turn_interrupted";
+    const content = stopRow ? null : renderRowContent(row, state);
     if (!footer) return content;
     return (
       <>
         {content}
         <TurnFooter
+          alone={stopRow}
           summary={footer}
           onFork={onFork}
           forkAvailability={footer.forkTurn == null ? undefined : forkAvailabilityByTurn?.get(footer.forkTurn)}
@@ -873,6 +907,7 @@ function EventTimelineBody({
           editInForkAvailability={item.kind === "user_message" ? editInForkAvailabilityByItem?.get(item.id) : undefined}
           standaloneCopy={standaloneReplies.has(row.key)}
           inTurnMenu={item.kind === "user_message" && turnMenuPrompts.has(item.id)}
+          failedTurnPrompt={item.kind === "error" ? turns.segments[turns.segmentOf.get(item.id) ?? -1]?.prompt : undefined}
           questionContext={item.kind === "question" && row.key === pinnedQuestionRow?.key &&
             questionContext?.questionInTimeline === true ? questionContext : undefined}
           approvalContext={item.kind === "permission" && item.resolvedOptionId === undefined &&
@@ -2128,6 +2163,7 @@ const TimelineRow = memo(function TimelineRow({
   editInForkAvailability,
   standaloneCopy = false,
   inTurnMenu = false,
+  failedTurnPrompt,
   highlightEligible = true,
   disclosureOpen = false,
   onDisclosureToggle,
@@ -2150,6 +2186,8 @@ const TimelineRow = memo(function TimelineRow({
   standaloneCopy?: boolean;
   /** A user message its settled turn's More Turn Actions already lists. */
   inTurnMenu?: boolean;
+  /** For an error: the prompt that opened its turn, which Retry Turn submits again. */
+  failedTurnPrompt?: UserMessageItem;
   highlightEligible?: boolean;
   disclosureOpen?: boolean;
   onDisclosureToggle?: () => void;
@@ -2257,14 +2295,10 @@ const TimelineRow = memo(function TimelineRow({
     case "stderr":
       return <AgentLogStep item={item} open={disclosureOpen} onToggle={onDisclosureToggle} />;
     case "error":
-      return <div className="tl-error">⚠ {item.message}</div>;
+      return <TurnFailedNotice message={item.message} prompt={failedTurnPrompt} />;
     case "turn_interrupted":
-      return (
-        <div className="tl-interrupted">
-          <span>Interrupted</span>
-          <ActivityTimestampMeta startedAt={item.createdAt} pointWhenEqual />
-        </div>
-      );
+      // The row shows only its turn's footer ("Stopped at …"); EventTimelineBody renders that.
+      return null;
     case "review_decision":
       return (
         <div className="tl-perm">
@@ -2833,6 +2867,46 @@ function UserMessageActions({ item, inTurnMenu, ...input }: MessageActionInput &
   );
 }
 
+/** Why Retry Turn cannot re-run a turn a provider command opened: the command is the composer's to
+ * invoke, with its own arguments and catalog revision. */
+export const RETRY_TURN_COMMAND_REASON = "Run the command again from the composer to retry this turn.";
+
+/** A failed turn, said once at the end of its turn (§13.2): a plain sentence from describeTurnError,
+ * Retry Turn to submit the turn's prompt again, and the provider's own words behind Show Details. */
+function TurnFailedNotice({ message, prompt }: { message: string; prompt?: UserMessageItem }) {
+  const retry = useContext(TurnRetryContext);
+  const reasonId = useId();
+  const raw = withoutPromptFailedPrefix(message);
+  const reason = prompt?.commandInvocation ? RETRY_TURN_COMMAND_REASON : retry?.unavailableReason;
+  const retrying = prompt !== undefined && retry?.pendingPromptId === prompt.id;
+  const actions = retry && prompt && (
+    <BusyButton
+      className="btn sm"
+      busy={retrying}
+      progress="Retrying the turn…"
+      disabled={reason !== undefined || (retry.pendingPromptId !== undefined && !retrying)}
+      aria-describedby={reason !== undefined ? reasonId : undefined}
+      onClick={() => retry.onRetry(prompt)}
+    >
+      Retry Turn
+    </BusyButton>
+  );
+  return (
+    <Notice
+      tone="danger"
+      title="Turn Failed"
+      actions={actions || undefined}
+      details={<div className="code-well"><pre>{raw}</pre></div>}
+    >
+      <p>{describeTurnError(message)}</p>
+      {actions && reason !== undefined && <p className="notice-meta" id={reasonId}>{reason}</p>}
+      {prompt !== undefined && retry?.error?.promptId === prompt.id && (
+        <p className="notice-meta" role="alert">Couldn't retry the turn: {retry.error.message}</p>
+      )}
+    </Notice>
+  );
+}
+
 /** "Started 12:25:38 AM, finished 12:26:04 AM (26s)": the exact span behind the footer's clock. The
  * duration is always finish minus start, so the three figures never contradict one another. */
 export function turnSpanDescription(summary: Pick<TurnFooterSummary, "startedAt" | "finishedAt">): string {
@@ -2893,7 +2967,9 @@ export function turnActions({ responseText, forkAvailability, onFork, forkTurn, 
  * turn's actions at the trailing end. More Turn Actions stays visible at rest on every pointer, so
  * every action, Rewind included, is found without hovering (#599); on a fine pointer, Copy Response
  * and a usable Fork After This Turn sit before it and show on hover or focus. */
-function TurnFooter({ summary, onFork, forkAvailability, prompt, ...messageInput }: MessageActionInput & {
+function TurnFooter({ summary, onFork, forkAvailability, prompt, alone = false, ...messageInput }: MessageActionInput & {
+  /** The footer is its row's only content (a stop's row), so the row gap already spaces it. */
+  alone?: boolean;
   summary: TurnFooterSummary;
   onFork?: (turn: number) => void;
   forkAvailability?: ConversationForkAvailability;
@@ -2903,8 +2979,9 @@ function TurnFooter({ summary, onFork, forkAvailability, prompt, ...messageInput
   const handoff = useContext(HandoffContext);
   const coarsePointer = useIsCoarsePointer();
   const tooltipId = useId();
-  const { forkTurn } = summary;
-  const clockAt = summary.finishedAt ?? summary.startedAt;
+  const { forkTurn, stopped } = summary;
+  // A stopped turn names when it stopped in place of when it finished.
+  const clockAt = stopped?.at ?? summary.finishedAt ?? summary.startedAt;
   const clock = formatClock(clockAt);
   const span = turnSpanDescription(summary);
   const usage = summary.usage ? turnUsageLabel(summary.usage, driver) : null;
@@ -2917,9 +2994,20 @@ function TurnFooter({ summary, onFork, forkAvailability, prompt, ...messageInput
     { label: "This Turn", actions },
   ];
   return (
-    <div className="tl-turn-footer" data-turn-footer={summary.turn ?? ""}>
+    <div className={alone ? "tl-turn-footer alone" : "tl-turn-footer"} data-turn-footer={summary.turn ?? ""}>
       {summary.turn !== undefined && <span className="tl-turn-label">Turn {summary.turn}</span>}
-      {clock && (
+      {stopped ? (
+        <span className="tl-turn-time tl-turn-stopped">
+          <StopTurnIcon size={14} aria-hidden="true" />
+          {clock ? (
+            <>
+              Stopped at{" "}
+              <time dateTime={new Date(clockAt!).toISOString()} aria-describedby={span ? tooltipId : undefined}>{clock}</time>
+            </>
+          ) : "Stopped"}
+          {clock && span && <span id={tooltipId} className="tl-tooltip" role="tooltip">{span}</span>}
+        </span>
+      ) : clock && (
         <span className="tl-turn-time">
           <time dateTime={new Date(clockAt!).toISOString()} aria-describedby={span ? tooltipId : undefined}>{clock}</time>
           {span && <span id={tooltipId} className="tl-tooltip" role="tooltip">{span}</span>}

@@ -568,7 +568,8 @@ export function ArrowDownIcon(props: IconProps) {
   return <LibraryIcon glyph={LucideArrowDown} {...props} />;
 }
 
-/** Filled to preserve the non-terminal turn interruption control. */
+/** Filled to preserve the non-terminal turn interruption control. A stopped turn's footer shows the
+ * same square, at 14px, beside "Stopped at …" (#2169). */
 export function StopTurnIcon(props: IconProps) {
   const { style, ...rest } = props;
   return (

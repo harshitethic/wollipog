@@ -89,7 +89,8 @@ import { StatusBadge } from "./StatusBadge.js";
 import { Notice } from "./Notice.js";
 import { sessionArchivedAtRest, statusMeta } from "../status-meta.js";
 import { shownWatchdogDelivery } from "../background-delivery-status.js";
-import { EventTimeline, TranscriptErrorAlert, type TimelineRevealRequest } from "./EventTimeline.js";
+import { EventTimeline, TranscriptErrorAlert, type TimelineRevealRequest, type TurnRetryControl } from "./EventTimeline.js";
+import { TURN_RETRY_IN_FLIGHT_REASON, turnRetryPlan } from "../turn-retry.js";
 import { ConversationHandoffDialog } from "./ConversationHandoffDialog.js";
 import { isTimelineSessionActive } from "../timeline-clock.js";
 import { RightPanel, type RightPanelState } from "./RightPanel.js";
@@ -3617,8 +3618,14 @@ function SessionDetailLoaded({
   // there; the Session Archived notice's Unarchive (and Restart) is the way back (#2301).
   const composerRestartOffered = session.status === "stopped" &&
     session.stopOperation?.status !== "stop_failed" && !session.archived;
+  // Retry Turn's restart and the composer's Restart share one guard: two restarts in flight would
+  // let the second replace the process the first started, interrupting the retried turn (#2169).
+  const turnRetryInFlightRef = useRef(false);
+  // More Actions → Restart Session in the header, which Retry Turn also waits for.
+  const [headerRestartPending, setHeaderRestartPending] = useState(false);
   const restartFromComposer = useCallback(async () => {
-    if (!composerRestartOffered || !runnerOnline || busy || restartPending || restartRefusal !== null) return;
+    if (!composerRestartOffered || !runnerOnline || busy || restartPending || restartRefusal !== null ||
+        turnRetryInFlightRef.current) return;
     const generation = viewGenerationRef.current;
     setError(null);
     setBusy(true);
@@ -3634,6 +3641,58 @@ function SessionDetailLoaded({
       }
     }
   }, [api, busy, composerRestartOffered, loadSession, restartPending, restartRefusal, runnerOnline, session.id]);
+  // Retry Turn on a failed turn's notice (#2169): the turn's prompt again, as a new turn. A failed
+  // or stopped session restarts first, since the control plane admits no prompt to it until then,
+  // but only where the restart resumes the provider conversation.
+  const retryPlan = turnRetryPlan({
+    status: session.status,
+    driver: session.driver,
+    runnerOnline,
+    promptRefusal,
+    restartRefusal,
+    sessionNoticeReason,
+    policyPaused,
+    stopFailed: session.stopOperation?.status === "stop_failed",
+    restarting: restartPending || headerRestartPending,
+  });
+  const [retryingTurnPromptId, setRetryingTurnPromptId] = useState<number>();
+  const [turnRetryError, setTurnRetryError] = useState<{ promptId: number; message: string }>();
+  const retryTurn = useCallback(async (prompt: Extract<TimelineItem, { kind: "user_message" }>) => {
+    // One retry at a time, decided synchronously: a second click before the pending state renders
+    // must not submit the prompt twice.
+    if (turnRetryInFlightRef.current || restartPending || headerRestartPending ||
+        retryPlan.kind === "unavailable") return;
+    turnRetryInFlightRef.current = true;
+    const generation = viewGenerationRef.current;
+    setTurnRetryError(undefined);
+    setRetryingTurnPromptId(prompt.id);
+    try {
+      // A refused restart throws here, so the prompt is never sent into a session that did not
+      // restart.
+      if (retryPlan.kind === "restart_then_prompt") loadSession(await api.restart(session.id));
+      // The accepted prompt's session (queued or running) is loaded before the guard opens, so the
+      // button cannot offer the same prompt again while the socket's update is still on its way.
+      // A model or effort chosen since the failure travels with the prompt, as Send's does, so the
+      // turn never starts on the previous selection while that change is still being saved.
+      const cfg = Object.keys(pendingConfig.current).length ? pendingConfig.current : undefined;
+      loadSession(await api.prompt(session.id, prompt.text, prompt.images ?? [], cfg));
+      pendingConfig.current = {};
+    } catch (cause) {
+      if (viewGenerationRef.current === generation) {
+        setTurnRetryError({ promptId: prompt.id, message: (cause as Error).message });
+      }
+    } finally {
+      turnRetryInFlightRef.current = false;
+      if (viewGenerationRef.current === generation) setRetryingTurnPromptId(undefined);
+    }
+  }, [api, headerRestartPending, loadSession, restartPending, retryPlan.kind, session.id]);
+  const retryPlanReason = retryPlan.kind === "unavailable" ? retryPlan.reason : undefined;
+  const turnRetry = useMemo<TurnRetryControl>(() => ({
+    onRetry: (prompt) => void retryTurn(prompt),
+    ...(retryPlanReason !== undefined ? { unavailableReason: retryPlanReason } : {}),
+    ...(retryingTurnPromptId !== undefined ? { pendingPromptId: retryingTurnPromptId } : {}),
+    ...(turnRetryError ? { error: turnRetryError } : {}),
+  }), [retryTurn, retryPlanReason, retryingTurnPromptId, turnRetryError]);
   const failedSetupWorktree = session.worktrees?.find((worktree) => worktree.setup?.status === "failed");
   const { creation: recoveryCreation, create: createRecoveryWorktreeWithProgress } =
     useRecoveryWorktreeCreation({ api, session, onSession: loadSession });
@@ -5475,6 +5534,9 @@ function SessionDetailLoaded({
             <MoveToWorkspaceDialog session={session} onClose={onClose} returnFocusRef={returnFocusRef} />
           )}
           topbarControls={topbarControls}
+          restartBlockedReason={retryingTurnPromptId !== undefined ? TURN_RETRY_IN_FLIGHT_REASON : undefined}
+          onRestartPendingChange={setHeaderRestartPending}
+          onRestarted={loadSession}
           activeSubagents={activeWorkerCount ? {
             count: activeWorkerCount,
             workers: true,
@@ -5786,6 +5848,7 @@ function SessionDetailLoaded({
                       rewindUnavailableReason={rewindUnavailableReason}
                       onFork={mode === "expanded" ? onFork : undefined}
                       handoff={mode === "expanded" ? handoffControls : undefined}
+                      turnRetry={mode === "expanded" ? turnRetry : undefined}
                       onEditAndResend={mode === "expanded" ? openResendAction : undefined}
                       editAndResendUnavailableReason={promptUnavailableReason ?? undefined}
                       onEditInFork={mode === "expanded" ? openForkEditAction : undefined}
@@ -6408,7 +6471,8 @@ function SessionDetailLoaded({
                       className="send-btn"
                       onPointerDown={(e) => e.preventDefault()}
                       onClick={() => void restartFromComposer()}
-                      disabled={!runnerOnline || composerRequestBusy || restartRefusal !== null}
+                      disabled={!runnerOnline || composerRequestBusy || restartRefusal !== null ||
+                        retryingTurnPromptId !== undefined}
                       title={restartPending ? "Restarting Session" : restartRefusal ?? "Restart Session"}
                       aria-label={restartPending ? "Restarting Session" : "Restart Session"}
                     >
