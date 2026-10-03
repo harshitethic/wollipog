@@ -611,7 +611,7 @@ test("rename-session retry preserves deliberate focus movement and keeps failure
 test("phone rename retry reveals the idle composer before restoring keyboard focus", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const composer = page.locator(".composer-input");
-  const preview = page.getByRole("button", { name: /^Edit Message:/ });
+  const preview = page.locator(".composer-idle-preview");
   await expect(preview).toBeVisible();
   await preview.click();
   await page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.deferNextRetitle());
@@ -642,7 +642,7 @@ test("phone rename retry reveals the idle composer before restoring keyboard foc
 test("wrapped composer errors stay in the composer while status receipts stay in the transcript at responsive widths", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const composer = page.locator(".composer-input");
-  await page.getByRole("button", { name: /^Edit Message:/ }).click();
+  await page.locator(".composer-idle-preview").click();
   await page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.deferNextRetitle());
   await composer.fill("/rename-session");
   await page.getByRole("button", { name: "Send" }).click();
