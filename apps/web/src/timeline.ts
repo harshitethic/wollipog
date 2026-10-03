@@ -15,6 +15,7 @@ import type {
   SessionCommandExecutionMode,
   SessionEvent,
   WorkflowArtifactView,
+  QuestionAnswerSummaryEntry,
   StructuredRequestResolutionReason,
 } from "@wollipog/protocol";
 
@@ -199,12 +200,21 @@ export type TimelineItem =
       kind: "question";
       id: number;
       requestId: string;
+      /** The runner's identity for this exact use of the request id. */
+      occurrenceId?: string;
       questions: AgentQuestion[];
+      /** When the agent asked. */
+      createdAt?: number;
       /** undefined = still pending; true = answered; false = dismissed. */
       answered?: boolean;
       answeredByPolicies?: string[];
       resolutionReason?: StructuredRequestResolutionReason;
       resolvedByParentSessionId?: string;
+      /** What was answered (#2188), recorded on the runner's resolution. Absent for a dismissal and
+       * for an answer an older runner or control plane recorded. */
+      answers?: QuestionAnswerSummaryEntry[];
+      /** When it was answered or otherwise resolved. */
+      resolvedAt?: number;
     }
   /** A content-safe policy-hook outcome. Current histories use the runner event sequence as `id`;
    * legacy histories synthesize a negative id from the audit and anchor it chronologically. */
@@ -1254,7 +1264,14 @@ export class TimelineBuilder {
       case "question_request": {
         this.breakText();
         const i =
-          this.items.push({ kind: "question", id: ev.seq, requestId: p.requestId, questions: p.questions }) - 1;
+          this.items.push({
+            kind: "question",
+            id: ev.seq,
+            requestId: p.requestId,
+            ...(p.occurrenceId ? { occurrenceId: p.occurrenceId } : {}),
+            questions: p.questions,
+            ...(Number.isFinite(ev.ts) ? { createdAt: ev.ts } : {}),
+          }) - 1;
         this.permIndex.set(p.requestId, i);
         this.markDirty(i);
         break;
@@ -1275,14 +1292,30 @@ export class TimelineBuilder {
         // An async answer can start the next provider turn with no prompt or checkpoint
         // (turn-progress.ts reads the same boundary).
         if (p.startsTurn) this.endTurnPlan();
-        const idx = this.permIndex.get(p.requestId);
+        let idx = this.permIndex.get(p.requestId);
+        // A provider may reuse a request id; the runner's occurrence names the exact question. A
+        // resolution never lands on a question that names a different occurrence, even when its own
+        // question lies outside the loaded history.
+        const candidateOccurrence = idx != null ? (this.items[idx] as { occurrenceId?: string }).occurrenceId : undefined;
+        if (p.occurrenceId && candidateOccurrence !== undefined && candidateOccurrence !== p.occurrenceId) {
+          idx = undefined;
+          for (let index = this.items.length - 1; index >= 0; index -= 1) {
+            const item = this.items[index]!;
+            if (item.kind === "question" && item.requestId === p.requestId && item.occurrenceId === p.occurrenceId) {
+              idx = index;
+              break;
+            }
+          }
+        }
         if (idx != null && this.items[idx]!.kind === "question") {
           const it = this.items[idx] as Extract<TimelineItem, { kind: "question" }>;
           this.items[idx] = { ...it, answered: p.answered, resolutionReason: p.resolutionReason,
             ...(p.resolvedByParentSessionId
               ? { resolvedByParentSessionId: p.resolvedByParentSessionId }
               : {}),
-            ...(!p.answered ? { answeredByPolicies: undefined } : {}) };
+            ...(Number.isFinite(ev.ts) ? { resolvedAt: ev.ts } : {}),
+            ...(p.answered && p.answers ? { answers: p.answers } : {}),
+            ...(!p.answered ? { answeredByPolicies: undefined, answers: undefined } : {}) };
           this.markDirty(idx);
         }
         break;

@@ -99,7 +99,15 @@ const EVERY_PAYLOAD = {
     requestId: "QUESTION_ID_LEAK",
     questions: [{ id: "ANSWER_KEY_LEAK", question: "QUESTION_TEXT_LEAK", options: [] }],
   },
-  question_resolved: { kind: "question_resolved", requestId: "QUESTION_RESOLUTION_LEAK", answered: true },
+  question_resolved: {
+    kind: "question_resolved",
+    requestId: "QUESTION_RESOLUTION_LEAK",
+    answered: true,
+    answers: [
+      { questionId: "ANSWERED_KEY_LEAK", selected: ["ANSWERED_LABEL_LEAK"] },
+      { questionId: "ANSWERED_TEXT_KEY_LEAK", text: "ANSWERED_TEXT_LEAK" },
+    ],
+  },
   question_policy_answered: { kind: "question_policy_answered", requestId: "POLICY_REQUEST_LEAK", policies: [{ policyId: "POLICY_LEAK", name: "POLICY_NAME_LEAK" }] },
   checkpoint: { kind: "checkpoint", turn: 1, tree: "CHECKPOINT_TREE_LEAK" },
   checkpoint_restored: { kind: "checkpoint_restored", turn: 2 },

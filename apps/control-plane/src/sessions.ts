@@ -32,6 +32,9 @@ import { type PolicyRule, type PolicyRuleKind, type RunnerGuardrailKind,
   runnerSupportsProtocol,
   validatePromptImageInputs,
   validatePromptImages,
+  summarizeQuestionAnswers,
+  type AgentQuestion,
+  type QuestionAnswerSummaryEntry,
   validateQuestionAnswers,
   worktreeRecoveryAction,
   HUMAN_ONLY_PARENT_CONTROL_POLICY,
@@ -9393,6 +9396,7 @@ export class SessionsService {
     const invalid = validateQuestionAnswers(pending.questions ?? [], answers, action);
     if (invalid) return fail(`invalid answers: ${invalid}`, 400);
     const auditContent = questionAuditContent(pending, answers);
+    const answerSummary = action === "submit" ? this.questionAnswerSummary(sessionId, pending.questions ?? [], answers) : undefined;
 
     if ((pending.async || pending.recoveryReason === "provider_restart") && action === "submit") {
       if (!pending.async && pending.ownerToolUseId) {
@@ -9420,6 +9424,7 @@ export class SessionsService {
         recoveryId: pending.recoveryId,
         answers,
         ...(resolvedByParentSessionId ? { resolvedByParentSessionId } : {}),
+        ...(answerSummary ? { answerSummary } : {}),
       };
       const now = Date.now();
       try {
@@ -9471,6 +9476,7 @@ export class SessionsService {
     const sent = this.hub.sendToRunner(session.runnerId, {
       type: "answer_question", sessionId, requestId, answers, action,
       ...(pending.occurrenceId ? { occurrenceId: pending.occurrenceId } : {}),
+      ...(answerSummary ? { answerSummary } : {}),
       ...(resolvedByParentSessionId ? { resolvedByParentSessionId } : {}),
     });
     if (!sent) {
@@ -9510,6 +9516,24 @@ export class SessionsService {
     this.hub.sessionChangedById(sessionId);
     this.publishCampaignAttentionTransition(campaignBefore);
     return ok(this.db.getSession(sessionId)!);
+  }
+
+  /** What was answered (#2188), content-safe, for the runner to record on this answer's
+   * resolution. Free text is redacted like transcript text, and secret and email answers keep no
+   * content. The governance audit stays digest-only. A summary that cannot be built never holds
+   * up the answer: the row then reads "Answered" without it. */
+  private questionAnswerSummary(
+    sessionId: string,
+    questions: readonly AgentQuestion[],
+    answers: Record<string, string | string[]>,
+  ): QuestionAnswerSummaryEntry[] | undefined {
+    try {
+      const sensitivePaths = this.db.sessionSensitivePaths(sessionId);
+      return summarizeQuestionAnswers(questions, answers, (text) => redactOperationalTranscriptText(text, sensitivePaths));
+    } catch (error) {
+      this.log.warn(`question answer summary not built for ${sessionId}: ${(error as Error).message}`);
+      return undefined;
+    }
   }
 
   approve(
@@ -12812,9 +12836,11 @@ export class SessionsService {
       }
       const automatic = questionPolicyAnswers(payload.questions, this.db.listGovernancePolicies(), this.db.sessionOwnerUser(sessionId), session);
       if (automatic) {
+        const policySummary = this.questionAnswerSummary(sessionId, payload.questions, automatic.answers);
         const sent = this.hub.sendToRunner(session.runnerId, {
           type: "answer_question", sessionId, requestId: approval.requestId,
           answers: automatic.answers, action: "submit",
+          ...(policySummary ? { answerSummary: policySummary } : {}),
         });
         for (const policy of automatic.policies) {
           this.recordGovernanceAudit(session, approval, "policy_decision", sent ? "answered" : "delivery_failed",
@@ -13500,7 +13526,8 @@ export class SessionsService {
     if (event.payload.kind !== "question_request") return null;
     const stored = this.db.questionPolicyAnswer(event);
     if (!stored) return null;
-    return this.db.appendEvent(event.sessionId, { ...stored.payload, questionEventSeq: event.seq }, stored.timestamp);
+    return this.db.appendEvent(event.sessionId, { ...stored.payload, questionEventSeq: event.seq }, stored.timestamp,
+      { restored: true });
   }
 
   private settleHydratedAsk(sessionId: string, trailingAsk: PendingApproval | null): void {

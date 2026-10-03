@@ -20898,6 +20898,9 @@ export class ControlPlaneDb {
       artifactIds?: readonly string[];
       /** Only a live runner event may correlate this delivery with a future trailing idle. */
       armBackgroundStatusSettlement?: boolean;
+      /** A control-plane event restored at its original time after a history cache reset; it
+       * never moves the session's last activity backward. */
+      restored?: boolean;
     },
   ): SessionEvent {
     if (options?.runnerSeq !== undefined &&
@@ -20978,6 +20981,11 @@ export class ControlPlaneDb {
             "UPDATE sessions SET last_event_at=?, message_count=COALESCE(message_count,0)+1, preview=? WHERE id=?",
           )
           .run(ts, next, sessionId);
+      } else if (options?.restored) {
+        this.stmt(
+            "UPDATE sessions SET last_event_at=MAX(COALESCE(last_event_at, ?), ?), message_count=COALESCE(message_count,0)+1 WHERE id=?",
+          )
+          .run(ts, ts, sessionId);
       } else {
         this.stmt(
             "UPDATE sessions SET last_event_at=?, message_count=COALESCE(message_count,0)+1 WHERE id=?",

@@ -620,7 +620,12 @@
 //      through the runner's existing `gh` login, and the runner answers with status data only.
 //      Older runners are never asked; their campaigns show `unavailable{runner_unsupported}`.
 // 199: revision-aware historical cost corrections survive runner replay and reconnect.
-export const PROTOCOL_VERSION = 199;
+// 200: answer summaries (#2188): the control plane sends a content-safe `answerSummary` with
+//      `answer_question` and `answer_recovered_question`, and the runner records it as `answers`
+//      on the `question_resolved` it emits for exactly that request. Secret and email answers keep
+//      no content. Additive + optional: older runners ignore the field and older control planes
+//      send none, so the transcript row shows its status without an answer.
+export const PROTOCOL_VERSION = 200;
 export const PROJECT_MEMORY_MIN_PROTOCOL = 195;
 /** Only Claude versions whose directory override we have verified are advertised as supported.
  * Codex native memory combines projects in a database and cannot be shared project by project. */
@@ -3872,6 +3877,69 @@ export function validateQuestionAnswers(
   return null;
 }
 
+/** The most free text a stored answer summary keeps (#2188). */
+export const QUESTION_ANSWER_SUMMARY_TEXT_MAX_LENGTH = 500;
+
+/**
+ * One question's answer as the session event log keeps it (#2188). Chosen option labels are kept:
+ * they are the agent's own offered labels. Free text is kept only for a question that is neither
+ * `secret` nor an `email` field, redacted like transcript text and bounded; otherwise `withheld`
+ * records that an answer was given without its content. A `secret` question keeps nothing but that.
+ */
+export interface QuestionAnswerSummaryEntry {
+  /** The answered `AgentQuestion.id`, verbatim. */
+  questionId: string;
+  /** The offered option labels chosen, in submitted order. */
+  selected?: string[];
+  /** Free text, redacted and bounded to `QUESTION_ANSWER_SUMMARY_TEXT_MAX_LENGTH` characters. */
+  text?: string;
+  /** The stored text was cut at the bound. */
+  truncated?: true;
+  /** An answer was given and deliberately not stored. */
+  withheld?: true;
+}
+
+/**
+ * Build the stored summary of a validated answer map, one entry per answered question in question
+ * order. `redact` is the transcript redaction the control plane applies to free text before it is
+ * bounded, so a credential that straddles the bound is still caught whole.
+ */
+export function summarizeQuestionAnswers(
+  questions: readonly AgentQuestion[],
+  answers: Readonly<Record<string, string | string[]>>,
+  redact: (text: string) => string = (text) => text,
+): QuestionAnswerSummaryEntry[] {
+  const entries: QuestionAnswerSummaryEntry[] = [];
+  for (const question of questions) {
+    if (!Object.hasOwn(answers, question.id)) continue;
+    const value = answers[question.id];
+    const questionId = question.id;
+    if (question.secret) {
+      entries.push({ questionId, withheld: true });
+      continue;
+    }
+    const offered = new Set(question.options.map((option) => option.label));
+    if (Array.isArray(value)) {
+      entries.push({ questionId, selected: value.filter((label) => typeof label === "string" && offered.has(label)) });
+      continue;
+    }
+    if (typeof value !== "string") continue;
+    if (offered.has(value)) {
+      entries.push({ questionId, selected: [value] });
+      continue;
+    }
+    if (question.inputFormat === "email") {
+      entries.push({ questionId, withheld: true });
+      continue;
+    }
+    const characters = Array.from(redact(value));
+    entries.push(characters.length > QUESTION_ANSWER_SUMMARY_TEXT_MAX_LENGTH
+      ? { questionId, text: characters.slice(0, QUESTION_ANSWER_SUMMARY_TEXT_MAX_LENGTH).join(""), truncated: true }
+      : { questionId, text: characters.join("") });
+  }
+  return entries;
+}
+
 export type ApprovalKind =
   | "permission"
   | "authentication"
@@ -5006,6 +5074,10 @@ export type SessionEventPayload =
       resolvedByParentSessionId?: string;
       /** Durable recovery-command identity when provider continuation replaced a lost callback. */
       commandId?: string;
+      /** What was answered (#2188): the control plane's content-safe summary, delivered with the
+       * answer and recorded by the runner for exactly this request. Absent for a dismissal and from
+       * older runners and control planes. Shared transcripts exclude it like every question event. */
+      answers?: QuestionAnswerSummaryEntry[];
     }
   | { kind: "checkpoint"; turn: number; tree: string }
   | { kind: "checkpoint_restored"; turn: number }
@@ -8394,6 +8466,8 @@ export interface AnswerRecoveredQuestionCommand {
   answers: Record<string, string | string[]>;
   /** Present only for a delegated descendant resolution authorized by the control plane. */
   resolvedByParentSessionId?: string;
+  /** v200: the content-safe summary the runner records on this answer's `question_resolved`. */
+  answerSummary?: QuestionAnswerSummaryEntry[];
 }
 
 /** Attempt to incorporate direct input or one existing queue item into the exact active turn.
@@ -8687,6 +8761,8 @@ export interface AnswerQuestionMessage {
   action?: "submit" | "dismiss";
   /** Present only for a delegated descendant resolution authorized by the control plane. */
   resolvedByParentSessionId?: string;
+  /** v200: the content-safe summary the runner records on this answer's `question_resolved`. */
+  answerSummary?: QuestionAnswerSummaryEntry[];
 }
 
 /** Restore a worktree session's FILES to the checkpoint taken before `turn` (T3-style rewind).

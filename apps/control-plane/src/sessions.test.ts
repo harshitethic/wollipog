@@ -4090,6 +4090,7 @@ test("opt-in Parent Control resolves exact nested request occurrences with agent
     assert.deepEqual(deliveredAnswer, {
       type: "answer_question", sessionId: grandchild.id, requestId: "provider-reused-id",
       answers: { q: "Continue" }, action: "submit", resolvedByParentSessionId: parent.data.id,
+      answerSummary: [{ questionId: "q", selected: ["Continue"] }],
     });
     assert.equal(svc.resolveDescendantRequest(parent.data.id, grandchild.id, questionOccurrence, {
       action: "dismiss",
@@ -6561,6 +6562,8 @@ test("question policy answers avoid input state, record provenance, and survive 
   assert.equal(audit?.governancePolicyId, "routine");
   assert.equal(JSON.stringify(audit).includes("Proceed"), false);
   assert.ok(db.listEvents(id).some((event) => event.payload.kind === "question_policy_answered"));
+  assert.deepEqual(hub.sentOfType("answer_question").at(-1)?.answerSummary, [{ questionId: "q", selected: ["Proceed"] }],
+    "a policy answer carries what it answered to the runner (#2188)");
   svc.onSessionEvent(id, { kind: "question_resolved", requestId: "ask", answered: true });
   db.clearSessionEvents(id);
   db.reconcileRunnerHistory(id, 1, 3);
@@ -12558,6 +12561,117 @@ test("governance audit records permission request and device resolution without 
   assert.equal(db.getSession(id)!.pendingApproval, null);
 });
 
+test("an answer carries its content-safe summary to the runner, and the audit stays digest-only (#2188)", () => {
+  const { db, hub, svc } = makeHarness();
+  const id = seedSession(svc, hub);
+  svc.onSessionEvent(id, {
+    kind: "question_request",
+    requestId: "ask-summary",
+    occurrenceId: "request_ask_summary",
+    questions: [
+      { id: "destination", header: "Destination", question: "Where should this deploy?",
+        options: [{ label: "Destination 1 (Production)" }, { label: "Destination 2 (Staging)" }] },
+      { id: "checks", question: "Which checks?", multiSelect: true,
+        options: [{ label: "Unit Tests" }, { label: "Browser Tests" }, { label: "Smoke Test" }] },
+      { id: "note", question: "Anything else?", options: [], allowOther: true, required: false },
+      { id: "token", question: "Paste the token.", options: [], allowOther: true, secret: true },
+      { id: "email", question: "Who should be notified?", options: [], allowOther: true, inputFormat: "email" as const },
+    ],
+  });
+  const note = `Use TOKEN=super-secret-note then ${"x".repeat(600)}`;
+  assert.ok(svc.answerQuestion(id, "ask-summary", {
+    destination: "Destination 1 (Production)",
+    checks: ["Unit Tests", "Smoke Test"],
+    note,
+    token: "TOP-SECRET-VALUE",
+    email: "person@example.com",
+  }, { kind: "human", id: "device-7" }, "submit").ok);
+
+  const summary = hub.sentOfType("answer_question").at(-1)!.answerSummary!;
+  assert.deepEqual(summary.slice(0, 2), [
+    { questionId: "destination", selected: ["Destination 1 (Production)"] },
+    { questionId: "checks", selected: ["Unit Tests", "Smoke Test"] },
+  ]);
+  assert.equal(summary[2]!.questionId, "note");
+  assert.equal(summary[2]!.truncated, true);
+  assert.equal(Array.from(summary[2]!.text!).length, 500);
+  assert.ok(summary[2]!.text!.startsWith("Use TOKEN="));
+  assert.equal(summary[2]!.text!.includes("super-secret-note"), false, "free text passes through transcript redaction");
+  assert.deepEqual(summary.slice(3), [{ questionId: "token", withheld: true }, { questionId: "email", withheld: true }]);
+  assert.equal(JSON.stringify(summary).includes("TOP-SECRET-VALUE"), false, "a secret answer is never in the summary");
+  assert.equal(JSON.stringify(summary).includes("person@example.com"), false, "an email answer is never in the summary");
+  assert.equal(JSON.stringify(db.listEvents(id)).includes("TOP-SECRET-VALUE"), false, "the control plane logs no answer");
+
+  // The runner records the summary on its resolution of exactly this request.
+  svc.onSessionEvent(id, { kind: "question_resolved", requestId: "ask-summary", occurrenceId: "request_ask_summary",
+    answered: true, resolutionReason: "submitted", answers: summary });
+  const resolved = db.listEvents(id).find((event) => event.payload.kind === "question_resolved")!;
+  assert.deepEqual(resolved.payload.kind === "question_resolved" ? resolved.payload.answers : null, summary);
+
+  const audit = svc.governanceAudit(id).filter((entry) => entry.requestId === "ask-summary");
+  assert.deepEqual(audit.map((entry) => [entry.stage, entry.outcome]), [["request", "pending"], ["resolution", "answered"]]);
+  assert.match(audit[1]!.contentDigest ?? "", /^[a-f0-9]{64}$/);
+  const auditJson = JSON.stringify(audit);
+  for (const answer of ["Destination 1 (Production)", "Smoke Test", "super-secret-note", "TOP-SECRET-VALUE", "person@example.com"]) {
+    assert.equal(auditJson.includes(answer), false, `the audit keeps only a digest of ${answer}`);
+  }
+});
+
+test("a recovered async answer carries its summary in the durable command (#2188)", () => {
+  const { db, hub, svc } = makeHarness();
+  const id = seedSession(svc, hub);
+  svc.onSessionEvent(id, { kind: "question_request", requestId: "async-ask", occurrenceId: "request_async_ask", async: true,
+    questions: [{ id: "q", question: "Go?", options: [{ label: "Yes" }, { label: "No" }] }] });
+  assert.ok(svc.answerQuestion(id, "async-ask", { q: "No" }, undefined, "submit", undefined, "request_async_ask").ok);
+  const command = hub.sentOfType("durable_session_command").at(-1)!.command;
+  assert.equal(command.type, "answer_recovered_question");
+  assert.deepEqual(command.type === "answer_recovered_question" ? command.answerSummary : null,
+    [{ questionId: "q", selected: ["No"] }]);
+  assert.equal(db.listEvents(id).some((event) => event.payload.kind === "question_resolved"), false,
+    "the runner, not the control plane, records the resolution");
+});
+
+test("a dismissed question sends no answer summary (#2188)", () => {
+  const { hub, svc } = makeHarness();
+  const id = seedSession(svc, hub);
+  svc.onSessionEvent(id, {
+    kind: "question_request", requestId: "ask-dismiss",
+    questions: [{ id: "q", question: "Continue?", options: [{ label: "Yes" }, { label: "No" }] }],
+  });
+  assert.ok(svc.answerQuestion(id, "ask-dismiss", {}, undefined, "dismiss").ok);
+  assert.equal(hub.sentOfType("answer_question").at(-1)!.answerSummary, undefined);
+  assert.deepEqual(svc.governanceAudit(id).map((entry) => [entry.stage, entry.outcome]),
+    [["request", "pending"], ["resolution", "dismissed"]]);
+});
+
+test("restoring a policy attribution never moves the session's last activity backward (#2188)", async () => {
+  const { db, hub, svc } = makeHarness();
+  const created = svc.createSession({ runnerId: RUNNER_ID, workspaceId: WORKSPACE_ID, agentId: AGENT_ID }, undefined,
+    { organizationId: db.localIdentityContext().organizationId, owner: { kind: "user", userId: db.localIdentityContext().userId } });
+  assert.ok(created.ok && created.data);
+  const id = created.data.id;
+  db.updateSessionStatus(id, "running", Date.now());
+  assert.ok(svc.upsertGovernancePolicy({ policyId: "routine", name: "Routine Review", enabled: true, effect: "allow", priority: 1,
+    ownerUserId: db.localIdentityContext().userId, scope: {}, questionRule: { headerPattern: "Review", answer: { option: "Proceed" } } }).ok);
+  const request = { kind: "question_request" as const, requestId: "ask", questions: [{ id: "q", header: "Review", question: "Continue?", options: [{ label: "Proceed" }] }] };
+  db.reconcileRunnerHistory(id, 1, 1);
+  svc.onSessionEvent(id, request, 1, 100);
+  const attributedAt = db.listEvents(id).find((event) => event.payload.kind === "question_policy_answered")!.ts;
+  const laterMessage = attributedAt + 60_000;
+  db.clearSessionEvents(id);
+  db.reconcileRunnerHistory(id, 1, 3);
+  hub.requestHandler = (msg) => ({ type: "session_history_page_result", requestId: "requestId" in msg ? msg.requestId! : "history",
+    sessionId: id, ok: true, events: [
+      { seq: 1, ts: 100, payload: request },
+      { seq: 2, ts: attributedAt + 1, payload: { kind: "question_resolved", requestId: "ask", answered: true } },
+      { seq: 3, ts: laterMessage, payload: { kind: "agent_message", text: "Done.", final: true } },
+    ],
+    page: { logEpoch: 1, throughSeq: 3, nextAfterSeq: 3, hasMore: false } });
+  await svc.hydrateHistory(id);
+  assert.equal(db.listEvents(id).filter((event) => event.payload.kind === "question_policy_answered").length, 1);
+  assert.equal(db.getSession(id)?.lastEventAt, laterMessage);
+});
+
 test("governance audit records explicit cancellation as dismissed", () => {
   const { hub, svc } = makeHarness();
   const id = seedSession(svc, hub);
@@ -14314,6 +14428,7 @@ test("an explicit empty question submission remains distinct from dismissal", ()
     requestId: "optional-form",
     answers: {},
     action: "submit",
+    answerSummary: [],
   });
 });
 
@@ -14447,6 +14562,7 @@ test("resumable recovered answers persist one deterministic command before clear
     requestId: "resumable-recovered-question",
     recoveryId: "question:1:12",
     answers: { target: "Production" },
+    answerSummary: [{ questionId: "target", selected: ["Production"] }],
   });
 
   hub.sentToRunner.length = 0;
