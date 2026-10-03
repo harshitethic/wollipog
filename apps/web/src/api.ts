@@ -1,4 +1,6 @@
 import type {
+  CampaignWorkItemDetailResponse,
+  CampaignWorkItemsPage,
   AddBoxRequest,
   BackgroundJobStopResponse,
   SessionWorktreeCreateOperationSummary,
@@ -1063,6 +1065,14 @@ export function createApiClient(transport: ApiTransport) {
   descendantRequests: (id: string, signal?: AbortSignal) =>
     req<DescendantRequestsView>(
       `/api/sessions/${encodeURIComponent(id)}/descendant-requests`,
+      { signal },
+    ),
+  /** Campaign Status (#2417). `id` may be the campaign root session or any member. */
+  campaignWorkItems: (id: string, query: string, signal?: AbortSignal) =>
+    req<CampaignWorkItemsPage>(`/api/sessions/${encodeURIComponent(id)}/campaign/work-items?${query}`, { signal }),
+  campaignWorkItem: (id: string, itemId: string, signal?: AbortSignal) =>
+    req<CampaignWorkItemDetailResponse>(
+      `/api/sessions/${encodeURIComponent(id)}/campaign/work-items/${encodeURIComponent(itemId)}`,
       { signal },
     ),
   childSessions: (id: string, eventEpoch: number, after = 0, limit = 50) => {
