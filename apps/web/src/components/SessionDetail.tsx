@@ -157,7 +157,7 @@ import {
   type ConversationForkAvailability,
   type EditInForkAvailability,
 } from "../session-actions.js";
-import { SessionApprovalRegion, standaloneApprovalForReview } from "./SessionApproval.js";
+import { SessionApprovalRegion, focusSessionRequest, standaloneApprovalForReview } from "./SessionApproval.js";
 import {
   requestTypeLabel,
   sessionRequestPanelKey,
@@ -3995,6 +3995,27 @@ function SessionDetailLoaded({
     showKeyHints: !isMobile,
   }), [handlePendingQuestionAvailabilityChange, isMobile, loadSession, questionInTimeline, runnerOnline,
     session.id, timelinePendingQuestion]);
+  // The working line's Review moves focus to the request blocking the turn, wherever it can be
+  // answered: its transcript row when the transcript owns that request (revealed like a step, since
+  // the virtual list may not have it mounted), else a request card outside the transcript, else
+  // the Agents panel, which lists every pending request (a worker's beside an async question).
+  const reviewPendingRequest = useCallback((requestId: string) => {
+    const transcriptOwnsRequest = requestId === pendingQuestion?.requestId
+      ? questionInTimeline
+      : requestId === timelineApprovalRequestId && ownApprovalHasTimelineRow;
+    for (let index = items.length - 1; transcriptOwnsRequest && index >= 0; index -= 1) {
+      const item = items[index]!;
+      if ((item.kind === "permission" && item.requestId === requestId && item.resolvedOptionId === undefined) ||
+          (item.kind === "question" && item.requestId === requestId && item.answered === undefined)) {
+        revealCurrentOperation(item.id);
+        return;
+      }
+    }
+    if (focusSessionRequest(session.id, requestId)) return;
+    rightPanel.show("subagents");
+    navigate({ name: "session", id: session.id, attention: { eventEpoch: session.eventEpoch ?? 0, requestId } });
+  }, [items, navigate, ownApprovalHasTimelineRow, pendingQuestion?.requestId, questionInTimeline,
+    revealCurrentOperation, rightPanel, session.eventEpoch, session.id, timelineApprovalRequestId]);
   const timelineApprovalContext = useMemo(() => timelineApprovalRequestId && ownApprovalHasTimelineRow ? {
       sessionId: session.id,
       requestId: timelineApprovalRequestId,
@@ -5493,6 +5514,7 @@ function SessionDetailLoaded({
                       progress={activeTurnProgress}
                       onRevealCurrentOperation={revealCurrentOperation}
                       onOpenSubagent={mode === "expanded" ? openSubagent : undefined}
+                      onReviewPendingRequest={reviewPendingRequest}
                     />
                   )}
                   {transcript.body === "timeline" && standaloneRequestCard}
