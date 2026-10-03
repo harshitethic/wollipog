@@ -1,4 +1,5 @@
 import { normalizeIssueClosureSnapshot, issueClosureActiveChildren } from "./github-issue-closure.js";
+import { normalizeReconciledSnapshot, reconciliationDeltaUsd, reconciliationRevision } from "./claude-cost-reconciliation.js";
 import type { GithubIssueClosureRequest, GithubIssueClosureResult } from "@wollipog/protocol";
 /**
  * Session orchestration: the control-plane brain that turns UI commands into
@@ -12496,6 +12497,9 @@ export class SessionsService {
           type: "priced_session_cost",
           sessionId,
           costUsd: this.db.sessionCostUsd(sessionId),
+          ...(runnerSupportsProtocol(this.db.getRunner(session.runnerId)?.protocolVersion, "costReconciliation") && reconciliationRevision(this.db, sessionId) > 0
+            ? { costReconciliationRevision: reconciliationRevision(this.db, sessionId),
+              costReconciliationDeltaUsd: reconciliationDeltaUsd(this.db, sessionId) } : {}),
         });
       }
       // Guardrail card gate: pause + ask once a policy rule trips. A v47 runner independently
@@ -13128,6 +13132,8 @@ export class SessionsService {
     // and ownership checks are refreshed after yielding, so UI actions remain authoritative.
     for (let offset = 0; offset < snapshots.length; offset += 32) {
       const chunk = snapshots.slice(offset, offset + 32);
+      const unsupportedCostSessions = new Set(chunk.filter((snap) =>
+        this.unsupportedCostReconciliation(runnerId, snap)).map((snap) => snap.id));
       const stopIntentIds = new Set(this.db.sessionStopIntentIds(runnerId));
       // Retained terminal sessions dominate reconnect snapshots. Their reconciliation is normally
       // read-only outside updateSessionFromSnapshot, but committing every unchanged row separately
@@ -13135,7 +13141,7 @@ export class SessionsService {
       // Batch only sessions with no stop, workflow-decision, hook, or policy-resume obligations;
       // everything with live service-level work remains on the exact per-session path below.
       const terminalBatch = chunk.flatMap((snap, snapshotIndex) => {
-        if (!isTerminal(snap.status) || duplicateSnapshotIds.has(snap.id) ||
+        if (unsupportedCostSessions.has(snap.id) || !isTerminal(snap.status) || duplicateSnapshotIds.has(snap.id) ||
             stopIntentIds.has(snap.id) || this.db.isTombstoned(snap.id) || changedSinceInventory(snap.id)) return [];
         const existing = this.db.getSession(snap.id);
         if (!existing || existing.runnerId !== runnerId || !isTerminal(existing.status) ||
@@ -13150,6 +13156,7 @@ export class SessionsService {
       const terminalBatchIndexes = new Set(terminalBatch.map(({ snapshotIndex }) => snapshotIndex));
       const terminalHistories = this.db.updateSessionsFromSnapshots(terminalBatch.map(({ snap }) => snap), now);
       for (const [index, { snap }] of terminalBatch.entries()) {
+        this.synchronizeCostReconciliation(snap.id, snap.costReconciliationRevision ?? 0);
         if (terminalHistories[index]?.reset) {
           const reset = this.db.getSession(snap.id)!;
           this.hub.sessionEventsReset(snap.id, this.db.listEvents(snap.id), reset.eventEpoch ?? 0);
@@ -13196,6 +13203,7 @@ export class SessionsService {
             continue;
           }
         }
+        if (unsupportedCostSessions.has(snap.id)) continue;
         if (existing) {
           // Only the owning runner may mutate an existing session row.
           if (existing.runnerId !== runnerId) {
@@ -13225,6 +13233,7 @@ export class SessionsService {
         } else {
           this.db.createSessionFromSnapshot(snap, runnerId, now);
         }
+        this.synchronizeCostReconciliation(snap.id, snap.costReconciliationRevision ?? 0);
         // A provisional disconnect clears projected cards while durable policy state survives.
         // Hydration is the settle-like moment that re-derives guardrails and restores typed cards.
         // gateOnPolicy is idempotent and no-ops when a runner card holds the slot or nothing is tripped.
@@ -13310,6 +13319,9 @@ export class SessionsService {
   applySessionRuntimeUpdate(runnerId: string, snapshot: SessionSnapshot, batch?: RunnerAttentionBatch): void {
     const existing = this.db.getSession(snapshot.id);
     if (!existing || existing.runnerId !== runnerId || this.db.isTombstoned(snapshot.id)) return;
+    const unsupportedCost = this.unsupportedCostReconciliation(runnerId, snapshot);
+    const unacknowledgedRevision = snapshot.costReconciliationRevision ?? 0;
+    snapshot = unsupportedCost ? { ...snapshot, costUsd: existing.costUsd } : normalizeReconciledSnapshot(this.db, snapshot);
     const runtimeSnapshot = snapshot.costUsd < existing.costUsd
       ? { ...snapshot, costUsd: existing.costUsd }
       : snapshot;
@@ -13341,6 +13353,7 @@ export class SessionsService {
         return;
       }
     }
+    if (unsupportedCost) return;
     const now = Date.now();
     if (isTerminal(runtimeSnapshot.status)) {
       this.revokeUnconsumedWorkflowDecisionsForSession(snapshot.id, "provider-session-ended");
@@ -13354,6 +13367,7 @@ export class SessionsService {
       this.db.clearPolicyResumeStatus(snapshot.id);
     }
     const history = this.db.updateSessionFromSnapshot(snapshot.id, runtimeSnapshot, now);
+    this.synchronizeCostReconciliation(snapshot.id, unacknowledgedRevision);
     if (history?.reset) {
       const reset = this.db.getSession(snapshot.id)!;
       this.hub.sessionEventsReset(snapshot.id, this.db.listEvents(snapshot.id), reset.eventEpoch ?? 0);
@@ -13372,6 +13386,29 @@ export class SessionsService {
     this.deliverHeldRestartNotices(snapshot.id, now);
     this.hub.sessionChangedById(snapshot.id);
     this.publishCampaignAttentionTransition(campaignBefore, batch);
+  }
+
+  private unsupportedCostReconciliation(runnerId: string, snapshot: SessionSnapshot): boolean {
+    const sessionId = snapshot.id;
+    if (this.db.getSession(sessionId)?.runnerId !== runnerId) return false;
+    const revision = reconciliationRevision(this.db, sessionId);
+    const acknowledged = snapshot.costReconciliationRevision ?? 0;
+    const revisionUnavailable = !Number.isSafeInteger(acknowledged) || acknowledged < 0 || acknowledged > revision;
+    if (!revisionUnavailable && (revision === 0 || runnerSupportsProtocol(
+      this.db.getRunner(runnerId)?.protocolVersion, "costReconciliation"))) return false;
+    this.log.warn(JSON.stringify({ event: revisionUnavailable ? "cost_reconciliation_revision_unavailable" :
+      "cost_reconciliation_runner_upgrade_required", runnerId, sessionId }));
+    return true;
+  }
+
+  private synchronizeCostReconciliation(sessionId: string, acknowledgedRevision: number): void {
+    const revision = reconciliationRevision(this.db, sessionId);
+    if (revision <= acknowledgedRevision) return;
+    const session = this.db.getSession(sessionId);
+    if (!session || !runnerSupportsProtocol(this.db.getRunner(session.runnerId)?.protocolVersion, "costReconciliation")) return;
+    this.hub.sendToRunner(session.runnerId, { type: "priced_session_cost", sessionId,
+      costUsd: this.db.sessionCostUsd(sessionId), costReconciliationRevision: revision,
+      costReconciliationDeltaUsd: reconciliationDeltaUsd(this.db, sessionId) });
   }
 
   /** Lazy-hydrate a session's event timeline from the runner (the box owns the log). Called when a

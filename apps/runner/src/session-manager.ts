@@ -5681,6 +5681,8 @@ export class SessionManager {
       contextTokensUsed: priorResumeId ? prior?.contextTokensUsed : undefined,
       contextWindow: priorResumeId ? prior?.contextWindow : undefined,
       costUsd: priorResumeId ? (prior?.costUsd ?? 0) : 0,
+      costReconciliationRevision: priorResumeId ? prior?.costReconciliationRevision : undefined,
+      costReconciliationDeltaUsd: priorResumeId ? prior?.costReconciliationDeltaUsd : undefined,
       preview: priorResumeId ? (prior?.preview ?? null) : null,
       pendingApproval: null,
       // Manager-driven: a continued session is no longer a pristine transcript, so it isn't
@@ -13426,6 +13428,8 @@ export class SessionManager {
         tokensIn: 0,
         tokensOut: 0,
         costUsd: 0,
+        costReconciliationRevision: undefined,
+        costReconciliationDeltaUsd: undefined,
         preview: null,
         pendingApproval: null,
         providerCredentialScopeId: undefined,
@@ -13638,9 +13642,21 @@ export class SessionManager {
   /** Persist the control plane's cumulative priced cost and apply the existing hard budget to the
    * active turn. Codex reports token usage without USD, so this acknowledgement is the first
    * authoritative cost the runner can enforce. */
-  syncPricedSessionCost(sessionId: string, costUsd: number): void {
+  syncPricedSessionCost(sessionId: string, costUsd: number, revision?: number, correctionDeltaUsd?: number): void {
     if (!Number.isFinite(costUsd) || costUsd < 0) return;
-    const updated = this.store.patchMeta(sessionId, { costUsd });
+    const current = this.store.readMeta(sessionId);
+    if (!current || !Number.isSafeInteger(revision ?? 0) || (revision ?? 0) < (current.costReconciliationRevision ?? 0)) return;
+    const priorRevision = current.costReconciliationRevision ?? 0;
+    if ((revision ?? 0) > 0) {
+      if (!Number.isFinite(correctionDeltaUsd) || correctionDeltaUsd! > 0) return;
+      if (revision === priorRevision && correctionDeltaUsd !== current.costReconciliationDeltaUsd) return;
+      // Preserve provider usage accrued after the preview/commit but before this frame arrived.
+      const adjusted = current.costUsd + correctionDeltaUsd! - (current.costReconciliationDeltaUsd ?? 0);
+      costUsd = Math.max(costUsd, adjusted);
+    }
+    const updated = this.store.patchMeta(sessionId, { costUsd,
+      ...(revision !== undefined ? { costReconciliationRevision: revision } : {}),
+      ...(correctionDeltaUsd !== undefined ? { costReconciliationDeltaUsd: correctionDeltaUsd } : {}) });
     if (!updated) return;
     this.send({ type: "session_runtime_updated", snapshot: this.snapshot(updated) });
 
