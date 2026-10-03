@@ -7,6 +7,7 @@ import {
   canonicalOperationalTranscriptJson,
   operationalTranscriptMarkdown,
   redactOperationalTranscriptText,
+  sharedTranscriptTitle,
 } from "./share-projection.js";
 
 type PayloadByKind = { [K in SessionEventKind]: Extract<SessionEventPayload, { kind: K }> };
@@ -377,4 +378,46 @@ test("malformed or future event payloads fail closed", () => {
   }
   const emptyParent = requireProjection([event(1, { kind: "agent_message", text: "subagent", parentToolUseId: "" })]);
   assert.deepEqual(emptyParent.projection.messages, []);
+});
+
+test("a shared title is the redacted one-line display title, bounded in code points (#2189)", () => {
+  assert.equal(sharedTranscriptTitle("  Fix the\tlogin   bug.\n\nmore"), "Fix the login bug");
+  assert.equal(sharedTranscriptTitle("\n\nSecond line names it"), "Second line names it");
+  assert.equal(sharedTranscriptTitle("Wait for it..."), "Wait for it...");
+  assert.equal(sharedTranscriptTitle(" \n\t "), null);
+  assert.equal(sharedTranscriptTitle(""), null);
+  assert.equal(sharedTranscriptTitle("\u0000Fix\u0007 it\u007f"), "Fix it", "control characters are dropped");
+  assert.equal(sharedTranscriptTitle("Fix\vthe\fbug"), "Fix the bug", "whitespace controls still separate words");
+  assert.equal(sharedTranscriptTitle("\u0000\u0001"), null);
+  // A control character next to a secret is a word boundary the redactors rely on; dropping it must
+  // never glue the secret to its neighbour and hide it from them.
+  for (const [title, secret] of [
+    [`prefix\u0007${FAKE_GITHUB_TOKEN}`, FAKE_GITHUB_TOKEN],
+    [`${FAKE_AWS_ACCESS_KEY}\u0007suffix`, FAKE_AWS_ACCESS_KEY],
+    [`prefix\u0000${FAKE_OPENAI_TOKEN}\u0001suffix`, FAKE_OPENAI_TOKEN],
+  ] as const) {
+    const shared = sharedTranscriptTitle(title);
+    assert.ok(shared && !shared.includes(secret.slice(4)), `${JSON.stringify(title)} leaked as ${JSON.stringify(shared)}`);
+    assert.ok(shared.includes("<redacted-secret>"));
+  }
+
+  // Redaction runs on the stored title exactly as on message text, including multi-line key blocks
+  // and configured workspace roots.
+  const title = `Rotate ${FAKE_GITHUB_TOKEN} and TOKEN=super-secret in D:/Projects/Acme/app.ts`;
+  assert.equal(
+    sharedTranscriptTitle(title, [String.raw`D:\Projects\Acme`]),
+    redactOperationalTranscriptText(title, [String.raw`D:\Projects\Acme`]),
+  );
+  const keyTitle = sharedTranscriptTitle(`${PRIVATE_KEY_BEGIN}\nPRIVATE_KEY_LEAK\n${PRIVATE_KEY_END}`);
+  assert.ok(keyTitle && !keyTitle.includes("PRIVATE_KEY_LEAK") && !keyTitle.includes("BEGIN"));
+
+  // Redaction comes before the bound, so a secret straddling the cut is never partly kept.
+  const straddling = sharedTranscriptTitle(`${"a ".repeat(97)}${FAKE_GITHUB_TOKEN}`);
+  assert.ok(straddling && !straddling.includes("ghp_"));
+  assert.ok(Array.from(straddling).length <= 200);
+
+  const emoji = sharedTranscriptTitle("😀".repeat(250));
+  assert.equal(Array.from(emoji ?? "").length, 200);
+  assert.equal(emoji, `${"😀".repeat(199)}…`, "the bound never splits a surrogate pair");
+  assert.equal(sharedTranscriptTitle("x".repeat(200)), "x".repeat(200));
 });

@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import {
   OPERATIONAL_TRANSCRIPT_PROJECTION_VERSION,
+  TRANSCRIPT_SHARE_TITLE_MAX_CHARS,
   type OperationalTranscriptMessage,
   type OperationalTranscriptProjection,
   type SessionEvent,
@@ -143,6 +144,37 @@ export function redactOperationalTranscriptText(
     (match, boundary: string, path: string) => boundary + boundedMarker(PATH, path.length));
 
   return text;
+}
+
+/**
+ * The session title a sharer opted to put on a link's public page (#2189), or null when nothing is
+ * left to show. The whole stored title is redacted exactly as message text is, before anything is
+ * cut, so a bound can never split a secret out of its pattern. What remains is the one-line display
+ * form the app names the session with (apps/web/src/session-title.ts: first non-empty line,
+ * whitespace collapsed, one trailing period dropped), bounded to
+ * TRANSCRIPT_SHARE_TITLE_MAX_CHARS code points with an ellipsis.
+ *
+ * Control characters are no part of a name, and SQLite's LENGTH() stops at NUL, so one would let a
+ * title pass this bound yet fail the stored column's CHECK. They become spaces, never nothing: a
+ * control character beside a secret is the word boundary its redactor matches on, and deleting it
+ * would glue the secret to its neighbour and hide it. Redaction runs on the original text first and
+ * again after, so neither form can let a secret through.
+ */
+export function sharedTranscriptTitle(
+  title: string,
+  sensitivePathPrefixes: readonly string[] = [],
+): string | null {
+  const printable = redactOperationalTranscriptText(title, sensitivePathPrefixes)
+    .replace(/[\u0000-\u0008\u000e-\u001f\u007f]/g, " ");
+  const redacted = redactOperationalTranscriptText(printable, sensitivePathPrefixes);
+  const line = redacted.split(/\r\n|\r|\n/).find((candidate) => candidate.trim() !== "") ?? "";
+  const collapsed = line.replace(/\s+/g, " ").trim();
+  const display = /[^.]\.$/.test(collapsed) ? collapsed.slice(0, -1).trimEnd() : collapsed;
+  if (!display) return null;
+  const chars = Array.from(display);
+  return chars.length <= TRANSCRIPT_SHARE_TITLE_MAX_CHARS
+    ? display
+    : `${chars.slice(0, TRANSCRIPT_SHARE_TITLE_MAX_CHARS - 1).join("").trimEnd()}…`;
 }
 
 function publicMessages(
