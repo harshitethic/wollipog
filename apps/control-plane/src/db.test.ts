@@ -2880,6 +2880,96 @@ test("campaign report verification and normalized follow-up deduplication surviv
   }
 });
 
+test("verifications a nested Orchestrator recorded under its own id move to the root campaign on open (#1462)", () => {
+  const root = mkdtempSync(join(tmpdir(), "wollipog-nested-campaign-rekey-"));
+  const file = join(root, "control-plane.db");
+  try {
+    const policy = resolveOrchestratorCampaignPolicy(DEFAULT_ORCHESTRATOR_DEFAULTS, "system_default");
+    const initial = ControlPlaneDb.open(file);
+    initial.registerRunner(meta(), 500, PROTOCOL_VERSION);
+    initial.createSession(newSession({ id: "campaign", config: { permissionMode: "orchestrator" }, orchestratorPolicy: policy }));
+    initial.createSession(newSession({ id: "nested", parentSessionId: "campaign",
+      config: { permissionMode: "orchestrator" }, orchestratorPolicy: policy }));
+    for (const id of ["grandchild", "reverified"]) {
+      initial.createSession(newSession({ id, parentSessionId: "nested" }));
+      initial.updateSessionStatus(id, "idle", 999);
+    }
+    initial.createSession(newSession({ id: "orphan", config: { permissionMode: "orchestrator" }, orchestratorPolicy: policy }));
+    initial.createSession(newSession({ id: "orphan-child", parentSessionId: "orphan" }));
+    initial.updateSessionStatus("orphan-child", "idle", 999);
+    const grandchildReport = initial.appendEvent("grandchild", { kind: "agent_message", text: "Report", final: true }, 1_000);
+    const staleReport = initial.appendEvent("reverified", { kind: "agent_message", text: "Old report", final: true }, 1_000);
+    const orphanReport = initial.appendEvent("orphan-child", { kind: "agent_message", text: "Report", final: true }, 1_000);
+    // The keys a pre-#1462 control plane wrote: the nested caller's own id.
+    initial.verifyCampaignChildReport("nested", "grandchild", grandchildReport.seq, 1_001);
+    initial.verifyCampaignChildReport("nested", "reverified", staleReport.seq, 1_001);
+    const currentReport = initial.appendEvent("reverified", { kind: "agent_message", text: "New report", final: true }, 1_002);
+    initial.verifyCampaignChildReport("campaign", "reverified", currentReport.seq, 1_003);
+    initial.verifyCampaignChildReport("orphan", "orphan-child", orphanReport.seq, 1_001);
+    // A cyclic ancestry the projection refuses keeps its row unreachable rather than inventing a root.
+    initial.raw().prepare("UPDATE sessions SET parent_session_id='orphan-child' WHERE id='orphan'").run();
+    assert.equal(initial.campaignChildReportVerified("campaign", "grandchild"), false);
+    initial.close();
+
+    const reopened = ControlPlaneDb.open(file);
+    const rows = reopened.raw().prepare(
+      `SELECT campaign_session_id, child_session_id, report_event_seq FROM orchestrator_campaign_child_reports
+       ORDER BY child_session_id`,
+    ).all();
+    assert.deepEqual(rows.map((row) => ({ ...row })), [
+      { campaign_session_id: "campaign", child_session_id: "grandchild", report_event_seq: grandchildReport.seq },
+      { campaign_session_id: "orphan", child_session_id: "orphan-child", report_event_seq: orphanReport.seq },
+      { campaign_session_id: "campaign", child_session_id: "reverified", report_event_seq: currentReport.seq },
+    ], "nested rows move to the root, the later verification wins a conflict, refused ancestry is untouched");
+    assert.equal(reopened.campaignChildReportVerified("campaign", "grandchild"), true);
+    assert.equal(reopened.campaignChildReportVerified("campaign", "reverified"), true);
+    assert.equal(reopened.campaignForVerifiedChild("grandchild"), "campaign");
+    assert.equal(reopened.campaignForVerifiedChild("orphan-child"), null,
+      "a row under a refused ancestry never names a campaign for cleanup");
+    assert.equal(reopened.campaignProjection("campaign")?.children.verified, 2);
+    reopened.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("campaign root resolution fails closed past its depth bound, so re-keying stays idempotent (#1462)", () => {
+  const root = mkdtempSync(join(tmpdir(), "wollipog-deep-campaign-rekey-"));
+  const file = join(root, "control-plane.db");
+  try {
+    const policy = resolveOrchestratorCampaignPolicy(DEFAULT_ORCHESTRATOR_DEFAULTS, "system_default");
+    const initial = ControlPlaneDb.open(file);
+    initial.registerRunner(meta(), 500, PROTOCOL_VERSION);
+    // 66 nested Orchestrators: the deepest is 65 hops below the root, past the 64-hop walk.
+    for (let depth = 0; depth <= 65; depth += 1) {
+      initial.createSession(newSession({
+        id: `deep${depth}`, config: { permissionMode: "orchestrator" }, orchestratorPolicy: policy,
+        ...(depth > 0 ? { parentSessionId: `deep${depth - 1}` } : {}),
+      }));
+    }
+    initial.createSession(newSession({ id: "deep-child", parentSessionId: "deep65" }));
+    initial.updateSessionStatus("deep-child", "idle", 999);
+    const report = initial.appendEvent("deep-child", { kind: "agent_message", text: "Report", final: true }, 1_000);
+    initial.verifyCampaignChildReport("deep65", "deep-child", report.seq, 1_001);
+    assert.equal(initial.resolvedCampaignSessionId("deep65"), null,
+      "a truncated walk names no root rather than an intermediate Orchestrator");
+    assert.equal(initial.campaignProjection("deep65"), null);
+    assert.equal(initial.resolvedCampaignSessionId("deep1"), "deep0", "a walk within the bound still resolves");
+    initial.close();
+
+    for (let open = 0; open < 2; open += 1) {
+      const reopened = ControlPlaneDb.open(file);
+      assert.deepEqual(reopened.raw().prepare(
+        "SELECT campaign_session_id FROM orchestrator_campaign_child_reports WHERE child_session_id='deep-child'",
+      ).all().map((row) => ({ ...row })), [{ campaign_session_id: "deep65" }],
+      `open ${open + 1} leaves a row under a refused ancestry where it was`);
+      reopened.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("verified campaign children survive an event cache reset without a history read", () => {
   const db = withRunner();
   try {
