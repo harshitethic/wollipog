@@ -8,11 +8,19 @@ import type { UsageCostSource } from "@wollipog/protocol";
  * lives in `usage-rate-table.ts`.
  */
 
+interface RequestModelRate {
+  inputCostPerToken: number;
+  outputCostPerToken: number;
+  cacheReadCostPerToken?: number;
+  cacheCreationCostPerToken?: number;
+}
+
 export interface ModelRate {
   inputCostPerToken: number;
   outputCostPerToken: number;
   cacheReadCostPerToken: number;
   cacheCreationCostPerToken: number;
+  requestRates?: { serviceTier: string; inputThreshold?: number; rate?: RequestModelRate }[];
 }
 
 export type RateTable = ReadonlyMap<string, ModelRate>;
@@ -43,6 +51,7 @@ export const FALLBACK_CACHE_WRITE_INPUT_RATIO = 1.25;
 const UNPRICEABLE_MODELS = new Set(["<synthetic>", "synthetic", "opus", "sonnet", "haiku", "fable", "default", "auto"]);
 
 interface RawRateEntry {
+  [key: string]: unknown;
   input_cost_per_token?: unknown;
   output_cost_per_token?: unknown;
   cache_read_input_token_cost?: unknown;
@@ -78,7 +87,8 @@ function sameRate(a: ModelRate, b: ModelRate): boolean {
   return a.inputCostPerToken === b.inputCostPerToken &&
     a.outputCostPerToken === b.outputCostPerToken &&
     a.cacheReadCostPerToken === b.cacheReadCostPerToken &&
-    a.cacheCreationCostPerToken === b.cacheCreationCostPerToken;
+    a.cacheCreationCostPerToken === b.cacheCreationCostPerToken &&
+    JSON.stringify(a.requestRates) === JSON.stringify(b.requestRates);
 }
 
 /**
@@ -100,7 +110,22 @@ export function parseRateTable(document: unknown): RateTable {
     if (input === null || output === null) continue;
     const key = normalizeRateKey(name);
     if (key.length === 0 || key === "sample_spec") continue;
+    const requestRates: NonNullable<ModelRate["requestRates"]> = [];
+    for (const field of Object.keys(entry).sort()) {
+      const match = field.match(/^input_cost_per_token_((?:above_\d+k_tokens)?(?:_?(?:priority|flex|batches))?)$/);
+      if (!match || !match[1]) continue;
+      const suffix = match[1];
+      const threshold = suffix.match(/^above_(\d+)k_tokens/);
+      const tier = suffix.replace(/^above_\d+k_tokens_?/, "") || "default";
+      const values = ["input_cost_per_token", "output_cost_per_token", "cache_read_input_token_cost", "cache_creation_input_token_cost"]
+        .map((prefix) => finiteNonNegative(entry[`${prefix}_${suffix}`]));
+      requestRates.push({ serviceTier: tier, ...(threshold ? { inputThreshold: Number(threshold[1]) * 1000 } : {}),
+        ...(values[0] === null || values[1] === null ? {} : {
+          rate: { inputCostPerToken: values[0]!, outputCostPerToken: values[1]!, ...(values[2] === null ? {} : { cacheReadCostPerToken: values[2]! }), ...(values[3] === null ? {} : { cacheCreationCostPerToken: values[3]! }) },
+        }) });
+    }
     table.set(key, {
+      ...(requestRates.length ? { requestRates } : {}),
       inputCostPerToken: input,
       outputCostPerToken: output,
       cacheReadCostPerToken: finiteNonNegative(entry.cache_read_input_token_cost) ?? input * FALLBACK_CACHE_READ_INPUT_RATIO,
@@ -141,13 +166,39 @@ export function priceUsage(
   model: string | null | undefined,
   buckets: UsageTokenBuckets,
   reportedCostUsd: number | null | undefined,
+  context?: { requestInputTokens?: number; serviceTier?: string },
+  costIsEstimate = false,
 ): PricedUsage {
-  const rate = table ? lookupRate(table, model) : null;
+  const base = table ? lookupRate(table, model) : null;
+  let rate = base;
+  if (base && context) {
+    const requestedTier = context.serviceTier ?? "default";
+    const tier = requestedTier === "fast" ? "priority" : requestedTier === "standard" ? "default" : requestedTier;
+    const requestInput = finiteNonNegative(context.requestInputTokens);
+    const variants = base.requestRates ?? [];
+    // Never use a turn's aggregated input to choose a per-request context premium.
+    if (variants.some((variant) => variant.inputThreshold !== undefined) && requestInput === null) rate = null;
+    else {
+      const threshold = variants.reduce((maximum, variant) =>
+        variant.inputThreshold !== undefined && requestInput !== null && requestInput > variant.inputThreshold
+          ? Math.max(maximum, variant.inputThreshold) : maximum, 0);
+      const candidate = variants.find((variant) => variant.serviceTier === tier &&
+        (variant.inputThreshold ?? 0) === threshold);
+      // An unpublished cache bucket matters only if this response used it. Never invent a
+      // premium write/read price or reject an OpenAI response with zero cache writes.
+      const selected = candidate ? candidate.rate : (tier === "default" && threshold === 0 ? base : undefined);
+      rate = !selected || buckets.cachedInputTokens > 0 && selected.cacheReadCostPerToken === undefined ||
+        buckets.cacheCreationTokens > 0 && selected.cacheCreationCostPerToken === undefined ? null : {
+          ...selected, cacheReadCostPerToken: selected.cacheReadCostPerToken ?? 0,
+          cacheCreationCostPerToken: selected.cacheCreationCostPerToken ?? 0,
+        };
+    }
+  }
   const cacheSavingsUsd = rate
     ? Math.max(0, buckets.cachedInputTokens * (rate.inputCostPerToken - rate.cacheReadCostPerToken))
     : 0;
   if (typeof reportedCostUsd === "number" && Number.isFinite(reportedCostUsd) && reportedCostUsd >= 0) {
-    return { costUsd: reportedCostUsd, costSource: "providerReported", cacheSavingsUsd };
+    return { costUsd: reportedCostUsd, costSource: costIsEstimate ? "modelPriced" : "providerReported", cacheSavingsUsd };
   }
   if (!rate) return { costUsd: 0, costSource: "unpriced", cacheSavingsUsd: 0 };
   const costUsd =
