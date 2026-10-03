@@ -2113,6 +2113,15 @@ function handleCommand(msg: ControlPlaneToRunner): void {
       runCommandTask("github_issue_closure", sessions.githubIssueClosure(msg).then(sendUp));
       break;
     }
+    case "campaign_forge_observe": {
+      // The same runner-local environment the Orchestrator's agent launches with (see prepareLaunch).
+      runCommandTask("campaign_forge_observe", sessions.campaignForgeObserve(msg, {
+        agentEnv: (meta) => meta.adopted && !meta.agentId
+          ? adoptedLaunchEnvironment(meta)
+          : runnerLocalAgentEnv(meta.agentId, meta.driver, meta.context),
+      }).then(sendUp));
+      break;
+    }
     case "reconcile_workflow_action": {
       runCommandTask("reconcile_workflow_action", sessions.reconcileWorkflowAction(msg.sessionId, {
         occurrenceId: msg.occurrenceId,

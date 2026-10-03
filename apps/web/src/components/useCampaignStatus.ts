@@ -26,6 +26,9 @@ const CAMPAIGN_WORK_PAGE_CEILING = CAMPAIGN_WORK_LEDGER_LIMITS.pageSizeMax;
 const MAX_REVISION_RESTARTS = 3;
 /** A member whose browser does not hold the root session re-reads it on this cadence. */
 const ROOT_SESSION_POLL_MS = 30_000;
+/** While details show pull requests, their GitHub status is re-read on this cadence (slice 8). The
+ * server reads each pull request at most every 30 seconds whoever asks. */
+export const CAMPAIGN_FORGE_REFRESH_MS = 60_000;
 
 export type CampaignLoadStatus = "loading" | "ready" | "error";
 
@@ -332,6 +335,8 @@ export function useCampaignStatus({
   /* ---------------------------------------------------------------- detail */
   const detailKey = selectedItemId ? `${session.id}:${selectedItemId}` : null;
   const [detail, setDetail] = useState<{ key: string; state: CampaignDetailState } | null>(null);
+  /** Completed forge reads; each one reloads the shown details (see the forge refresh below). */
+  const [forgeReads, setForgeReads] = useState(0);
   useEffect(() => {
     if (!selectedItemId || !detailKey || !online) return;
     const controller = new AbortController();
@@ -355,7 +360,35 @@ export function useCampaignStatus({
       cancelled = true;
       controller.abort();
     };
-  }, [api, detailKey, online, revision, reconnects, retries, selectedItemId, session.id]);
+  }, [api, detailKey, forgeReads, online, revision, reconnects, retries, selectedItemId, session.id]);
+
+  /* ---------------------------------------------------------------- forge refresh */
+  // While an item's details are showing, ask the server to read its pull requests on GitHub: once
+  // when they open and then on a fixed cadence. The server rate-limits and coalesces these, and a
+  // reader without access to the observing runner is never sent (their facts say not authorized).
+  const shownDetail = detail?.key === detailKey ? detail.state.detail : null;
+  const forgeRefreshable = Boolean(shownDetail?.observed.pullRequests?.some((entry) =>
+    entry.fact.availability !== "unavailable" || entry.fact.reason !== "not_authorized"));
+  useEffect(() => {
+    if (!selectedItemId || !detailKey || !online || !forgeRefreshable) return;
+    const controller = new AbortController();
+    const refresh = () => {
+      // The answer's own facts are not applied: a reply can arrive after newer details, even at the
+      // same revision (the revision bump is coalesced after the store write). Re-reading the details
+      // through the ordered detail load shows whatever the store holds now.
+      api.campaignForgeRefresh(session.id, selectedItemId, controller.signal).then(() => {
+        if (!controller.signal.aborted) setForgeReads((count) => count + 1);
+      }).catch(() => {
+        // The shown facts already explain what is unavailable; a failed refresh changes nothing.
+      });
+    };
+    refresh();
+    const timer = setInterval(refresh, CAMPAIGN_FORGE_REFRESH_MS);
+    return () => {
+      clearInterval(timer);
+      controller.abort();
+    };
+  }, [api, detailKey, forgeRefreshable, online, selectedItemId, session.id]);
 
   return {
     summary,
