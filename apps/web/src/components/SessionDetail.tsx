@@ -54,6 +54,8 @@ import { isPartialHistory, isRebuiltEventsArray, useStoreActions, useStoreSelect
 import { relativeTime, shortenPath, titleCaseLabel } from "../format.js";
 import { COMPOSER_USAGE_MIN_COLUMN_REM, composerUsagePlacement, useNarrowerThanRem } from "../composer-usage-placement.js";
 import { accountLabelText, isPersonalIdentifier, redactPersonalIdentifiers } from "../personal-identifiers.js";
+import { AccountLabel } from "./AccountIdentifier.js";
+import { useAccountEmailPrivacy } from "../account-email-privacy.js";
 import { compareSessionNotices, SESSION_NOTICE_RANK, SessionNoticeSlot, type SessionNoticeEntry } from "./SessionNoticeSlot.js";
 import { sessionAccountSwitchApplicable, SwitchAccountDialog } from "./SwitchAccountDialog.js";
 import { BusyButton } from "./ui/BusyButton.js";
@@ -814,6 +816,7 @@ function SessionDetailLoaded({
   composerDraftCleanup = deleteComposerDraftIfMatches,
   session,
 }: SessionDetailProps & { session: SessionView }) {
+  const privacy = useAccountEmailPrivacy();
   const api = useApi();
   const isMobile = useIsMobile();
   const isMobileRef = useRef(isMobile);
@@ -2617,7 +2620,9 @@ function SessionDetailLoaded({
     });
     automaticAccountSwitchNotice.current = update.state;
     if (update.providerAccountLabel) {
-      showToast(`Moved this session to ${accountLabelText(update.providerAccountLabel, "another account")} after its prior account exhausted a usage window.`);
+      showToast(`Moved this session to ${accountLabelText(update.providerAccountLabel, "another account")} after its prior account exhausted a usage window.`, {
+        messageContent: <>Moved this session to <AccountLabel value={update.providerAccountLabel} hidden="another account" /> after its prior account exhausted a usage window.</>,
+      });
     }
   }, [eventHistory?.everComplete, evs, session.id, showToast, timelineItems]);
   const observedLastEventAt = Math.max(session.lastEventAt ?? 0, activity?.lastEventAt ?? 0) || undefined;
@@ -3856,10 +3861,13 @@ function SessionDetailLoaded({
   }
   if (accountSwitchFailure && accountSwitchFailedOrder) {
     const failure = accountSwitchFailure;
-    // A personal identifier is never inlined, masked or not: the sentence names the account by role.
-    const account = isPersonalIdentifier(failure.providerAccountLabel)
+    // With hiding enabled, generated account sentences name an email-shaped account by role.
+    const account = privacy.hide && isPersonalIdentifier(failure.providerAccountLabel)
       ? "the selected account"
       : failure.providerAccountLabel;
+    const reason = privacy.hide ? redactPersonalIdentifiers(failure.reason, "the selected account") : failure.reason;
+    // An email's local part can be case-sensitive; sentence formatting must not change it.
+    const capitalizeReason = privacy.hide || !isPersonalIdentifier(reason.trim().split(/\s/u)[0]);
     const switchReason = !accountSwitchSupported
       ? runnerCapabilityRequirement(runner?.protocolVersion, "sessionProviderAccountSwitch", "session account switching")
       : runnerOfflineReason;
@@ -3886,7 +3894,7 @@ function SessionDetailLoaded({
           )}>
           <p>
             Wollipog couldn&rsquo;t continue with {account}.
-            {" "}{asSentence(redactPersonalIdentifiers(failure.reason, "the selected account"))}
+            {" "}{asSentence(reason, capitalizeReason)}
           </p>
           {accountSwitchApplicable && switchReason !== null && (
             <p className="notice-meta" id="account-switch-refusal">{switchReason}</p>
@@ -7384,10 +7392,10 @@ export function EarlierActivityControl({
 
 /** A runner-written fragment ("Install Dependencies exited with 1", "the provider conversation
  * cannot be resumed…") as a sentence of its own: capitalized, with closing punctuation. */
-function asSentence(text: string): string {
+function asSentence(text: string, capitalize = true): string {
   const trimmed = text.trim();
   if (!trimmed) return trimmed;
-  const capitalized = trimmed[0]!.toUpperCase() + trimmed.slice(1);
+  const capitalized = capitalize ? trimmed[0]!.toUpperCase() + trimmed.slice(1) : trimmed;
   return /[.!?…]$/u.test(capitalized) ? capitalized : `${capitalized}.`;
 }
 
