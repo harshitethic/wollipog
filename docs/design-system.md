@@ -357,8 +357,8 @@ Implementation:
 @media (pointer: coarse) {
   :root { --control-h: 44px; --control-h-lg: 48px; --control-h-sm: 36px;
           --row-h: 48px; --row-h-2: 64px; --row-h-dense: 44px; }
-  :is(.btn.sm, .icon-btn.sm, button.chip) { position: relative; }
-  :is(.btn.sm, .icon-btn.sm, button.chip)::after { content: ""; position: absolute; inset: -4px; }  /* 44px hit */
+  :is(.btn.sm, .icon-btn.sm, button.chip, .composer-btn) { position: relative; }
+  :is(.btn.sm, .icon-btn.sm, button.chip, .composer-btn)::after { content: ""; position: absolute; inset: -4px; }  /* 44px hit */
   .seg.sm { height: var(--control-h); }        /* adjacent options cannot borrow hit area: 44px real */
   .seg-option { position: relative; }
   .seg-option::after { content: ""; position: absolute; inset: -3px 0; }   /* 38px option + 2px inset + 1px edge = 44 */
@@ -386,8 +386,9 @@ the surrounding row being the target.
 
 Every interactive element uses one of these heights. `min-height` never comes from padding. Icon
 buttons are square (`width: var(--control-h)`). Per-selector `min-height: 44px` patches on controls
-are replaced by this one block. Phone composer targets use the coarse `sm` recipe (36px visual, 44px
-hit); the settled composer layout fixes the 44px hit areas and leaves the visual size open.
+are replaced by this one block. Composer bar controls (`ComposerButton`, #2174) are `--composer-ctl`
+tall: `--control-h` (32px) on a fine pointer and the coarse `sm` recipe on touch (36px visual, 44px
+hit, 8px apart), on every width including the phone capsule.
 
 ### 2.9 Motion
 
@@ -1977,7 +1978,7 @@ so it is the Restart to Install Update confirmation (§13.1), never a banner or 
 | Toasts | Bottom center above the tab bar or composer, inside the safe area; one visible (§13.1). |
 | Request dock | Caps at 50% of the chat column, 40% while the software keyboard is open; its body scrolls, and it shrinks to the 44px strip while reading back (§13.2). |
 | Keyboard hints | Hidden (`pointer: coarse`). |
-| Live usage | The composer bar seats the context ring and the session cost before the mic as two `.btn.sm.ghost` triggers (§3.1) in `--type-small` and `--text-dim`, each opening its popover. Below 760px, or in a composer column narrower than 40rem (640px at the default text size) at any width, they leave the bar so it never wraps, and Model Settings opens with a read-only Session Usage group at the top: Context Window (ring, percentage and "72K of 200K") and Session Cost. Where Model Settings cannot open (an agent with nothing to configure, or a person who may not change it), they take their own right-aligned row above the bar instead, hidden while a phone composer is collapsed. Answer Mode, which replaces the bar, carries the two triggers beside Submit, or on their own row above its buttons in a narrow column. A session with no usage yet shows neither (#2166). |
+| Live usage | The composer bar seats the context ring and the session cost before the mic as two borderless ghost `ComposerButton` triggers (§3.1, #2174), `--composer-ctl` tall, in `--type-small` and `--text-dim`, each opening its popover. Below 760px, or in a composer column narrower than 40rem (640px at the default text size) at any width, they leave the bar so it never wraps, and Model Settings opens with a read-only Session Usage group at the top: Context Window (ring, percentage and "72K of 200K") and Session Cost. Where Model Settings cannot open (an agent with nothing to configure, or a person who may not change it), they take their own right-aligned row above the bar instead, hidden while a phone composer is collapsed. Answer Mode, which replaces the bar, carries the two triggers beside Submit, or on their own row above its buttons in a narrow column. A session with no usage yet shows neither (#2166). |
 | Fixed bottom layers | Every bottom-anchored surface (right panel sheet, shell dock, composer) follows the same `:has(textarea:focus)` rule as the rail so nothing shows through. |
 | Gutter | `--page-gutter: 16px`. Centered columns use `max(var(--space-3), (100% - max) / 2)` so content never touches the screen edge. |
 
@@ -2430,3 +2431,11 @@ These trade-offs are deliberate. Keep them in mind when a screen seems to argue 
    composer on phones too, with 44px rows and no footer keys, instead of becoming a bottom sheet
    (§9.2). A sheet would cover the caret and compete with the software keyboard while the person is
    still typing the query the picker filters on.
+10. **Disabled composer bar controls.** A ghost control rests in `--text-dim`, and §3.1's disabled
+    `--text-faint` is only about 1.2:1 from it, so on a stopped or failed session the bar's +,
+    shield, model chip and mic read as enabled. In the composer bar only, a disabled ghost
+    `ComposerButton` (glyph, label and agent mark) draws in
+    `color-mix(in srgb, var(--text-faint) 75%, var(--bg))`. That is at least 3:1 on `--bg` and
+    `--bg-elev` in every scheme (the glyph floor, #1880) and about 2:1 below rest (1.9–2:1 in the
+    Wollipog themes), with no opacity (#2174). Forced colors stays `GrayText`, and filled controls
+    (Send, Stop Turn) keep §3.1. Every disabled control still says why.
