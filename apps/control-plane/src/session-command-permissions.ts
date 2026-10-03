@@ -243,6 +243,65 @@ export interface SessionCommandPermissionSource {
   /** The records behind a projection's holds, read for every held child it lists. */
   sessionHoldRecords(ids: readonly string[]): Map<string,
     Pick<SessionView, "orchestratorPolicy" | "worktreeRecovery" | "queueHold"> & { parentSessionId: string | null }>;
+  /** The root campaign an Orchestrator session resolves to (#2417). Without it, no agent sees a
+   * campaign work summary. */
+  resolvedCampaignSessionId?(sessionId: string): string | null;
+}
+
+/** The campaign work summary is ledger data. An agent may read it only as an Orchestrator of that
+ * campaign; any other agent able to read the root session sees the projection without it, as the
+ * Campaign Status routes refuse it (docs/campaign-work-ledger.md). It rides only on the root's own
+ * view, so the campaign is the session itself. */
+export function withCampaignWorkFor<T extends SessionView>(
+  source: SessionCommandPermissionSource,
+  principal: AuthPrincipal,
+  session: T,
+): T {
+  const campaign = session.orchestratorCampaign;
+  if (!campaign?.work || principal.kind !== "agent") return session;
+  const own = principal.orchestrator && principal.credentialSessionId
+    ? source.resolvedCampaignSessionId?.(principal.credentialSessionId) ?? null
+    : null;
+  if (own === session.id) return session;
+  const { work: _hidden, ...withoutWork } = campaign;
+  return { ...session, orchestratorCampaign: withoutWork };
+}
+
+function isSessionViewWithWork(value: unknown): value is SessionView {
+  const candidate = value as Partial<SessionView> | null;
+  return typeof candidate === "object" && candidate !== null && typeof candidate.id === "string" &&
+    candidate.orchestratorCampaign?.work !== undefined;
+}
+
+/**
+ * Apply the campaign-work rule to a whole response body for an agent, the way
+ * `withVisibleCampaignChildren` narrows held children: a session view or array of views at the top
+ * level or under any first-level key. Session reads already project per principal; mutation
+ * responses (config, stop, restart, archive, prompt) return the service's raw view, and an agent may
+ * command a campaign root it is an ancestor of, so every agent-bound API body passes through here.
+ */
+export function withCampaignWorkForResponse(
+  source: Pick<SessionCommandPermissionSource, "resolvedCampaignSessionId">,
+  principal: AuthPrincipal | null | undefined,
+  payload: unknown,
+): unknown {
+  if (principal?.kind !== "agent") return payload;
+  const projectView = (value: unknown): unknown => isSessionViewWithWork(value)
+    ? withCampaignWorkFor(source as SessionCommandPermissionSource, principal, value)
+    : value;
+  const project = (value: unknown): unknown => {
+    if (!Array.isArray(value)) return projectView(value);
+    const projected = value.map(projectView);
+    return projected.some((item, index) => item !== value[index]) ? projected : value;
+  };
+  const top = project(payload);
+  if (typeof top !== "object" || top === null || Array.isArray(top)) return top;
+  let result = top as Record<string, unknown>;
+  for (const [key, value] of Object.entries(top)) {
+    const projected = project(value);
+    if (projected !== value) result = { ...result, [key]: projected };
+  }
+  return result;
 }
 
 function permissionFacts(
@@ -378,6 +437,7 @@ export function withSessionCommandPermissions<T extends SessionView>(
   session: T,
 ): T {
   if (!principal) return session;
+  session = withCampaignWorkFor(source, principal, session);
   const commandPermissions = sessionCommandPermissions(principal, session, permissionFacts(source, principal, session.id));
   return withSessionHoldAdviceFor(source, principal, { ...session, commandPermissions },
     session.holds?.length ? holdAdviceReader(commandPermissions) : undefined);

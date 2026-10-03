@@ -6797,6 +6797,7 @@ export class SessionsService {
     if (spentApprovals.length > 0) this.hub.sessionChangedById(child.id);
     this.db.verifyCampaignChildReport(root.id, child.id, request.reportEventSeq, now);
     let workItemResult: VerifyOrchestratorChildWorkItemResult | undefined;
+    const attemptsBefore = workItem ? this.db.campaignWorkLedger.openAttemptsBySession(root.id) : null;
     if (workItem) {
       const recorded = this.db.campaignWorkLedger.recordVerification(root.id, {
         workItemId: workItem.id,
@@ -6818,6 +6819,8 @@ export class SessionsService {
     const projection = this.db.campaignProjection(campaignSessionId)!;
     // Refreshes the root and every nested Orchestrator above the child, including the caller.
     this.campaignViewsChanged(root.id, child.id);
+    // A delivered verification closes the child's attempt, which its membership names.
+    if (attemptsBefore) this.campaignMembershipsChanged(root.id, attemptsBefore);
     return ok({ campaign: projection, child: updated, ...(workItemResult ? { workItem: workItemResult } : {}) },
       updated.archiveStatus ? 202 : 200);
   }
@@ -6852,10 +6855,23 @@ export class SessionsService {
     write: () => { ok: true; data: T } | { ok: false; status: number; error: string },
   ): ServiceResult<T> {
     const before = this.db.campaignWorkLedger.revision(scope.root.id);
+    const attemptsBefore = this.db.campaignWorkLedger.openAttemptsBySession(scope.root.id);
     const result = write();
     if (!result.ok) return fail(result.error, result.status);
-    if (result.data.revision !== before) this.campaignLedgerChanged(scope.root.id, scope.caller.id);
+    if (result.data.revision !== before) {
+      this.campaignLedgerChanged(scope.root.id, scope.caller.id);
+      this.campaignMembershipsChanged(scope.root.id, attemptsBefore);
+    }
     return ok(result.data);
+  }
+
+  /** A session's `campaignMembership` names its open attempt, so re-send every session whose open
+   * attempt a ledger write opened, closed, or replaced. */
+  private campaignMembershipsChanged(rootId: string, before: ReadonlyMap<string, string>): void {
+    const after = this.db.campaignWorkLedger.openAttemptsBySession(rootId);
+    for (const sessionId of new Set([...before.keys(), ...after.keys()])) {
+      if (before.get(sessionId) !== after.get(sessionId)) this.hub.sessionChangedById(sessionId);
+    }
   }
 
   recordCampaignPlan(
@@ -6973,6 +6989,13 @@ export class SessionsService {
       response.recommendations = recommendations.data.items;
     }
     return ok(response);
+  }
+
+  /** An observed change or an attempt session's deletion moved the campaign's ledger revision
+   * (campaign-work-observation.ts): re-send the root, the only view that carries the summary. A
+   * deleted session's ancestry is gone by then, so the campaign names what to refresh. */
+  campaignWorkObserved(rootId: string): void {
+    this.hub.sessionChangedById(rootId);
   }
 
   /** Refresh the root campaign and every nested Orchestrator between it and `sessionId`: each one's
