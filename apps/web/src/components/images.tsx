@@ -11,6 +11,7 @@ import {
   type PromptImageInput,
   type WorkspaceReference,
 } from "@wollipog/protocol";
+import { CloseIcon, FileCodeIcon, FolderIcon } from "./Icons.js";
 import { PromptImageView } from "./PromptImageView.js";
 
 function fileToImage(file: File): Promise<PromptImage | null> {
@@ -28,6 +29,70 @@ function fileToImage(file: File): Promise<PromptImage | null> {
   });
 }
 
+// What the protocol does not carry: the file an image was picked, dropped or pasted from, for its alt
+// text and the broken-image notice. Drafts are copied attachment by attachment on their way through
+// queued edits, Edit as a New Turn and failed sends, so a name follows the image's content rather than
+// one object: a 53-bit hash of all of its data, computed once per attachment object. The key is a new
+// short string, so it never holds a removed image's data alive. Only this page's recent picks are
+// remembered; an image the composer never saw picked (a draft restored after a reload, a stored
+// artifact) is numbered instead.
+const MAX_REMEMBERED_FILE_NAMES = 64;
+const attachmentFileNames = new Map<string, string>();
+const contentKeys = new WeakMap<PromptImageInput, string | null>();
+const attachmentKeys = new WeakMap<PromptImageInput, string>();
+let nextAttachmentKey = 0;
+
+/** cyrb53: a fast, well-distributed 53-bit string hash. Not cryptographic; it tells images apart. */
+function hash53(text: string): number {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+
+function contentKey(image: PromptImageInput): string | null {
+  let key = contentKeys.get(image);
+  if (key === undefined) {
+    key = isPromptImageReference(image)
+      ? null
+      : `${image.mimeType.length}:${image.data.length}:${hash53(image.mimeType)}:${hash53(image.data)}`;
+    contentKeys.set(image, key);
+  }
+  return key;
+}
+
+function rememberFileName(image: PromptImageInput, name: string) {
+  const key = contentKey(image);
+  if (key === null) return;
+  attachmentFileNames.delete(key);
+  attachmentFileNames.set(key, name);
+  if (attachmentFileNames.size > MAX_REMEMBERED_FILE_NAMES) {
+    attachmentFileNames.delete(attachmentFileNames.keys().next().value!);
+  }
+}
+
+/** The name of the file an attached image came from, when this page saw it picked. */
+export function attachmentFileName(image: PromptImageInput): string | undefined {
+  const key = contentKey(image);
+  return key === null ? undefined : attachmentFileNames.get(key);
+}
+
+/** A stable key for an attachment while the composer holds it: React keys and notice keys. */
+export function attachmentKey(image: PromptImageInput): string {
+  let key = attachmentKeys.get(image);
+  if (key === undefined) {
+    key = `attachment-${nextAttachmentKey++}`;
+    attachmentKeys.set(image, key);
+  }
+  return key;
+}
+
 /** Why an attachment did not land, before it is put into words (§17; #2156). */
 export type AttachmentProblem =
   | { kind: "unsupported-type"; mimeType: string; allowedMimeTypes: readonly string[] }
@@ -36,7 +101,8 @@ export type AttachmentProblem =
   | { kind: "unreadable"; fileName: string }
   | { kind: "too-many" }
   | { kind: "too-large-together" }
-  | { kind: "too-many-references" };
+  | { kind: "too-many-references" }
+  | { kind: "duplicate-reference"; path: string };
 
 /** A composer notice's words: the "+N More" menu's Title Case title and one sentence-case message. */
 export interface AttachmentProblemText {
@@ -124,6 +190,8 @@ export function describeAttachmentProblem(problem: AttachmentProblem): Attachmen
         title: "Too Many References",
         message: `You can reference up to ${MAX_WORKSPACE_REFERENCES} files. Remove one to add another.`,
       };
+    case "duplicate-reference":
+      return { title: "Already Attached", message: `“${problem.path}” is already attached.` };
   }
 }
 
@@ -155,6 +223,10 @@ export function usePastedImages(
     const parsed = await Promise.all(accepted.map(fileToImage));
     const unreadable = accepted.find((_, index) => parsed[index] === null);
     if (unreadable) problem ??= { kind: "unreadable", fileName: unreadable.name };
+    parsed.forEach((image, index) => {
+      const name = accepted[index]?.name;
+      if (image && name) rememberFileName(image, name);
+    });
     const valid = parsed.filter((x): x is PromptImage => x !== null);
     if (valid.length) {
       onUserChange?.();
@@ -222,7 +294,10 @@ export function usePastedImages(
     }
     if (currentReferences.some((candidate) => candidate.targetFingerprint === reference.targetFingerprint &&
         candidate.kind === reference.kind && candidate.startLine === reference.startLine &&
-        candidate.endLine === reference.endLine && candidate.side === reference.side)) return "duplicate" as const;
+        candidate.endLine === reference.endLine && candidate.side === reference.side)) {
+      onProblem?.({ kind: "duplicate-reference", path: reference.path });
+      return "duplicate" as const;
+    }
     onUserChange?.();
     const next = [...imagesRef.current, reference];
     imagesRef.current = next;
@@ -233,72 +308,129 @@ export function usePastedImages(
   return { images, onPaste, addFiles, addWorkspaceReference, remove, clear, replace };
 }
 
-function workspaceReferenceLabel(reference: WorkspaceReference): string {
+/** ":18-21" (":18" for one line), then " · Worktree" or " · Base" for a diff: what follows the path. */
+export function workspaceReferenceSuffix(reference: WorkspaceReference): string {
   const lines = reference.startLine === undefined
     ? ""
-    : `:${reference.startLine}${reference.endLine === reference.startLine ? "" : `-${reference.endLine}`}`;
+    : `:${reference.startLine}${reference.endLine === undefined || reference.endLine === reference.startLine ? "" : `-${reference.endLine}`}`;
   const side = reference.kind === "diff" ? ` · ${reference.side === "left" ? "Base" : "Worktree"}` : "";
-  return `${reference.path}${lines}${side}`;
+  return `${lines}${side}`;
 }
 
-export function ImageStrip({
+/** "src/session.ts:18-21": the path and what follows it, which names a reference in its controls. */
+export function workspaceReferenceLabel(reference: WorkspaceReference): string {
+  return `${reference.path}${workspaceReferenceSuffix(reference)}`;
+}
+
+/** "Attached image 2: diagram.png", or "Attached image 2" when the file name isn't known. */
+export function attachedImageAlt(number: number, name: string | undefined): string {
+  return name ? `Attached image ${number}: ${name}` : `Attached image ${number}`;
+}
+
+function ReferenceChipBody({ reference }: { reference: WorkspaceReference }) {
+  const suffix = workspaceReferenceSuffix(reference);
+  return (
+    <>
+      {reference.kind === "directory" ? <FolderIcon size={14} /> : <FileCodeIcon size={14} />}
+      {/* A long path keeps its end, where the file name is, and loses its start. */}
+      <span className="ref-chip-path"><bdi>{reference.path}</bdi></span>
+      {suffix && <span className="ref-chip-suffix">{suffix}</span>}
+    </>
+  );
+}
+
+/** A sent message's reference in the transcript: the chip without its open and remove halves. */
+export function ReadonlyReferenceChip({ reference }: { reference: WorkspaceReference }) {
+  return (
+    <span className="ref-chip is-readonly" title={workspaceReferenceLabel(reference)}>
+      <ReferenceChipBody reference={reference} />
+    </span>
+  );
+}
+
+/**
+ * The one remove button of the composer's attachment tray (#2177): 20px with the close icon, and a
+ * 28px hit area on a fine pointer, 44px on a coarse one. It unmounts with its attachment, so
+ * `onRemove` gets the button, to move a keyboard user's focus back to the composer (#1913).
+ */
+export function AttachmentRemove({ label, onRemove }: {
+  label: string;
+  onRemove: (control: HTMLElement) => void;
+}) {
+  return (
+    <button
+      className="attach-remove"
+      type="button"
+      // Keep the composer focused until the click lands, like Send: blurring it on pointerdown brings
+      // the phone rail back and moves this button out from under the finger.
+      onPointerDown={(event) => event.preventDefault()}
+      onClick={(event) => onRemove(event.currentTarget)}
+      aria-label={label}
+      title={label}
+    >
+      <CloseIcon size={14} />
+    </button>
+  );
+}
+
+/**
+ * Attached images and file references in one wrapping tray inside the composer card (#2177): 56px
+ * thumbnails and reference chips on one centre line, each with the same remove button.
+ */
+export function ComposerAttachments({
   images,
   onRemove,
   onInspectReference,
+  onImageBroken,
 }: {
   images: PromptImageInput[];
-  /** `control` is the ✕, which unmounts with its chip: a keyboard user's focus needs a new home. */
+  /** `control` is the remove button, which unmounts with its attachment: a keyboard user's focus
+   * needs a new home. */
   onRemove: (i: number, control: HTMLElement) => void;
   /** `opener` is the chip, for returning focus on close: a pointer never focuses it. */
   onInspectReference?: (reference: WorkspaceReference, opener: HTMLElement) => void;
+  /** An attached image that couldn't be shown, for the notice slot to name. */
+  onImageBroken?: (image: PromptImageInput) => void;
 }) {
   if (!images.length) return null;
+  let imageNumber = 0;
   return (
-    <div className="image-strip">
-      {images.map((img, i) => (
-        isWorkspaceReference(img) ? (
-          <div className="workspace-reference-chip" key={img.artifactId}>
-            <button
-              className="workspace-reference-open"
-              type="button"
-              // Keep the composer focused until the click lands, like Send: blurring it on
-              // pointerdown brings the phone rail back and moves this chip out from under the finger.
-              onPointerDown={(event) => event.preventDefault()}
-              onClick={(event) => onInspectReference?.(img, event.currentTarget)}
-              aria-label={`Inspect Workspace Reference ${workspaceReferenceLabel(img)}`}
-              title="Inspect Workspace Reference"
-            >
-              <span aria-hidden="true">@</span>{workspaceReferenceLabel(img)}
-            </button>
-            <button
-              className="workspace-reference-remove"
-              type="button"
-              // Keep the composer focused until the click lands, like Send: blurring it on
-              // pointerdown brings the phone rail back and moves this button out from under the finger.
-              onPointerDown={(event) => event.preventDefault()}
-              onClick={(event) => onRemove(i, event.currentTarget)}
-              aria-label={`Remove Workspace Reference ${workspaceReferenceLabel(img)}`}
-            >
-              ✕
-            </button>
+    <div className="composer-attachments">
+      {images.map((img, i) => {
+        if (isWorkspaceReference(img)) {
+          const label = workspaceReferenceLabel(img);
+          return (
+            <div className="ref-chip" key={img.artifactId}>
+              <button
+                className="ref-chip-open"
+                type="button"
+                // Keep the composer focused until the click lands, like Send: blurring it on
+                // pointerdown brings the phone rail back and moves this chip out from under the finger.
+                onPointerDown={(event) => event.preventDefault()}
+                onClick={(event) => onInspectReference?.(img, event.currentTarget)}
+                aria-label={`Inspect Reference ${label}`}
+                title={label}
+              >
+                <ReferenceChipBody reference={img} />
+              </button>
+              <AttachmentRemove label={`Remove Reference ${label}`} onRemove={(control) => onRemove(i, control)} />
+            </div>
+          );
+        }
+        imageNumber += 1;
+        const number = imageNumber;
+        return (
+          <div className="attach-thumb" key={attachmentKey(img)}>
+            <PromptImageView
+              image={img}
+              alt={attachedImageAlt(number, attachmentFileName(img))}
+              onBroken={onImageBroken && (() => onImageBroken(img))}
+            />
+            <AttachmentRemove label={`Remove Attached Image ${number}`} onRemove={(control) => onRemove(i, control)} />
           </div>
-        ) : (
-          <div className="image-thumb" key={i}>
-            <PromptImageView image={img} alt={`attachment ${i + 1}`} />
-            <button
-              className="image-remove"
-              type="button"
-              // Keep the composer focused until the click lands, like Send: blurring it on
-              // pointerdown brings the phone rail back and moves this button out from under the finger.
-              onPointerDown={(event) => event.preventDefault()}
-              onClick={(event) => onRemove(i, event.currentTarget)}
-              aria-label="Remove Image"
-            >
-              ✕
-            </button>
-          </div>
-        )
-      ))}
+        );
+      })}
     </div>
   );
 }
+
