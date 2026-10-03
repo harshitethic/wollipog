@@ -862,6 +862,7 @@ function SessionDetailLoaded({
   const clearSourceLocation = useCallback(() => {
     navigate({ name: "session", id: sessionId });
   }, [navigate, sessionId]);
+  const openSession = useCallback((id: string) => navigate({ name: "session", id }), [navigate]);
   const recoveryEventEpoch = useStoreSelector((s) => s.sessions.get(sessionId)?.eventEpoch ?? 0);
   const recoveryGeneration = useStoreSelector((s) => s.snapshotRevision);
   const evs = useStoreSelector((s) => s.events.get(sessionId));
@@ -5609,6 +5610,7 @@ function SessionDetailLoaded({
                       sessionActive={isTimelineSessionActive(session.status)}
                       onOpenSubagent={mode === "expanded" ? openSubagent : undefined}
                       onOpenSourceLocation={openSourceLocation}
+                      onOpenSession={openSession}
                       workspaceRoot={session.worktreePath ?? runner?.workspaces.find((workspace) => workspace.id === session.workspaceId)?.path}
                       scrollRef={scrollRef}
                       historyKey={timelineHistoryKey}
