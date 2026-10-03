@@ -29,6 +29,10 @@ const ROOT_SESSION_POLL_MS = 30_000;
 /** While details show pull requests, their GitHub status is re-read on this cadence (slice 8). The
  * server reads each pull request at most every 30 seconds whoever asks. */
 export const CAMPAIGN_FORGE_REFRESH_MS = 60_000;
+/** Member usage moves campaign cost without a revision, and the server re-sends the root at most
+ * once per second per campaign. Cost-only changes re-read the open details and the shown rows at
+ * most once per this window, matching the server's coalescing. */
+export const CAMPAIGN_COST_REFRESH_MS = 1_000;
 
 export type CampaignLoadStatus = "loading" | "ready" | "error";
 
@@ -110,6 +114,9 @@ export function useCampaignStatusAvailability(
  *   A new revision reloads the rows already shown in place, and a `revision_changed` refusal on a
  *   later page restarts from the first page, so a list is never stitched from two revisions.
  * - The selected item's details reload on every revision too.
+ * - Cost moves without a revision as member usage arrives, and the server re-sends the root with
+ *   the new summary cost. A cost-only change re-reads the open details and, quietly, the shown rows
+ *   at the same revision, at most once per `CAMPAIGN_COST_REFRESH_MS`, so they follow the summary.
  */
 export function useCampaignStatus({
   session,
@@ -199,6 +206,45 @@ export function useCampaignStatus({
     };
   const revision = summary.summary?.revision ?? null;
 
+  /* ---------------------------------------------------------------- cost refresh */
+  // The summary's cost moved at the same revision: usage arrived, and the details and rows still
+  // carry the old cost. The first change re-reads at once; further changes within the window are
+  // gathered into one re-read when it ends, so a token stream costs at most one re-read per window.
+  // A new revision reloads everything anyway and drops any gathered re-read.
+  const costKey = summary.summary?.cost ? JSON.stringify(summary.summary.cost) : null;
+  const [costReads, setCostReads] = useState(0);
+  const lastCost = useRef({ revision, costKey });
+  const costWindow = useRef<{ timer: number | null; pending: boolean }>({ timer: null, pending: false });
+  useEffect(() => {
+    const previous = lastCost.current;
+    lastCost.current = { revision, costKey };
+    const gate = costWindow.current;
+    if (previous.revision !== revision) {
+      gate.pending = false;
+      return;
+    }
+    if (previous.costKey === costKey || previous.costKey === null) return;
+    if (gate.timer !== null) {
+      gate.pending = true;
+      return;
+    }
+    setCostReads((count) => count + 1);
+    const close = () => {
+      if (!gate.pending) {
+        gate.timer = null;
+        return;
+      }
+      gate.pending = false;
+      setCostReads((count) => count + 1);
+      gate.timer = window.setTimeout(close, CAMPAIGN_COST_REFRESH_MS);
+    };
+    gate.timer = window.setTimeout(close, CAMPAIGN_COST_REFRESH_MS);
+  }, [revision, costKey]);
+  useEffect(() => () => {
+    if (costWindow.current.timer !== null) window.clearTimeout(costWindow.current.timer);
+    costWindow.current = { timer: null, pending: false };
+  }, []);
+
   /* ---------------------------------------------------------------- work list */
   const listKey = JSON.stringify([session.id, filters.origin, filters.state, filters.sort]);
   const [list, setList] = useState<{ key: string; state: CampaignListState; cursor: string | null }>(
@@ -220,6 +266,30 @@ export function useCampaignStatus({
   // The page a Show More in flight asked for. A reload that starts before it lands drops its
   // response, so the reload loads those rows itself rather than swallowing the request.
   const requestedMore = useRef<{ key: string } | null>(null);
+  // The shown rows may carry an older cost than the summary: a cost change arrived and no re-read
+  // or reload started since. It stays set until a quiet re-read lands or a reload starts.
+  const rowsStale = useRef(false);
+  const seenCostReads = useRef(0);
+
+  /** Read the list from its first page until at least `want` rows, or null once `live()` is false. */
+  const readRows = useCallback(async (want: number, signal: AbortSignal, live: () => boolean) => {
+    const rows: CampaignWorkItemSummary[] = [];
+    const seen = new Set<string>();
+    let cursor: string | null = null;
+    let total: number | null = null;
+    do {
+      const limit = Math.min(CAMPAIGN_WORK_PAGE_CEILING, Math.max(1, want - rows.length));
+      const page = await api.campaignWorkItems(session.id, campaignWorkItemsQuery(filtersRef.current, cursor, limit), signal);
+      if (!live()) return null;
+      const before = rows.length;
+      for (const item of page.items) if (!seen.has(item.id)) { seen.add(item.id); rows.push(item); }
+      total = page.total;
+      cursor = page.nextCursor;
+      // A page that adds nothing would repeat forever; what was shown stays, and Show More remains.
+      if (rows.length === before) break;
+    } while (cursor && rows.length < want);
+    return { rows, total, cursor };
+  }, [api, session.id]);
 
   /**
    * Load the list from its first page until at least `target` rows are shown, page by page, all at
@@ -234,27 +304,18 @@ export function useCampaignStatus({
     const want = Math.max(CAMPAIGN_WORK_PAGE_SIZE, target, superseded);
     reloadTarget.current = { key: listKey, rows: want };
     reloading.current = true;
+    // Its pages are read from now on, so they carry every cost the summary has shown so far.
+    rowsStale.current = false;
     setList((current) => current.key === listKey
       ? { ...current, state: { ...current.state, reloading: true } }
       : { key: listKey, state: { ...EMPTY_LIST, reloading: true }, cursor: null });
     void (async () => {
       for (let restarts = 0; ; restarts += 1) {
         try {
-          const rows: CampaignWorkItemSummary[] = [];
-          const seen = new Set<string>();
-          let cursor: string | null = null;
-          let total: number | null = null;
-          do {
-            const limit = Math.min(CAMPAIGN_WORK_PAGE_CEILING, Math.max(1, want - rows.length));
-            const page = await api.campaignWorkItems(session.id, campaignWorkItemsQuery(filtersRef.current, cursor, limit), controller.signal);
-            if (!live()) return;
-            const before = rows.length;
-            for (const item of page.items) if (!seen.has(item.id)) { seen.add(item.id); rows.push(item); }
-            total = page.total;
-            cursor = page.nextCursor;
-            // A page that adds nothing would repeat forever; what was shown stays, and Show More remains.
-            if (rows.length === before) break;
-          } while (cursor && rows.length < want);
+          const read = await readRows(want, controller.signal, live);
+          // A newer reload may have started while this continuation was queued.
+          if (!read || !live()) return;
+          const { rows, total, cursor } = read;
           reloading.current = false;
           setList({
             key: listKey,
@@ -277,7 +338,7 @@ export function useCampaignStatus({
       }
     })();
     return () => controller.abort();
-  }, [api, listKey, session.id]);
+  }, [listKey, readRows]);
 
   // A remounted panel reloads as many rows as it last showed, so returning from an item's details
   // finds that item's row and scroll position again. Only for the list it was showing: a new
@@ -332,21 +393,91 @@ export function useCampaignStatus({
     });
   }, [api, listKey, reload, session.id]);
 
+  // A cost-only change re-reads the shown rows at the same revision without a reload: nothing shows
+  // as reloading and Show More stays available. While a reload or a Show More is in flight the
+  // re-read waits, and it runs once the list settles: a Show More only appends its page, so the rows
+  // above it would otherwise keep their older cost. The fresh rows replace the shown ones only when
+  // nothing else changed the list meanwhile; when something did, this runs again on the settled list.
+  // A further cost change never cancels a re-read in flight, or a walk slower than the window would
+  // never land while usage streams: it is gathered behind that re-read, which re-reads once more on
+  // landing. Only a change to the list itself (or going offline) abandons it. A `revision_changed`
+  // refusal partway restarts the walk a bounded number of times: in the cost sort, usage itself
+  // reorders the rows between pages, and a moved revision reloads the list anyway. Any other failure
+  // leaves the shown rows as they are, and retries once more if cost changes arrived meanwhile.
+  const quietRead = useRef<{ controller: AbortController; shown: typeof list } | null>(null);
+  const [rowRetries, setRowRetries] = useState(0);
+  useEffect(() => {
+    if (costReads !== seenCostReads.current) {
+      seenCostReads.current = costReads;
+      rowsStale.current = true;
+    }
+    const inFlight = quietRead.current;
+    if (inFlight && (inFlight.shown !== list || !online)) {
+      inFlight.controller.abort();
+      quietRead.current = null;
+    }
+    if (quietRead.current || !rowsStale.current || !online) return;
+    const shown = list;
+    if (shown.key !== listKey || shown.state.status !== "ready" || shown.state.loadingMore || reloading.current) return;
+    const controller = new AbortController();
+    const current = { controller, shown };
+    quietRead.current = current;
+    const live = () => !controller.signal.aborted && listRef.current === shown;
+    const settled = () => { if (quietRead.current === current) quietRead.current = null; };
+    void (async () => {
+      for (let restarts = 0; ; restarts += 1) {
+        const tick = seenCostReads.current;
+        try {
+          const read = await readRows(shown.state.items.length, controller.signal, live);
+          settled();
+          if (!read || !live()) return;
+          // Cost changes that arrived while this read was in flight leave the rows stale, so the
+          // list this sets re-runs the effect and reads once more.
+          rowsStale.current = seenCostReads.current !== tick;
+          setList({ key: listKey, state: { ...shown.state, items: read.rows, total: read.total, hasMore: read.cursor !== null }, cursor: read.cursor });
+          return;
+        } catch (cause) {
+          if (!live() || isAbort(cause)) {
+            settled();
+            return;
+          }
+          if (isRevisionChanged(cause) && restarts < MAX_REVISION_RESTARTS) continue;
+          settled();
+          // The shown rows stay. Changes gathered behind this read get one more attempt; otherwise
+          // a new revision, a settled page, or the next cost change re-reads them.
+          if (seenCostReads.current !== tick) setRowRetries((count) => count + 1);
+          return;
+        }
+      }
+    })();
+  }, [costReads, list, listKey, online, readRows, rowRetries]);
+  useEffect(() => () => {
+    quietRead.current?.controller.abort();
+    quietRead.current = null;
+  }, []);
+
   /* ---------------------------------------------------------------- detail */
   const detailKey = selectedItemId ? `${session.id}:${selectedItemId}` : null;
   const [detail, setDetail] = useState<{ key: string; state: CampaignDetailState } | null>(null);
   /** Completed forge reads; each one reloads the shown details (see the forge refresh below). */
   const [forgeReads, setForgeReads] = useState(0);
+  // Every outcome (details, missing, or an error) applies in the order its read was issued, whether
+  // a load or a cost re-read issued it, so an older answer never replaces a newer one.
+  const detailOrder = useRef({ issued: 0, applied: 0 });
   useEffect(() => {
     if (!selectedItemId || !detailKey || !online) return;
     const controller = new AbortController();
     // Aborting cannot stop a body already arriving, so a superseded response is ignored here.
     let cancelled = false;
+    const sequence = ++detailOrder.current.issued;
     api.campaignWorkItem(session.id, selectedItemId, controller.signal).then((response) => {
-      if (cancelled) return;
+      if (cancelled || sequence < detailOrder.current.applied) return;
+      detailOrder.current.applied = sequence;
       setDetail({ key: detailKey, state: { status: "ready", detail: response.item, error: null } });
     }).catch((cause: unknown) => {
-      if (cancelled || isAbort(cause)) return;
+      // An older failure never replaces what a newer read already showed.
+      if (cancelled || isAbort(cause) || sequence < detailOrder.current.applied) return;
+      detailOrder.current.applied = sequence;
       if (cause instanceof ApiError && cause.status === 404) {
         setDetail({ key: detailKey, state: { status: "missing", detail: null, error: null } });
         return;
@@ -361,6 +492,50 @@ export function useCampaignStatus({
       controller.abort();
     };
   }, [api, detailKey, forgeReads, online, revision, reconnects, retries, selectedItemId, session.id]);
+
+  // A cost-only change re-reads the open details without cancelling a read already in flight: a
+  // slow read would otherwise be cancelled by every change and never land while usage streams. At
+  // most one cost re-read is in flight; changes meanwhile are gathered into one more when it ends.
+  const openDetail = useRef({ key: detailKey, itemId: selectedItemId, online });
+  openDetail.current = { key: detailKey, itemId: selectedItemId, online };
+  const costDetail = useRef({ busy: false, pending: false });
+  // A read still in flight when the panel closes may settle later; it must not start another.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      costDetail.current.pending = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (costReads === 0) return;
+    const gate = costDetail.current;
+    if (gate.busy) {
+      gate.pending = true;
+      return;
+    }
+    const read = () => {
+      const { key, itemId, online: connected } = openDetail.current;
+      if (!mounted.current || !key || !itemId || !connected) return;
+      gate.busy = true;
+      gate.pending = false;
+      const sequence = ++detailOrder.current.issued;
+      api.campaignWorkItem(session.id, itemId).then((response) => {
+        if (openDetail.current.key !== key || sequence < detailOrder.current.applied) return;
+        detailOrder.current.applied = sequence;
+        setDetail({ key, state: { status: "ready", detail: response.item, error: null } });
+      }).catch(() => {
+        // The shown details stay; the next revision or cost change reads them again.
+      }).finally(() => {
+        gate.busy = false;
+        if (gate.pending && mounted.current) read();
+      });
+    };
+    read();
+    // Only a cost change starts this; the open item is read through `openDetail` when it runs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [costReads]);
 
   /* ---------------------------------------------------------------- forge refresh */
   // While an item's details are showing, ask the server to read its pull requests on GitHub: once

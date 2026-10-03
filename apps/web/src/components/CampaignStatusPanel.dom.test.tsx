@@ -24,7 +24,7 @@ import { titleCaseLabel } from "../format.js";
 import type { GitStatus } from "./useGitStatus.js";
 import { RightPanel, useRightPanelState, type RightPanelState } from "./RightPanel.js";
 import { forgetCampaignStatusMemory } from "./CampaignStatusPanel.js";
-import { useCampaignStatusAvailability } from "./useCampaignStatus.js";
+import { CAMPAIGN_COST_REFRESH_MS, useCampaignStatusAvailability } from "./useCampaignStatus.js";
 import { CAMPAIGN_STATUS_UNSUPPORTED_REASON } from "../campaign-status.js";
 import {
   campaignProjection,
@@ -1063,23 +1063,349 @@ test("Back before the remembered rows arrive still lands on the opened row once 
   }
 });
 
-test("member usage re-sent on the root updates the summary cost without reloading the list", async () => {
-  const { client, calls } = fakeClient(() => ({ revision: 1, items: [item("cwi_1")], nextCursor: null }));
-  const panel = await mount({ initial: rootSession, client });
+/** A server whose item costs move as usage arrives, without a new revision. */
+function costServer(initialUsd: number, rows = 1) {
+  const state = { usd: initialUsd, revision: 1 };
+  const summaryOf = (id: string) => item(id, { cost: knownCost(state.usd) });
+  const ids = Array.from({ length: rows }, (_, index) => `cwi_${index + 1}`);
+  const details: Record<string, CampaignWorkItemDetail> = {};
+  const refreshDetails = () => { for (const id of ids) details[id] = detailOf(summaryOf(id)); };
+  refreshDetails();
+  const base = fakeClient(() => ({ revision: state.revision, items: ids.map(summaryOf), nextCursor: null }), details);
+  const calls = Object.assign(base.calls, { aborted: 0, rowsAborted: 0, rowsIssued: 0 });
+  /**
+   * While `hold` is set, detail reads wait for it, and row reads wait for `rows`, as a slow server
+   * would. While `manual` is set, each detail read waits until the test settles it from `pending`,
+   * in any order, with the details as they stand then or with an error.
+   */
+  const slow: {
+    hold: Promise<void> | null;
+    rows: Promise<void> | null;
+    manual: boolean;
+    /** Errors the next row reads fail with, in order, once any hold is released. */
+    refuse: Error[];
+    pending: Array<(outcome?: Error) => void>;
+  } = { hold: null, rows: null, manual: false, pending: [], refuse: [] };
+  const client = {
+    ...base.client,
+    campaignWorkItems: async (id: string, query: string, signal?: AbortSignal) => {
+      calls.rowsIssued += 1;
+      signal?.addEventListener("abort", () => { calls.rowsAborted += 1; });
+      const held = slow.rows;
+      if (held) await held;
+      const refusal = slow.refuse.shift();
+      if (refusal) throw refusal;
+      return base.client.campaignWorkItems(id, query, signal);
+    },
+    campaignWorkItem: async (id: string, itemId: string, signal?: AbortSignal) => {
+      base.calls.detail.push(`${id}/${itemId}`);
+      signal?.addEventListener("abort", () => { calls.aborted += 1; });
+      if (slow.manual) {
+        const outcome = await new Promise<Error | undefined>((settle) => { slow.pending.push(settle); });
+        if (outcome) throw outcome;
+      } else if (slow.hold) {
+        await slow.hold;
+      }
+      if (signal?.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      const found = details[itemId];
+      if (!found) throw new ApiError("not found", 404);
+      return { revision: state.revision, item: found };
+    },
+  } as ApiClient;
+  return {
+    client,
+    calls,
+    slow,
+    /** Usage arrives: every item now costs `usd`, and the root summary says so at `revision`. Its
+     * coordination share differs from the fixture's, so every call moves the summary cost. */
+    use(usd: number, revision = state.revision) {
+      state.usd = usd;
+      state.revision = revision;
+      refreshDetails();
+      const base = workSummary();
+      return session({ orchestratorCampaign: campaign(workSummary({
+        revision, cost: { ...base.cost!, total: knownCost(usd * rows + 0.25), workItems: knownCost(usd * rows) },
+      })) });
+    },
+  };
+}
+
+function detailCost(container: HTMLElement): string {
+  const term = [...container.querySelectorAll("dt")].find((node) => node.textContent === "Cost");
+  return term?.nextElementSibling?.textContent ?? "";
+}
+
+const pause = (ms: number) => act(async () => { await new Promise((resolve) => setTimeout(resolve, ms)); });
+
+test("member usage re-sent on the root re-reads the open details and the shown rows, with no reload", async () => {
+  const server = costServer(1);
+  const panel = await mount({ initial: rootSession, client: server.client });
   try {
     await act(async () => panel.state.show("campaign"));
     await settle();
     const summaryText = () => panel.container.querySelector(".campaign-status-summary")?.textContent ?? "";
     assert.match(summaryText(), /\$2\.50/);
-    const listed = calls.list.length;
+    await click(panel.container.querySelector(".campaign-work-row")!);
+    assert.match(detailCost(panel.container), /\$1\.00/);
+    const [listed, detailed] = [server.calls.list.length, server.calls.detail.length];
+
     // The server re-sends the root after member usage arrives: the same revision, a higher cost.
-    const base = workSummary();
+    await panel.setSession(server.use(3.25));
+    assert.equal(server.calls.detail.length, detailed + 1, "the open details are re-read once");
+    assert.match(detailCost(panel.container), /\$3\.25/, "the open item's cost follows the summary");
+    assert.equal(server.calls.list.length, listed + 1, "the shown rows are re-read once");
+    assert.doesNotMatch(server.calls.list.at(-1)!, /cursor=/, "at the same revision, from the first page");
+
+    await click(panel.container.querySelector(".campaign-detail-back")!);
+    assert.match(summaryText(), /\$3\.50/, "the summary shows the new campaign cost");
+    const row = panel.container.querySelector(".campaign-work-row")!;
+    assert.match(row.textContent ?? "", /\$3\.25/, "the row shows the new cost too");
+    assertNoDomNode(panel.container.querySelector('[role="alert"]'), "a cost refresh is not an error");
+  } finally {
+    await panel.dispose();
+  }
+});
+
+test("a token stream re-reads at most once per window, and a revision change needs no extra re-read", async () => {
+  const server = costServer(1);
+  const panel = await mount({ initial: rootSession, client: server.client });
+  try {
+    await act(async () => panel.state.show("campaign"));
+    await settle();
+    await click(panel.container.querySelector(".campaign-work-row")!);
+    const detailed = server.calls.detail.length;
+
+    // A burst of re-sends inside one window: one re-read at once, one more when the window closes.
+    for (const usd of [1.5, 2, 2.5, 3]) await panel.setSession(server.use(usd));
+    assert.equal(server.calls.detail.length, detailed + 1, "the first change re-reads at once");
+    await pause(CAMPAIGN_COST_REFRESH_MS + 100);
+    await settle();
+    assert.equal(server.calls.detail.length, detailed + 2, "the rest of the burst costs one more re-read");
+    assert.match(detailCost(panel.container), /\$3\.00/, "and it shows the latest cost");
+    await pause(CAMPAIGN_COST_REFRESH_MS + 100);
+    await settle();
+    assert.equal(server.calls.detail.length, detailed + 2, "a quiet window re-reads nothing");
+
+    // A new revision with a new cost reloads once through the revision path, not twice.
+    const beforeRevision = server.calls.detail.length;
+    await panel.setSession(server.use(4, 2));
+    await pause(CAMPAIGN_COST_REFRESH_MS + 100);
+    await settle();
+    assert.equal(server.calls.detail.length, beforeRevision + 1, "the revision reload already carries the new cost");
+    assert.match(detailCost(panel.container), /\$4\.00/);
+  } finally {
+    await panel.dispose();
+  }
+});
+
+test("details slower than the window still land while usage streams, with no read cancelled", async () => {
+  const server = costServer(1);
+  const panel = await mount({ initial: rootSession, client: server.client });
+  try {
+    await act(async () => panel.state.show("campaign"));
+    await settle();
+    await click(panel.container.querySelector(".campaign-work-row")!);
+    assert.match(detailCost(panel.container), /\$1\.00/);
+    const detailed = server.calls.detail.length;
+    // The server now answers detail reads only when released, while costs keep moving.
+    let release!: () => void;
+    server.slow.hold = new Promise<void>((done) => { release = done; });
+    for (const usd of [2, 3, 4]) {
+      await panel.setSession(server.use(usd));
+      await pause(CAMPAIGN_COST_REFRESH_MS + 100);
+    }
+    assert.equal(server.calls.detail.length, detailed + 1, "one cost re-read in flight; later changes wait for it");
+    assert.equal(server.calls.aborted, 0, "no read is cancelled by a later cost change");
+    server.slow.hold = null;
+    await act(async () => { release(); });
+    await settle();
+    assert.equal(server.calls.detail.length, detailed + 2, "the gathered changes cost one more re-read once it lands");
+    assert.match(detailCost(panel.container), /\$4\.00/, "and the details show the latest cost");
+  } finally {
+    await panel.dispose();
+  }
+});
+
+test("rows slower than the window still land while usage streams, with no re-read cancelled", async () => {
+  const server = costServer(1);
+  const panel = await mount({ initial: rootSession, client: server.client });
+  try {
+    await act(async () => panel.state.show("campaign"));
+    await settle();
+    const rowCost = () => /\$\d+\.\d{2}/u.exec(panel.container.querySelector(".campaign-work-row")?.textContent ?? "")?.[0];
+    assert.equal(rowCost(), "$1.00");
+    const listed = server.calls.rowsIssued;
+    // The server now answers row reads only when released, while costs keep moving.
+    let release!: () => void;
+    server.slow.rows = new Promise<void>((done) => { release = done; });
+    for (const usd of [2, 3, 4]) {
+      await panel.setSession(server.use(usd));
+      await pause(CAMPAIGN_COST_REFRESH_MS + 100);
+    }
+    assert.equal(server.calls.rowsIssued, listed + 1, "one quiet re-read in flight; later changes wait for it");
+    assert.equal(server.calls.rowsAborted, 0, "no row re-read is cancelled by a later cost change");
+    server.slow.rows = null;
+    await act(async () => { release(); });
+    await settle();
+    assert.equal(server.calls.rowsIssued, listed + 2, "the gathered changes cost one more re-read once it lands");
+    assert.equal(rowCost(), "$4.00", "and the rows show the latest cost");
+  } finally {
+    await panel.dispose();
+  }
+});
+
+test("a refused or failed quiet re-read still brings the rows to the latest cost", async () => {
+  const server = costServer(1);
+  const panel = await mount({ initial: rootSession, client: server.client });
+  try {
+    await act(async () => panel.state.show("campaign"));
+    await settle();
+    const rowCost = () => /\$\d+\.\d{2}/u.exec(panel.container.querySelector(".campaign-work-row")?.textContent ?? "")?.[0];
+    for (const [usd, refusal] of [
+      // In the cost sort, usage can reorder the rows between pages, and the server refuses the cursor.
+      [3, new ApiError("revision changed", 409, "revision_changed")],
+      // Any other failure, with a change gathered behind the read, gets one more attempt.
+      [5, new ApiError("unavailable", 503)],
+    ] as const) {
+      let release!: () => void;
+      server.slow.rows = new Promise<void>((done) => { release = done; });
+      await panel.setSession(server.use(usd - 1));
+      await pause(CAMPAIGN_COST_REFRESH_MS + 100);
+      // The last change of the stream arrives while that re-read is in flight, which then fails.
+      await panel.setSession(server.use(usd));
+      server.slow.refuse.push(refusal);
+      server.slow.rows = null;
+      await act(async () => { release(); });
+      await settle();
+      assert.equal(rowCost(), `$${usd}.00`, `rows follow the latest cost after a ${refusal.status}`);
+      assertNoDomNode(panel.container.querySelector('[role="alert"]'), "a quiet re-read's failure is not shown");
+      await pause(CAMPAIGN_COST_REFRESH_MS + 100);
+    }
+  } finally {
+    await panel.dispose();
+  }
+});
+
+test("a cost re-read gathered behind a slow one never starts after the panel closes", async () => {
+  const server = costServer(1);
+  const panel = await mount({ initial: rootSession, client: server.client });
+  let release!: () => void;
+  try {
+    await act(async () => panel.state.show("campaign"));
+    await settle();
+    await click(panel.container.querySelector(".campaign-work-row")!);
+    server.slow.hold = new Promise<void>((done) => { release = done; });
+    await panel.setSession(server.use(2));
+    await pause(CAMPAIGN_COST_REFRESH_MS + 100);
+    await panel.setSession(server.use(3));
+  } finally {
+    await panel.dispose();
+  }
+  const issued = server.calls.detail.length;
+  server.slow.hold = null;
+  await act(async () => { release(); });
+  await settle();
+  assert.equal(server.calls.detail.length, issued, "the closed panel reads nothing more");
+});
+
+test("detail outcomes apply in the order their reads were issued, whichever path issued them", async () => {
+  const server = costServer(1);
+  const panel = await mount({ initial: rootSession, client: server.client });
+  const text = () => panel.container.querySelector(".rp-body")?.textContent ?? panel.container.textContent ?? "";
+  try {
+    await act(async () => panel.state.show("campaign"));
+    await settle();
+    await click(panel.container.querySelector(".campaign-work-row")!);
+    assert.match(detailCost(panel.container), /\$1\.00/);
+    server.slow.manual = true;
+
+    // An older load's failure lands after a newer cost re-read: the newer details stay.
+    await panel.setSession(server.use(2, 2));
+    const olderLoad = server.slow.pending.length - 1;
+    await panel.setSession(server.use(3, 2));
+    const newerCostRead = server.slow.pending.length - 1;
+    assert.ok(newerCostRead > olderLoad, "the cost re-read was issued after the revision's load");
+    await act(async () => { server.slow.pending[newerCostRead]!(); });
+    await settle();
+    assert.match(detailCost(panel.container), /\$3\.00/);
+    await act(async () => { server.slow.pending[olderLoad]!(new ApiError("unavailable", 503)); });
+    await settle();
+    assertNoDomNode(panel.container.querySelector('[role="alert"]'), "an older failure never replaces newer details");
+    assert.match(detailCost(panel.container), /\$3\.00/);
+
+    // An older cost re-read lands after a newer load found the item gone: it stays gone.
+    await pause(CAMPAIGN_COST_REFRESH_MS + 100);
+    await panel.setSession(server.use(4, 2));
+    const olderCostRead = server.slow.pending.length - 1;
+    await panel.setSession(server.use(4, 3));
+    const newerLoad = server.slow.pending.length - 1;
+    assert.ok(newerLoad > olderCostRead);
+    await act(async () => { server.slow.pending[newerLoad]!(new ApiError("not found", 404)); });
+    await settle();
+    assert.match(text(), /Work Item Not Found/u);
+    await act(async () => { server.slow.pending[olderCostRead]!(); });
+    await settle();
+    assert.match(text(), /Work Item Not Found/u, "an older answer never brings back an item a newer read found gone");
+  } finally {
+    server.slow.manual = false;
+    for (const settleRead of server.slow.pending) settleRead();
+    await panel.dispose();
+  }
+});
+
+test("a quiet row re-read never blocks Show More and never replaces rows a page added meanwhile", async () => {
+  // A server that honours `limit`, whose item costs move with usage; Show More can be held.
+  let usd = 1;
+  const all = () => Array.from({ length: 60 }, (_, index) =>
+    item(`cwi_${index + 1}`, { queuePosition: index + 1, cost: knownCost(usd) }));
+  let hold: { promise: Promise<void>; resolve: () => void } | null = null;
+  const pages = (query: string): FixturePage | Error => {
+    const search = new URLSearchParams(query);
+    const offset = Number(search.get("cursor") ?? 0);
+    const limit = Number(search.get("limit"));
+    const next = offset + limit < 60 ? String(offset + limit) : null;
+    return { revision: 1, items: all().slice(offset, offset + limit), nextCursor: next, total: 60 };
+  };
+  const rowCosts = () => new Set([...panel.container.querySelectorAll(".campaign-work-row")]
+    .map((row) => /\$\d+\.\d{2}/u.exec(row.textContent ?? "")?.[0]));
+  const base = fakeClient(pages);
+  const client = {
+    ...base.client,
+    campaignWorkItems: async (id: string, query: string, signal?: AbortSignal) => {
+      if (hold && new URLSearchParams(query).get("cursor")) await hold.promise;
+      return base.client.campaignWorkItems(id, query, signal);
+    },
+  } as ApiClient;
+  const panel = await mount({ initial: rootSession, client });
+  try {
+    await act(async () => panel.state.show("campaign"));
+    await settle();
+    assert.equal(panel.container.querySelectorAll(".campaign-work-row").length, 50);
+    // Show More is in flight when usage arrives.
+    let resolve!: () => void;
+    hold = { promise: new Promise<void>((done) => { resolve = done; }), resolve: () => resolve() };
+    const more = () => [...panel.container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "Show More");
+    await click(more()!);
+    usd = 3;
+    const usage = workSummary();
     await panel.setSession(session({ orchestratorCampaign: campaign(workSummary({
-      cost: { ...base.cost!, total: knownCost(3.75), workItems: knownCost(3.25) },
+      cost: { ...usage.cost!, total: knownCost(180) },
     })) }));
-    assert.match(summaryText(), /\$3\.75/, "the panel shows the new campaign cost");
-    assert.doesNotMatch(summaryText(), /\$2\.50/);
-    assert.equal(calls.list.length, listed, "a cost-only update keeps the list and its cursor");
+    await act(async () => { hold!.resolve(); });
+    hold = null;
+    await settle();
+    assert.equal(panel.container.querySelectorAll(".campaign-work-row").length, 60, "the page Show More asked for stays");
+    assert.deepEqual([...rowCosts()], ["$3.00"],
+      "the cost change that arrived during paging re-reads the rows above the new page once it lands");
+    // With nothing in flight, a cost change re-reads quietly: Show More stays enabled throughout.
+    await pause(CAMPAIGN_COST_REFRESH_MS + 100);
+    usd = 4;
+    await panel.setSession(session({ orchestratorCampaign: campaign(workSummary({
+      cost: { ...usage.cost!, total: knownCost(240) },
+    })) }));
+    assertNoDomNode(more() ?? null, "every row is shown, so there is no Show More");
+    assert.equal(panel.container.querySelectorAll(".campaign-work-row").length, 60, "the quiet re-read keeps every shown row");
+    assert.deepEqual([...rowCosts()], ["$4.00"]);
   } finally {
     await panel.dispose();
   }
