@@ -1007,9 +1007,10 @@ function VirtualList<T>({
     let pending = pendingAnchorRef.current;
     const currentScrollMargin = root.getBoundingClientRect().top - viewport.top + scroll.scrollTop;
     const currentViewportWidth = Math.round(viewport.width);
+    const widthChangedBeforeObserver =
+      viewportWidthRef.current !== 0 && viewportWidthRef.current !== currentViewportWidth;
     const geometryChangedBeforeObserver =
-      Math.abs(scrollMarginRef.current - currentScrollMargin) >= 0.5 ||
-      (viewportWidthRef.current !== 0 && viewportWidthRef.current !== currentViewportWidth);
+      Math.abs(scrollMarginRef.current - currentScrollMargin) >= 0.5 || widthChangedBeforeObserver;
     const widthAnchor = preserveAnchorRef.current ? widthAnchorRef.current : null;
     const widthAnchorRow = widthAnchor ? findRow(widthAnchor.key) : null;
     const mountedWidthAnchor = widthAnchor && widthAnchorRow ? widthAnchor : null;
@@ -1075,7 +1076,10 @@ function VirtualList<T>({
         const rect = row.getBoundingClientRect();
         return rect.bottom > correctedViewport.top && rect.top < correctedViewport.bottom;
       });
-    if (firstVisible?.dataset.virtualKey) {
+    // Until the observer adopts a new width, the rows are laid out for a width this list has not
+    // measured, and scrollTop may be clamped to that layout's end (#2541). Keep the last observed
+    // reading row as the baseline the width correction restores.
+    if (firstVisible?.dataset.virtualKey && !widthChangedBeforeObserver) {
       const anchor = {
         key: firstVisible.dataset.virtualKey,
         offset: firstVisible.getBoundingClientRect().top - correctedViewport.top,
