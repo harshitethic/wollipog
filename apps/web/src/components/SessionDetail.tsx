@@ -6009,7 +6009,7 @@ function SessionDetailLoaded({
                   markTouchEarlierActivityIntent(event.clientY);
                   // A touch pauses following on the press, as its touchstart does. A drag the
                   // floating tail control hands over (#2425) arrives as pointer events only.
-                  followTail.onTouchStart();
+                  followTail.onTouchPointerDown(event);
                 } else markPointerEarlierActivityIntent(event.currentTarget);
               }}
               onPointerMove={(event) => {
@@ -6029,7 +6029,7 @@ function SessionDetailLoaded({
               }}
               onTouchStart={(event) => {
                 markNativeTouchEarlierActivityIntent(event.touches[0]?.clientY ?? null);
-                followTail.onTouchStart();
+                followTail.onTouchStart(event.nativeEvent);
               }}
               onTouchMove={(event) => {
                 const clientY = event.touches[0]?.clientY ?? null;

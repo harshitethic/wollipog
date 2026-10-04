@@ -93,7 +93,8 @@ function Harness({ sessionId, revision, mode, scope = "test", rows, generation, 
       onScroll={followTail.onScroll}
       onWheel={followTail.onWheel}
       onPointerMove={followTail.onPointerMove}
-      onTouchStart={followTail.onTouchStart}
+      onTouchStart={(event) => followTail.onTouchStart(event.nativeEvent)}
+      onPointerDown={(event) => { if (event.pointerType === "touch") followTail.onTouchPointerDown(event); }}
       onKeyDown={(event) => {
         if (mode !== "expanded") return;
         if (followTail.onKeyDown(event)) event.preventDefault();
@@ -466,6 +467,168 @@ test("bare scroll intent pauses during the bounded streaming settle window", asy
     "settle frames after the first mutation frame must not veto scrollbar or assistive intent");
   await act(async () => { root.unmount(); });
   container.remove();
+});
+
+/** A touch event for the fingers `changed`, with `down` the fingers still on the page after it. */
+function touchEvent(type: "touchstart" | "touchend", changed: readonly number[], down: readonly number[]): Event {
+  const event = new domWindow.Event(type, { bubbles: true }) as unknown as Event;
+  const list = (ids: readonly number[]) => ids.map((identifier) => ({ identifier, clientY: 0 }));
+  Object.defineProperty(event, "changedTouches", { value: list(changed) });
+  Object.defineProperty(event, "touches", { value: list(down) });
+  return event;
+}
+
+function pointerEvent(type: "pointerdown" | "pointerup", pointerId: number): Event {
+  const event = new domWindow.Event(type, { bubbles: true }) as unknown as Event;
+  Object.defineProperty(event, "pointerId", { value: pointerId });
+  Object.defineProperty(event, "pointerType", { value: "touch" });
+  return event;
+}
+
+test("a held touch that turns back from the tail pauses at once, while layout and a lifted finger do not (#2549)", async () => {
+  MockResizeObserver.instances.length = 0;
+  const container = domWindow.document.createElement("div") as unknown as HTMLDivElement;
+  domWindow.document.body.append(container as never);
+  const root = createRoot(container);
+  await act(async () => {
+    root.render(<Harness sessionId="touch-reversal" revision={0} mode="expanded" scope="touch-reversal" />);
+  });
+  const transcript = container.firstElementChild as HTMLElement;
+  setScrollMetrics(transcript, { scrollTop: 600, scrollHeight: 1_000, clientHeight: 200 });
+  const scrollRequests: ScrollToOptions[] = [];
+  transcript.scrollTo = ((options: ScrollToOptions) => {
+    scrollRequests.push(options);
+    setScrollMetrics(transcript, {
+      scrollTop: Math.min(Number(options.top), transcript.scrollHeight - transcript.clientHeight),
+      scrollHeight: transcript.scrollHeight,
+      clientHeight: transcript.clientHeight,
+    });
+  }) as typeof transcript.scrollTo;
+  const viewportObserver = MockResizeObserver.instances.find((observer) => observer.observed.has(transcript));
+  assert.ok(viewportObserver);
+  const scrollTo = async (scrollTop: number, scrollHeight = transcript.scrollHeight) => {
+    setScrollMetrics(transcript, { scrollTop, scrollHeight, clientHeight: 200 });
+    await act(async () => { transcript.dispatchEvent(new domWindow.Event("scroll", { bubbles: true }) as never); });
+  };
+
+  // The press pauses; the pan reaches the tail and resumes there.
+  await act(async () => { transcript.dispatchEvent(touchEvent("touchstart", [1], [1]) as never); });
+  assert.equal(transcript.dataset.state, "paused");
+  await scrollTo(700);
+  await scrollTo(800);
+  assert.equal(transcript.dataset.state, "following");
+
+  // Content shrinking under the held finger clamps the reader up: layout, not reading back.
+  setScrollMetrics(transcript, { scrollTop: 800, scrollHeight: 950, clientHeight: 200 });
+  await act(async () => { viewportObserver.trigger(); });
+  await scrollTo(750, 950);
+  assert.equal(transcript.dataset.state, "following", "a layout clamp under a held finger keeps following");
+
+  // Turning back a single step, inside the 48px tail band, reads back at once.
+  await scrollTo(725, 950);
+  assert.equal(transcript.dataset.state, "paused", "a held finger turning back from the tail pauses");
+  scrollRequests.length = 0;
+  await act(async () => {
+    root.render(<Harness sessionId="touch-reversal" revision={1} mode="expanded" scope="touch-reversal" />);
+  });
+  assert.equal(scrollRequests.length, 0, "streamed output leaves the reader where the finger left it");
+
+  // Back at the tail it follows again; once the finger lifts, a small upward scroll inside the
+  // tail band is no longer a turn-back and keeps following, as before.
+  await scrollTo(750, 950);
+  assert.equal(transcript.dataset.state, "following");
+  await act(async () => { transcript.dispatchEvent(touchEvent("touchend", [1], []) as never); });
+  await scrollTo(725, 950);
+  assert.equal(transcript.dataset.state, "following", "without a held finger the tail band still applies");
+
+  await act(async () => { root.unmount(); });
+  container.remove();
+});
+
+test("each held finger is released by its own end, wherever that end is delivered (#2549)", async () => {
+  interface Fingers { transcript: HTMLElement; row: HTMLElement; outside: HTMLElement }
+  const dispatch = async (target: EventTarget, event: Event) => {
+    await act(async () => { target.dispatchEvent(event as never); });
+  };
+  const cases: Array<{ name: string; held: boolean; gesture: (fingers: Fingers) => Promise<void> }> = [
+    {
+      name: "a finger that is still down",
+      held: true,
+      gesture: async ({ row }) => { await dispatch(row, touchEvent("touchstart", [1], [1])); },
+    },
+    {
+      name: "a reader finger that lifts before a finger outside the reader",
+      held: false,
+      gesture: async ({ row, outside }) => {
+        await dispatch(row, touchEvent("touchstart", [1], [1]));
+        await dispatch(outside, touchEvent("touchstart", [2], [1, 2]));
+        await dispatch(row, touchEvent("touchend", [1], [2]));
+        await dispatch(outside, touchEvent("touchend", [2], []));
+      },
+    },
+    {
+      name: "one of two reader fingers, while the other stays down",
+      held: true,
+      gesture: async ({ row, transcript }) => {
+        await dispatch(row, touchEvent("touchstart", [1], [1]));
+        await dispatch(transcript, touchEvent("touchstart", [2], [1, 2]));
+        await dispatch(row, touchEvent("touchend", [1], [2]));
+      },
+    },
+    {
+      name: "a finger whose row a re-render removed before it lifted",
+      held: false,
+      gesture: async ({ row }) => {
+        await dispatch(row, touchEvent("touchstart", [1], [1]));
+        row.remove();
+        await dispatch(row, touchEvent("touchend", [1], []));
+      },
+    },
+    {
+      name: "a touch pointer that lifts outside the reader",
+      held: false,
+      gesture: async ({ transcript, outside }) => {
+        await dispatch(transcript, pointerEvent("pointerdown", 7));
+        await dispatch(outside, pointerEvent("pointerup", 7));
+      },
+    },
+    {
+      name: "a touch pointer while another pointer lifts",
+      held: true,
+      gesture: async ({ transcript, outside }) => {
+        await dispatch(transcript, pointerEvent("pointerdown", 7));
+        await dispatch(outside, pointerEvent("pointerup", 8));
+      },
+    },
+  ];
+  for (const [index, { name, held, gesture }] of cases.entries()) {
+    const container = domWindow.document.createElement("div") as unknown as HTMLDivElement;
+    const outside = domWindow.document.createElement("div") as unknown as HTMLElement;
+    domWindow.document.body.append(container as never, outside as never);
+    const root = createRoot(container);
+    const scope = `touch-release-${index}`;
+    await act(async () => { root.render(<Harness sessionId={scope} revision={0} mode="expanded" scope={scope} />); });
+    const transcript = container.firstElementChild as HTMLElement;
+    const row = domWindow.document.createElement("div") as unknown as HTMLElement;
+    transcript.append(row as never);
+    setScrollMetrics(transcript, { scrollTop: 800, scrollHeight: 1_000, clientHeight: 200 });
+    transcript.scrollTo = (() => {}) as typeof transcript.scrollTo;
+    const scrollTo = async (scrollTop: number) => {
+      setScrollMetrics(transcript, { scrollTop, scrollHeight: 1_000, clientHeight: 200 });
+      await dispatch(transcript, new domWindow.Event("scroll", { bubbles: true }) as unknown as Event);
+    };
+
+    await gesture({ transcript, row, outside });
+    await scrollTo(800);
+    assert.equal(transcript.dataset.state, "following", `${name}: at the tail`);
+    await scrollTo(775);
+    assert.equal(transcript.dataset.state, held ? "paused" : "following",
+      held ? `${name} is held, so turning back pauses` : `${name} is released, so the tail band applies`);
+
+    await act(async () => { root.unmount(); });
+    container.remove();
+    outside.remove();
+  }
 });
 
 test("previewing and paused sessions restore distinct logical anchors without following backfill", async () => {

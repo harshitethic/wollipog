@@ -421,7 +421,7 @@ function Fixture() {
           onScroll={followTailEnabled ? followTail.onScroll : undefined}
           onWheel={followTailEnabled ? followTail.onWheel : undefined}
           onPointerMove={followTailEnabled ? followTail.onPointerMove : undefined}
-          onTouchStart={followTailEnabled ? followTail.onTouchStart : undefined}
+          onTouchStart={followTailEnabled ? (event) => followTail.onTouchStart(event.nativeEvent) : undefined}
           onKeyDown={followTailEnabled ? (event) => {
             if (!followTail.onKeyDown(event)) return;
             event.preventDefault();
