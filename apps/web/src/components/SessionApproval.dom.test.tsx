@@ -7,7 +7,7 @@ import { Window } from "happy-dom";
 import type { AgentQuestion, SessionView } from "@wollipog/protocol";
 import { api, type ApiClient } from "../api.js";
 import { ApiProvider } from "../api-context.js";
-import { claimQuestionResponseOperation, clearQuestionDrafts, storedQuestionDrafts } from "../question-response.js";
+import { claimQuestionResponseOperation, clearQuestionDrafts, storeQuestionDrafts, storedQuestionDrafts } from "../question-response.js";
 import { setQuestionResponseStyle } from "../question-response-style.js";
 import { SessionApprovalBanner, SessionQuestionBanner } from "./SessionApproval.js";
 import { assertNoDomNode } from "../dom-test-assertions.js";
@@ -286,7 +286,7 @@ function submitButton(container: HTMLDivElement): HTMLButtonElement {
   return button;
 }
 
-test("unsupported multi-select Other responses are deactivated while Dismiss remains usable", async () => {
+test("multi-select custom text replaces choice selection and is submitted verbatim (#1595)", async () => {
   const container = domWindow.document.createElement("div") as unknown as HTMLDivElement;
   domWindow.document.body.append(container as never);
   const root = createRoot(container);
@@ -308,25 +308,23 @@ test("unsupported multi-select Other responses are deactivated while Dismiss rem
 
   try {
     await renderBanner(root, questions, true, client);
-    assertNoDomNode(container.querySelector(".question-input"));
+    const input = container.querySelector<HTMLInputElement>(".question-input");
+    assert.ok(input);
+    assert.equal(input.disabled, false);
     const choice = container.querySelector<HTMLButtonElement>('[role="checkbox"]');
     assert.ok(choice);
-    assert.equal(choice.disabled, true);
-    assert.equal(choice.getAttribute("aria-disabled"), "true");
-    assert.equal(choice.tabIndex, -1);
+    assert.equal(choice.disabled, false);
+    assert.equal(choice.getAttribute("aria-disabled"), null);
+    assert.equal(choice.tabIndex, 0);
     assert.equal(submitButton(container).disabled, true);
 
-    const dismiss = [...container.querySelectorAll<HTMLButtonElement>(".approval-actions button")]
-      .find((candidate) => candidate.textContent?.trim().startsWith("Dismiss"));
-    assert.ok(dismiss);
-    assert.equal(dismiss.disabled, false);
-    await act(async () => {
-      dismiss.click();
-      await tick();
-    });
+    await act(async () => { setInputValue(input, "Audit"); });
+    assert.equal(choice.getAttribute("aria-checked"), "false");
+    assert.equal(submitButton(container).disabled, false);
+    await act(async () => { submitButton(container).click(); await tick(); });
     assert.deepEqual(calls, [{
       sessionId: "session-1",
-      action: { requestId: "question-1", answers: {}, action: "dismiss" },
+      action: { requestId: "question-1", answers: { features: "Audit" }, action: "submit" },
     }]);
   } finally {
     await act(async () => { root.unmount(); });
@@ -847,5 +845,41 @@ test("a Viewer sees a permission request's options disabled with the reason, and
       await act(async () => { root.unmount(); });
       container.remove();
     }
+  }
+});
+
+
+test("switching to Interactive Form does not present an invalid typed choice as an Other draft", async () => {
+  const container = domWindow.document.createElement("div") as unknown as HTMLDivElement;
+  domWindow.document.body.append(container as never);
+  const root = createRoot(container);
+  const questions: AgentQuestion[] = [{
+    id: "target", question: "Choose a target", allowOther: false,
+    options: [{ label: "Production" }, { label: "Staging" }],
+  }];
+  try {
+    storeQuestionDrafts("session-1", "question-1", { target: { kind: "entry", value: "Canary" } });
+    setQuestionResponseStyle("interactive", domWindow as never);
+    await renderBanner(root, questions, true);
+    const input = container.querySelector<HTMLInputElement>(".question-input")!;
+    assert.equal(input.value, "", "unadopted typed entry is not displayed as Other");
+    assert.equal(submitButton(container).disabled, true);
+    assert.deepEqual(storedQuestionDrafts("session-1", "question-1"), {
+      target: { kind: "entry", value: "Canary" },
+    }, "switching styles preserves the original draft intent");
+    await act(async () => { setInputValue(input, "Canary"); });
+    assert.equal(input.value, "Canary");
+    assert.equal(submitButton(container).disabled, false, "typing in Other explicitly adopts custom intent");
+    storeQuestionDrafts("session-1", "question-1", { target: { kind: "entry", value: "Canary" } });
+    await act(async () => setQuestionResponseStyle("composer", domWindow as never));
+    await renderBanner(root, [{ ...questions[0]!, allowOther: true }], true);
+    await act(async () => setQuestionResponseStyle("interactive", domWindow as never));
+    assert.equal(container.querySelector<HTMLInputElement>(".question-input")!.value, "Canary",
+      "a legacy single-choice typed custom answer is still displayed");
+    assert.equal(submitButton(container).disabled, false);
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    clearQuestionDrafts("session-1", "question-1");
   }
 });

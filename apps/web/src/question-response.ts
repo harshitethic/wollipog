@@ -115,7 +115,7 @@ export function resolveQuestionResponse(question: AgentQuestion, rawValue: strin
     const labels: string[] = [];
     for (const token of tokens) {
       const label = offeredLabel(question, token);
-      if (!label) return { error: `“${token}” is not a displayed number or unambiguous option label.` };
+      if (!label) return { error: `“${token}” is not a displayed number or unambiguous option label. Choose Other Response to enter custom text.` };
       if (labels.includes(label)) return { error: `“${label}” was selected more than once.` };
       labels.push(label);
     }
@@ -129,9 +129,7 @@ export function resolveQuestionResponse(question: AgentQuestion, rawValue: strin
 
   const label = offeredSingleLabel(question, value);
   if (label) return { answer: label };
-  if (!question.allowOther) {
-    return { error: "Enter a displayed number or unambiguous option label." };
-  }
+  if (!question.allowOther) return { error: "Enter a displayed number or unambiguous option label, or choose Other Response for custom text." };
   const freeTextError = validateQuestionFreeText(question, value);
   return freeTextError ? { error: `Response ${freeTextError}.` } : { answer: value };
 }
@@ -139,11 +137,16 @@ export function resolveQuestionResponse(question: AgentQuestion, rawValue: strin
 /** Validate an explicit Interactive Form Other response without applying Composer Response's displayed
  * number or offered-label syntax. */
 function resolveQuestionOtherResponse(question: AgentQuestion, rawValue: string): ResolvedQuestionResponse {
-  if (!isAnswerableAgentQuestion(question) || question.multiSelect || !question.allowOther) {
+  if (!isAnswerableAgentQuestion(question)) {
     return { error: "This question format is unsupported." };
   }
   const value = rawValue.trim();
   if (!value) return question.required === false ? {} : { error: "Enter a response." };
+  // A native typed form can carry an exact single-choice label even when it
+  // cannot carry arbitrary text. Match the server without ordinal parsing.
+  if (!question.multiSelect && question.customAnswerError && question.options.some((option) => option.label === value)) {
+    return { answer: value };
+  }
   const freeTextError = validateQuestionFreeText(question, value);
   return freeTextError ? { error: `Response ${freeTextError}.` } : { answer: value };
 }

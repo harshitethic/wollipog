@@ -1110,12 +1110,7 @@ export function SessionQuestionBanner({
                   })}
                 </div>
               )}
-              {responseStyle === "interactive" && question.options.length > 0 && !question.allowOther && showResponseError && (
-                <span className="form-error question-field-error" id={responseErrorId} role="alert">
-                  {responseError}
-                </span>
-              )}
-              {responseStyle === "interactive" && question.allowOther && !question.multiSelect && (
+              {responseStyle === "interactive" && isAnswerableAgentQuestion(question) && (
                 <label className="question-input-label">
                   <span id={responseLabelId}>{question.options.length > 0 ? "Other Response" : "Response"}</span>
                   {question.required === false && <span className="muted sm"> (optional)</span>}
@@ -1141,7 +1136,9 @@ export function SessionQuestionBanner({
                     max={question.maximum}
                     minLength={question.minLength}
                     maxLength={question.maxLength ?? DEFAULT_QUESTION_FREE_TEXT_MAX_LENGTH}
-                    value={draft?.kind === "other" || (draft?.kind === "entry" && selected.length === 0) ? rawValue : ""}
+                    value={draft?.kind === "other" || (draft?.kind === "entry"
+                      && (question.options.length === 0 || (!question.multiSelect && question.allowOther && selected.length === 0)))
+                      ? rawValue : ""}
                     autoComplete="off"
                     onChange={(event) => updateDraft(question, { kind: "other", value: event.target.value })}
                   />

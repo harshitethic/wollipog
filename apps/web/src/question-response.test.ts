@@ -106,7 +106,7 @@ test("free text is accepted only when declared and retains provider validation",
   };
   assert.deepEqual(resolveQuestionResponse(form, "2"), { answer: "2" });
   assert.match(resolveQuestionResponse(form, "4").error ?? "", /above its maximum/);
-  assert.match(resolveQuestionResponse(single, "arbitrary prose").error ?? "", /displayed number/);
+  assert.match(resolveQuestionResponse(single, "arbitrary prose").error ?? "", /Other Response/);
 });
 
 test("answer maps omit blank optional fields and report every invalid response", () => {
@@ -114,7 +114,7 @@ test("answer maps omit blank optional fields and report every invalid response",
     single,
     { ...single, id: "optional", required: false },
     { ...single, id: "required" },
-  ], { language: "1", optional: "", required: "unknown" });
+  ], { language: "1", optional: "", required: "" });
   assert.deepEqual(result.answers, { language: "TypeScript" });
   assert.deepEqual(Object.keys(result.errors), ["required"]);
 });
@@ -187,4 +187,43 @@ test("opaque prototype-chain question ids remain own answer keys", () => {
   assert.equal(Object.hasOwn(result.answers, "__proto__"), true);
   assert.equal(result.answers.__proto__, "TypeScript");
   assert.deepEqual(result.errors, {});
+});
+
+test("Other intents are independent for every question and preserve numeric and label-like text (#1595)", () => {
+  for (const allowOther of [undefined, false, true]) {
+    const questions = [
+      { ...single, allowOther },
+      { ...single, id: "multi", multiSelect: true, minSelections: 2, allowOther },
+    ];
+    assert.deepEqual(questionDraftAnswers(questions, {
+      language: { kind: "other", value: "2" },
+      multi: { kind: "other", value: "TypeScript" },
+    }), { answers: { language: "2", multi: "TypeScript" }, errors: {} });
+    assert.match(resolveQuestionResponse(questions[1]!, "1, 4").error!, /not a displayed number/);
+  }
+});
+
+test("typed choice mistakes retain validation while explicit Other preserves arbitrary punctuation", () => {
+  const multi = { ...single, multiSelect: true };
+  assert.match(resolveQuestionResponse(single, "4").error!, /Other Response/);
+  assert.match(resolveQuestionResponse(multi, "1, 4").error!, /not a displayed number/);
+  assert.match(resolveQuestionResponse(multi, "TypeScript, Pythno").error!, /not a displayed number/);
+  assert.deepEqual(questionDraftAnswers([multi], { language: { kind: "other", value: "1, 4" } }),
+    { answers: { language: "1, 4" }, errors: {} });
+});
+
+
+test("explicit Other accepts only exact single-choice labels on native typed forms", () => {
+  const question: AgentQuestion = {
+    id: "confirm", question: "Continue?", options: [{ label: "Yes" }, { label: "No" }],
+    customAnswerError: "cannot be delivered because the provider requires one of its typed choices",
+  };
+  assert.deepEqual(questionDraftAnswers([question], { confirm: { kind: "other", value: "Yes" } }),
+    { answers: { confirm: "Yes" }, errors: {} });
+  for (const value of ["yes", "1", "Maybe"]) {
+    assert.match(questionDraftAnswers([question], { confirm: { kind: "other", value } }).errors.confirm!, /cannot be delivered/);
+  }
+  assert.match(questionDraftAnswers([{ ...question, multiSelect: true }], {
+    confirm: { kind: "other", value: "Yes" },
+  }).errors.confirm!, /cannot be delivered/, "a multi-select custom string is not a typed array");
 });
