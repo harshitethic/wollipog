@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expectDelayedTooltip } from "./tooltip-delay";
 
 type Scenario = "running" | "failing" | "silent" | "approval" | "agents";
 
@@ -113,6 +114,37 @@ test("a long unbroken plan step wraps inside the step tooltip at 390px", async (
   await expect(tooltip).toContainText(plan);
   await expect.poll(() => tooltip.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
   await expectNoHorizontalOverflow(page);
+});
+
+for (const reducedMotion of ["no-preference", "reduce"] as const) {
+  test(`the step link's tooltip waits the shared tooltip delay on hover (${reducedMotion} motion)`, async ({ page }) => {
+    // Reduced motion collapses the fade, not the wait: the delay is intent, not animation.
+    await page.emulateMedia({ reducedMotion });
+    const progress = await openScenario(page, "running", { width: 1280, height: 800 });
+    const step = progress.getByRole("button", { name: "Coordinate Release Audit" });
+    await expectDelayedTooltip(page, step, progress.locator("[role='tooltip']"));
+  });
+}
+
+test("keyboard focus reveals the step link's tooltip at once, even mid-way through a hover's delay", async ({ page }) => {
+  const progress = await openScenario(page, "running", { width: 1280, height: 800 });
+  const step = progress.getByRole("button", { name: "Coordinate Release Audit" });
+  const tooltip = progress.locator("[role='tooltip']");
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Animation.enable");
+  await cdp.send("Animation.setPlaybackRate", { playbackRate: 0 });
+  await step.hover();
+  await tooltip.evaluate((element) => { for (const animation of element.getAnimations()) animation.currentTime = 100; });
+  await expect(tooltip).toBeHidden();
+  // A keypress first, so the focus that follows is keyboard focus (:focus-visible), as a Tab's is.
+  await page.keyboard.press("Shift");
+  await step.focus();
+  await expect(step).toBeFocused();
+  // The animation timeline is still frozen, so only a reveal that does not wait can pass.
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip).toHaveCSS("opacity", "1");
+  await cdp.send("Animation.setPlaybackRate", { playbackRate: 1 });
+  await cdp.detach();
 });
 
 test("a silent turn says how long it has been quiet", async ({ page }) => {
