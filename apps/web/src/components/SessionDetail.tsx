@@ -120,6 +120,7 @@ import { PinnedSummaryDock } from "./PinnedSummaryDock.js";
 import type { PinnedSummaryState } from "./pinned-summary-state.js";
 import { deriveGitPresentation } from "../pinned-summary.js";
 import { useVoiceDictation } from "./useVoiceDictation.js";
+import { DictationStrip } from "./DictationStrip.js";
 import { appendTranscript } from "../dictation.js";
 import { loadSeen, markSeen, saveSeen } from "../sessions-seen.js";
 import { subscriptionRecoveryRevision } from "../ui-subscriptions.js";
@@ -1763,7 +1764,7 @@ function SessionDetailLoaded({
     pendingHydrationCaretRef.current = null;
     pendingComposerFocusRestoreRef.current = null;
   }, [replace, sessionId, setProgrammaticComposerText]);
-  // Hold-to-talk dictation (browser SpeechRecognition; hidden when unsupported).
+  // Tap-or-hold dictation (browser SpeechRecognition; hidden when unsupported, #2193).
   const dictation = useVoiceDictation((phrase) => {
     revealOrdinaryComposerRef.current("always");
     markDraftDirty();
@@ -3903,6 +3904,9 @@ function SessionDetailLoaded({
     if ((stored?.id ?? null) !== (editCopyRef.current?.id ?? null)) setEditCopyState(stored);
   }, [activeComposerMutation, instanceScope, sessionId]);
   const putComposerDraft = useCallback((draft: ComposerDraftContent) => {
+    // A draft put in place of another (Edit as a New Turn, Discard Edit) ends the dictation that was
+    // writing the old one (#2193).
+    dictation.cancel();
     draftDirty.current = true;
     composerDraftVersionRef.current += 1;
     draftState.current = draft;
@@ -3910,7 +3914,7 @@ function SessionDetailLoaded({
     if (draft.images.length) replace(draft.images);
     else clear();
     setHistIdx(-1);
-  }, [clear, replace, setProgrammaticComposerText]);
+  }, [clear, dictation.cancel, replace, setProgrammaticComposerText]);
   const openResendAction = useCallback(async (item: Extract<TimelineItem, { kind: "user_message" }>) => {
     if (!canPromptRef.current) return;
     const held = draftState.current;
@@ -4720,12 +4724,27 @@ function SessionDetailLoaded({
   const composerControlsDisabledReason = configRefusal ??
     (promptRefusal === null ? promptUnavailableReason : null);
   const composerUnavailableId = `composer-unavailable-${session.id}`;
-  // A disabled mic never sees the pointerup that ends a hold, so a hold the composer loses mid-way
-  // ends here.
+  // A composer that can no longer send stops listening (#2154, #2193): a disabled mic never sees the
+  // tap or release that would have ended it.
   const stopDictation = dictation.stop;
   useEffect(() => {
     if (!canPrompt && dictation.recording) stopDictation();
   }, [canPrompt, dictation.recording, stopDictation]);
+  // Dictation lives as long as the mic that shows it (#2193). Whatever removes the mic — Answer Mode
+  // replacing the bar, the Inbox collapsing the session to its preview — cancels dictation rather
+  // than leave it listening unseen, where a late phrase would rewrite a hidden draft or reopen the
+  // ordinary composer mid-answer. A new session's composer starts without it too.
+  const cancelDictation = dictation.cancel;
+  const micRef = useCallback((mic: HTMLButtonElement | null) => {
+    if (!mic) return;
+    return () => cancelDictation();
+  }, [cancelDictation]);
+  useEffect(() => cancelDictation, [session.id, cancelDictation]);
+  // Opening a queued edit, or leaving one (Save, Cancel Edit, Dismiss Recovery), swaps the draft the
+  // words go into: dictation ends with the draft it was writing, so no unsettled phrase lands in the
+  // other one.
+  const queuedEditPromptId = queuedEdit?.promptId ?? null;
+  useEffect(() => cancelDictation, [queuedEditPromptId, cancelDictation]);
   // Live context and cost sit in the composer bar's trailing cluster, or in Model Settings when the
   // bar has no room for them (#2166).
   const [composerBoxRef, composerColumnNarrow] = useNarrowerThanRem<HTMLDivElement>(COMPOSER_USAGE_MIN_COLUMN_REM);
@@ -4827,6 +4846,9 @@ function SessionDetailLoaded({
   };
   const send = async () => {
     if (composerMutationRegistry.has(mutationKey) || stopTurnPendingRef.current || retitleInFlightRef.current) return;
+    // Sending ends dictation first (#2193) and drops what the engine has not settled: a phrase
+    // landing while the request is in flight would join the sent text or be lost to restoration.
+    dictation.cancel();
     const outgoing = text.trim();
     let invocation = resolveComposerCommandInvocation(outgoing, composerCommands);
     if (invocation.kind === "command" && invocation.command.source === "app") {
@@ -5041,6 +5063,7 @@ function SessionDetailLoaded({
   const steerDraft = async () => {
     // Direct steering posts to the same route as queued steering, so it follows that verdict (#1857).
     if (composerMutationRegistry.has(mutationKey) || stopTurnPendingRef.current || !canSend) return;
+    dictation.cancel();
     if (queueRefusal !== null) {
       setError(queueRefusal, "Message Not Sent");
       return;
@@ -5297,6 +5320,7 @@ function SessionDetailLoaded({
 
   const saveQueuedPromptEdit = async () => {
     if (!queuedEdit || queuedEditBusy || !queuedEditRetryable || composerMutationRegistry.has(mutationKey)) return;
+    dictation.cancel();
     // An edit opened before the person lost queue management is not sent (#1857).
     if (queueRefusal !== null) {
       setError(queueRefusal);
@@ -5528,6 +5552,13 @@ function SessionDetailLoaded({
         commitSlashCommand(selectedSlashCommand ?? slashMatches[0]!);
         return;
       }
+    }
+    // Escape ends dictation first: it is the layer on top, beneath only the pickers it would close
+    // first (§16.2, #2193). A second Escape then reaches an open queued edit.
+    if (dictation.recording && e.key === "Escape" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      e.preventDefault();
+      dictation.stop();
+      return;
     }
     // With no picker open, Escape cancels an open edit as Cancel Edit does. A recovered edit is the
     // only copy of its content, so Escape never dismisses it; it keeps its ordinary meaning there.
@@ -6470,6 +6501,11 @@ function SessionDetailLoaded({
                       : "Drop images to attach"}
                   </div>
                 )}
+                {/* While the mic listens, the left group says so (#2193); the trailing group, the mic
+                    and Send stay where they are. */}
+                {dictation.recording && dictation.startedAt !== null ? (
+                  <DictationStrip startedAt={dictation.startedAt} held={dictation.held} interim={dictation.interim} />
+                ) : (
                 <div className="cbar-left">
                   <ComposerPlusMenu
                     session={session}
@@ -6530,6 +6566,7 @@ function SessionDetailLoaded({
                     <span className="sr-only" id={configRefusalId}>{composerControlsDisabledReason}</span>
                   )}
                 </div>
+                )}
                 <div className="cbar-right">
                   {cancelTurnRefusal !== null && (
                     <span className="sr-only" id={`stop-turn-refusal-${session.id}`}>{cancelTurnRefusal}</span>
@@ -6544,22 +6581,44 @@ function SessionDetailLoaded({
                   </>}
                   {dictation.supported && (
                     <ComposerButton
+                      ref={micRef}
                       square
-                      className={`voice-btn${dictation.recording ? " voice-recording" : ""}`}
                       // A composer that cannot send takes no dictation either (#2154).
                       disabled={!canPrompt}
                       aria-describedby={canPrompt ? undefined : composerUnavailableId}
+                      // A tap toggles and a hold is push-to-talk (#2193): the press starts or stops,
+                      // releasing a hold stops, and a press that never completes (the browser took
+                      // the touch, the mouse left) stops. Only a primary left-button press counts —
+                      // a right-click's context menu swallows the pointerup on some platforms.
                       onPress={(e) => {
-                        // Only a primary left-button press dictates — a right-click's context menu
-                        // swallows the pointerup on some platforms and would leave the mic hot.
                         if (!e.isPrimary || e.button !== 0) return;
-                        dictation.start();
+                        // The press keeps focus where it was, and the strip is about to replace the
+                        // left group: a control there that holds focus (the model chip after its menu
+                        // closed) would take it to the page body, where Escape no longer reaches
+                        // dictation. Focus moves to the mic, which stays: its Escape stops dictation,
+                        // and unlike the textarea it opens no phone keyboard (§16.2).
+                        const mic = e.currentTarget;
+                        const focused = mic.ownerDocument.activeElement;
+                        if (!dictation.recording && focused instanceof HTMLElement && focused.closest(".cbar-left")) {
+                          mic.focus({ preventScroll: true });
+                        }
+                        dictation.pressStart();
                       }}
-                      onPointerUp={dictation.stop}
-                      onPointerCancel={dictation.stop}
-                      onPointerLeave={() => dictation.recording && dictation.stop()}
-                      title="Hold to Dictate"
-                      aria-label="Hold to Dictate"
+                      onPointerUp={dictation.pressEnd}
+                      onPointerCancel={dictation.pressCancel}
+                      onPointerLeave={dictation.pressCancel}
+                      // Enter, Space and assistive technology click without a pointer (detail 0);
+                      // a pointer's own click has already been handled by its press.
+                      onClick={(e) => {
+                        if (e.detail === 0) dictation.toggle();
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key !== "Escape" || !dictation.recording) return;
+                        e.preventDefault();
+                        dictation.stop();
+                      }}
+                      title="Tap to dictate, or hold and release"
+                      aria-label={dictation.recording ? "Stop Dictating" : "Dictate"}
                       aria-pressed={dictation.recording}
                     >
                       <MicIcon size={16} />
