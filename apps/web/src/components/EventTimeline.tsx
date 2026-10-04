@@ -48,6 +48,7 @@ import {
   retryNeighbours,
   sameWork,
   splitStepTitle,
+  stepObjectIsPath,
   subagentName,
   summarizeWork,
   workspaceRelativePath,
@@ -2518,7 +2519,7 @@ function ToolCallStep({ item, attempts, open, onToggle }: {
     <ToolStep
       icon={toolIcon(item.toolKind)}
       verb={verb}
-      object={object}
+      object={object && stepObjectIsPath(item.title, item.toolKind) ? <PathLabel path={object} /> : object}
       trail={fact}
       timing={span.description || undefined}
       status={<StepStatus status={item.status} />}
@@ -2570,7 +2571,7 @@ function PathLabel({ path }: { path: string }) {
   const slash = path.lastIndexOf("/");
   return (
     <span className="tl-path" title={path}>
-      {slash > 0 && <span className="tl-path-dir">{path.slice(0, slash + 1)}</span>}
+      {slash >= 0 && <span className="tl-path-dir">{path.slice(0, slash + 1)}</span>}
       <span className="tl-path-name">{path.slice(slash + 1)}</span>
     </span>
   );
