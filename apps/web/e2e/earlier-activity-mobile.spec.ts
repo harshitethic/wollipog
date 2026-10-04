@@ -1,4 +1,5 @@
-import { devices, expect, test } from "@playwright/test";
+import { devices, expect, test, type BrowserContext, type Page } from "@playwright/test";
+import { dialogMotionSettled } from "./dialog-motion.js";
 
 const phone = devices["Pixel 7"];
 test.use({
@@ -272,4 +273,70 @@ test("a downward finger drag at the head loads the next page without a scroll ev
   await expect(control).toContainText("Loading earlier activity…");
   await expect.poll(() => reader.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
   await expect(page.locator(".detail-scroll[data-follow-tail-state]")).toHaveAttribute("data-follow-tail-state", "paused");
+});
+
+// #2570: the phone menu sheet is portalled out of the transcript, but React still delivers its
+// touches to the reader. A pan inside the sheet is not reading the transcript underneath it.
+async function panInsideOpenTurnMenuSheet(page: Page, context: BrowserContext, startTop: number) {
+  await page.goto("/recovery-notice-e2e.html?pagination=resolve&pagination-delay=300&height=720&width=412");
+
+  const reader = page.locator(".detail-scroll");
+  await expect.poll(() => page.locator("body").getAttribute("data-tail-request-count")).toBe("1");
+  await reader.dispatchEvent("wheel", { deltaY: -40 });
+  await expect(page.locator(".detail-scroll[data-follow-tail-state]")).toHaveAttribute("data-follow-tail-state", "paused");
+  await page.waitForTimeout(250);
+  await reader.evaluate((element, top) => {
+    element.scrollTop = top;
+    element.dispatchEvent(new Event("scroll", { bubbles: true }));
+  }, startTop);
+  await page.waitForTimeout(250);
+  await expect(page.locator("body")).toHaveAttribute("data-tail-request-count", "1");
+  await expect(page.locator(".tl-earlier")).toBeInViewport();
+
+  await reader.getByRole("button", { name: "More Turn Actions" }).first().tap();
+  const menu = page.getByRole("menu", { name: "More Turn Actions" });
+  await expect(menu).toBeVisible();
+  await dialogMotionSettled(page);
+  expect(await menu.evaluate((element) => element.closest(".detail-scroll") === null)).toBe(true);
+  // Let the intent armed by the tap on the transcript's own menu button go idle.
+  await page.waitForTimeout(400);
+
+  const box = (await menu.boundingBox())!;
+  const client = await context.newCDPSession(page);
+  const x = Math.round(box.x + box.width / 2);
+  const startY = Math.round(box.y + 20);
+  await client.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x, y: startY, id: 1 }] });
+  for (let step = 1; step <= 8; step += 1) {
+    await client.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ x, y: startY + 20 * step, id: 1 }],
+    });
+    await page.waitForTimeout(16);
+  }
+  return { reader, release: () => client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] }) };
+}
+
+test("a downward pan inside an open turn menu sheet at the head loads no earlier activity", async ({ page, context }) => {
+  const { reader, release } = await panInsideOpenTurnMenuSheet(page, context, 0);
+  await page.waitForTimeout(600);
+  await expect(page.locator("body")).toHaveAttribute("data-tail-request-count", "1");
+  await release();
+  await page.waitForTimeout(300);
+  await expect(page.locator("body")).toHaveAttribute("data-tail-request-count", "1");
+  expect(await reader.evaluate((element) => element.scrollTop)).toBe(0);
+});
+
+test("a finger held on an open turn menu sheet arms no earlier activity for a reader that reaches the head", async ({ page, context }) => {
+  const { reader, release } = await panInsideOpenTurnMenuSheet(page, context, 40);
+  // While that finger is held, layout carries the reader up to its head. A touch armed by the sheet
+  // would read that scroll as the reader's own traversal and request the earlier page.
+  await reader.evaluate((element) => {
+    element.scrollTop = 0;
+    element.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+  await page.waitForTimeout(600);
+  await expect(page.locator("body")).toHaveAttribute("data-tail-request-count", "1");
+  await release();
+  await page.waitForTimeout(300);
+  await expect(page.locator("body")).toHaveAttribute("data-tail-request-count", "1");
 });
