@@ -633,6 +633,257 @@ test("an oversized recovered attachment set stays recoverable and reports the li
   await expect(page.locator('.session-notice-slot .notice.t-danger[role="alert"]')).toContainText("at most 6 images may be attached");
 });
 
+/** One editable queued message on a runner that can edit queued messages. */
+async function seedEditableQueue(page: Page, { withImage = false } = {}) {
+  await page.evaluate((withImage) => {
+    window.__WOLLIPOG_PROJECT_INBOX_E2E__.setRunnerProtocolVersion(99);
+    window.__WOLLIPOG_PROJECT_INBOX_E2E__.setSlashCommands([], [], { supportsImages: true });
+    window.__WOLLIPOG_PROJECT_INBOX_E2E__.updateSession("session-alpha", {
+      queued: [
+        { id: "queue-edit", text: "Run the integration suite after the migration lands", steerable: true,
+          liveQueueObserved: true, editable: true, editRevision: "r1", hasImages: withImage },
+        { id: "queue-other", text: "Then summarize the failures", steerable: true,
+          liveQueueObserved: true, editable: true, editRevision: "r2" },
+      ],
+    });
+  }, withImage);
+}
+
+/** A recovered edit whose queued message changed elsewhere, so it can't be retried. */
+async function seedStaleRecoveredEdit(page: Page) {
+  await page.evaluate(() => {
+    window.__WOLLIPOG_PROJECT_INBOX_E2E__.setRunnerProtocolVersion(99);
+    window.__WOLLIPOG_PROJECT_INBOX_E2E__.updateSession("session-alpha", {
+      queued: [{ id: "queue-recovered", text: "Changed elsewhere", liveQueueObserved: true, editable: true,
+        editRevision: "newer-revision" }],
+    });
+    window.__WOLLIPOG_PROJECT_INBOX_E2E__.seedQueuedEditRecovery("session-alpha", {
+      edit: {
+        promptId: "queue-recovered",
+        text: "Original queued content",
+        images: [],
+        editRevision: "original-revision",
+        displacedDraft: { text: "Ordinary draft", images: [] },
+      },
+      draft: { text: "Keep this recovered message", images: [] },
+    });
+  });
+}
+
+/** The visible height of a control and the height its coarse-pointer `::after` reaches (§2.8). */
+async function hitArea(page: Page, name: string) {
+  return page.getByRole("button", { name, exact: true }).evaluate((element) => {
+    const box = element.getBoundingClientRect();
+    const after = getComputedStyle(element, "::after");
+    return {
+      visual: box.height,
+      hit: box.height - Number.parseFloat(after.top) - Number.parseFloat(after.bottom),
+    };
+  });
+}
+
+test("editing a queued message is a 40px strip in the card, a check in the Send seat and the selected row (#2194)", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await seedEditableQueue(page);
+  await page.locator(".composer-input").fill("Unsent local draft");
+  await page.getByTestId("queued-prompt-queue-edit").getByRole("button", { name: "Edit Queued Message" }).click();
+  await expect(page.locator(".composer-input")).toHaveValue("Run the integration suite after the migration lands");
+
+  const strip = page.locator(".composer-box > .composer-mode");
+  await expect(strip).toBeVisible();
+  await expect(strip.locator(".composer-mode-title")).toHaveText("Editing Queued Message");
+  await expect(strip.locator("kbd")).toHaveText("Enter");
+  expect((await strip.boundingBox())?.height).toBe(40);
+  await expect(page.locator(".composer > .composer-mode, .queued-edit-banner")).toHaveCount(0);
+
+  const save = page.getByRole("button", { name: "Save Queued Message", exact: true });
+  await expect(save.locator("svg.lucide-check")).toHaveCount(1);
+  await expect(save).toHaveAttribute("title", "Save queued message (Enter)");
+  await expect(save).toHaveClass(/\bprimary\b/);
+
+  const edited = page.getByTestId("queued-prompt-queue-edit");
+  await expect(edited).toHaveAttribute("aria-current", "true");
+  await expect(tray(page).locator('[aria-current="true"]')).toHaveCount(1);
+  const fills = await edited.evaluate((row) => {
+    const probe = document.createElement("div");
+    probe.style.background = "var(--surface-selected)";
+    row.append(probe);
+    const selected = getComputedStyle(probe).backgroundColor;
+    probe.remove();
+    return { row: getComputedStyle(row).backgroundColor, selected, bar: getComputedStyle(row, "::before").width };
+  });
+  expect(fills.row).toBe(fills.selected);
+  expect(fills.bar).toBe("2px");
+  await page.screenshot({ path: test.info().outputPath("queued-edit-desktop.png") });
+
+  // Escape with no picker open cancels the edit and restores the displaced draft, like Cancel Edit.
+  await page.locator(".composer-input").press("Escape");
+  await expect(strip).toHaveCount(0);
+  await expect(page.locator(".composer-input")).toHaveValue("Unsent local draft");
+  await expect(tray(page).locator('[aria-current="true"]')).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Send", exact: true }).locator("svg.lucide-arrow-up")).toHaveCount(1);
+});
+
+test("a recovered edit that can't be retried says why in the strip, and Save is described by it (#2194)", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await seedStaleRecoveredEdit(page);
+  await reopenSteeringSession(page);
+  const strip = page.locator(".composer-box > .composer-mode.is-recovered");
+  await expect(strip.locator(".composer-mode-title")).toHaveText("Recovered Queued Message");
+  const reason = strip.locator(".composer-mode-reason");
+  await expect(reason).toHaveText(
+    "This queued message changed elsewhere. The recovered edit cannot overwrite its newer revision.");
+  await expect(strip.locator("kbd")).toHaveCount(0);
+  const save = page.getByRole("button", { name: "Save Queued Message", exact: true });
+  await expect(save).toBeDisabled();
+  await expect(save).toHaveAccessibleDescription(
+    "This queued message changed elsewhere. The recovered edit cannot overwrite its newer revision.");
+  await expect(strip.getByRole("button", { name: "Use as New Message" })).toBeEnabled();
+  await expect(strip.getByRole("button", { name: "Dismiss Recovery" })).toBeEnabled();
+  await page.screenshot({ path: test.info().outputPath("queued-edit-recovered-desktop.png") });
+});
+
+test.describe("on a coarse pointer", () => {
+  test.use({ hasTouch: true });
+
+  test("the queued-edit strip stays 40px at 390px and Cancel Edit has a 44px hit area (#2194)", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await seedEditableQueue(page);
+    await page.getByTestId("queued-prompt-queue-edit").getByRole("button", { name: "Queued Message Actions" }).click();
+    await page.getByRole("menu", { name: "Queued Message Actions" }).getByRole("menuitem", { name: "Edit Message" }).click();
+    const strip = page.locator(".composer-box > .composer-mode");
+    await expect(strip.locator(".composer-mode-title")).toHaveText("Editing Queued Message");
+    expect((await strip.boundingBox())?.height).toBe(40);
+    // Keycaps are for a keyboard: a touch pointer hides the save hint.
+    await expect(strip.locator(".shortcut-hint")).toBeHidden();
+    expect(await hitArea(page, "Cancel Edit")).toEqual({ visual: 36, hit: 46 });
+    await expect(page.getByTestId("queued-prompt-queue-edit")).toHaveAttribute("aria-current", "true");
+    await page.screenshot({ path: test.info().outputPath("queued-edit-phone.png") });
+
+    await page.getByRole("button", { name: "Cancel Edit", exact: true }).click();
+    await expect(strip).toHaveCount(0);
+  });
+
+  /**
+   * Every visible control in the composer column with the area it answers to: its border box, grown
+   * by a `::after` hit area, which is placed from the padding edge, so the border is added back.
+   */
+  async function composerTouchAreas(page: Page) {
+    return page.locator(".composer button").evaluateAll((buttons) => buttons
+      .filter((button) => (button as HTMLElement).offsetParent !== null)
+      .map((button) => {
+        const box = button.getBoundingClientRect();
+        const style = getComputedStyle(button);
+        const after = getComputedStyle(button, "::after");
+        const grow = (inset: string, border: string) =>
+          after.content === "none" ? 0 : Math.max(0, -(Number.parseFloat(inset) || 0) - Number.parseFloat(border));
+        return {
+          name: button.getAttribute("aria-label") ?? button.textContent?.trim() ?? "",
+          inStrip: button.closest(".composer-mode") !== null,
+          top: box.top - grow(after.top, style.borderTopWidth),
+          bottom: box.bottom + grow(after.bottom, style.borderBottomWidth),
+          left: box.left - grow(after.left, style.borderLeftWidth),
+          right: box.right + grow(after.right, style.borderRightWidth),
+        };
+      }));
+  }
+
+  /** The strip's actions each answer to at least 44px, and to no area another control answers to. */
+  async function expectStripTouchAreasOwnTheirTaps(page: Page) {
+    const areas = await composerTouchAreas(page);
+    const strip = areas.filter((area) => area.inStrip);
+    expect(strip.length).toBeGreaterThan(0);
+    for (const action of strip) {
+      expect(action.bottom - action.top, `${action.name} keeps a 44px touch area`).toBeGreaterThanOrEqual(44);
+      for (const other of areas) {
+        if (other === action) continue;
+        const overlap = Math.min(action.bottom, other.bottom) - Math.max(action.top, other.top) > 0.01 &&
+          Math.min(action.right, other.right) - Math.max(action.left, other.left) > 0.01;
+        expect(overlap, `${action.name}'s touch area overlaps ${other.name}'s`).toBe(false);
+      }
+    }
+  }
+
+  // The tray docks on the card above the strip, and a pending question's Respond can sit just below
+  // it. A tap meant for either must never cancel the edit (§2.8).
+  for (const width of [1000, 390]) {
+    test(`at ${width}px the strip's touch areas stay clear of the queued row above and Respond below (#2194)`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      await seedEditableQueue(page);
+      if (width <= 760) {
+        await page.getByTestId("queued-prompt-queue-edit").getByRole("button", { name: "Queued Message Actions" }).click();
+        await page.getByRole("menu", { name: "Queued Message Actions" }).getByRole("menuitem", { name: "Edit Message" })
+          .click();
+      } else {
+        await page.getByTestId("queued-prompt-queue-edit").getByRole("button", { name: "Edit Queued Message" }).click();
+      }
+      await expect(page.locator(".composer-box > .composer-mode")).toBeVisible();
+      await expectStripTouchAreasOwnTheirTaps(page);
+
+      await page.evaluate(() => {
+        localStorage.setItem("wollipog.question-response-style", "composer");
+        window.dispatchEvent(new Event("wollipog:question-response-style-change"));
+        window.__WOLLIPOG_PROJECT_INBOX_E2E__.updateSession("session-alpha", {
+          pendingApproval: {
+            requestId: "question:steering:1",
+            kind: "question",
+            title: "Choose a release target",
+            options: [],
+            questions: [{
+              id: "target",
+              question: "Which environment should receive the release?",
+              options: [{ label: "Staging" }, { label: "Production" }],
+            }],
+          },
+        });
+      });
+      await expect(page.getByRole("button", { name: "Respond", exact: true })).toBeVisible();
+      await expect(page.locator(".composer-box > .composer-mode")).toBeVisible();
+      await expectStripTouchAreasOwnTheirTaps(page);
+    });
+
+    // An edited message with images opens the attachment tray (#2177) under the strip; its Remove
+    // buttons borrow a wide touch area upward, which must not reach the strip's actions.
+    test(`at ${width}px the strip's touch areas stay clear of the attachment tray's Remove (#2194)`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      await seedEditableQueue(page, { withImage: true });
+      if (width <= 760) {
+        await page.getByTestId("queued-prompt-queue-edit").getByRole("button", { name: "Queued Message Actions" }).click();
+        await page.getByRole("menu", { name: "Queued Message Actions" }).getByRole("menuitem", { name: "Edit Message" })
+          .click();
+      } else {
+        await page.getByTestId("queued-prompt-queue-edit").getByRole("button", { name: "Edit Queued Message" }).click();
+      }
+      await expect(page.locator(".composer-box > .composer-mode")).toBeVisible();
+      await expect(page.locator(".composer-attachments .attach-thumb .attach-remove")).toHaveCount(5);
+      await expectStripTouchAreasOwnTheirTaps(page);
+    });
+  }
+
+  test("a recovered edit's Use as New Message and Dismiss Recovery each have a 44px hit area at 390px (#2194)", async ({ page }) => {
+    await seedStaleRecoveredEdit(page);
+    await reopenSteeringSession(page);
+    await page.setViewportSize({ width: 390, height: 844 });
+    const strip = page.locator(".composer-box > .composer-mode.is-recovered");
+    await expect(strip.locator(".composer-mode-reason")).toBeVisible();
+    for (const name of ["Use as New Message", "Dismiss Recovery"]) {
+      expect(await hitArea(page, name)).toEqual({ visual: 36, hit: 46 });
+    }
+    // The strip's content stays inside the card on a phone.
+    const [card, actions] = await Promise.all([
+      page.locator(".composer-box").boundingBox(),
+      strip.locator(".composer-mode-actions").boundingBox(),
+    ]);
+    expect((actions?.x ?? 0) + (actions?.width ?? 0)).toBeLessThanOrEqual((card?.x ?? 0) + (card?.width ?? 0));
+    // Side by side, under the sentence, or on the strip's first row: no action shares a tap.
+    await expectStripTouchAreasOwnTheirTaps(page);
+    await page.screenshot({ path: test.info().outputPath("queued-edit-recovered-phone.png") });
+    await page.setViewportSize({ width: 1000, height: 900 });
+    await expect(strip.locator(".composer-mode-actions")).toBeVisible();
+    await expectStripTouchAreasOwnTheirTaps(page);
+  });
+});
+
 test("a definite direct rejection preserves the draft and never creates a transcript bubble", async ({ page }) => {
   const composer = page.locator(".composer-input");
   await page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.deferNextSteeringResult());
