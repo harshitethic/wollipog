@@ -1771,7 +1771,8 @@ test("mount hydration reconciles a newer recovery saved while its displaced draf
     const currentComposer = fixture.container.querySelector(".composer-input") as HTMLTextAreaElement;
     assert.equal(currentComposer.value, "Newer recovered edit");
     assert.ok(fixture.container.querySelector(".composer-mode"));
-    assert.match(fixture.container.querySelector(".notice.t-danger[role=\"alert\"]:not(.state-error)")?.textContent ?? "", /Newer recovery/);
+    assertNoDomNode(fixture.container.querySelector(".notice.t-danger[role=\"alert\"]:not(.state-error)"),
+      "the strip says what happened to a restored recovery, so its stored outcome is not also a notice (#2560)");
     await flushAsyncWork(450);
     const reconciled = loadDurableQueuedEditRecovery(recoveryScope);
     assert.equal(reconciled?.edit.editRevision, "qer_newer");
@@ -2761,11 +2762,248 @@ test("a queued edit interrupted by runtime reload returns as unconfirmed recover
     await flushAsyncWork();
     assert.equal(reloaded.value, "Indeterminate submission");
     assertNoDomNode(fixture.container.querySelector('button[aria-label="Save Queued Message"] .spinner'));
-    assert.match(
-      fixture.container.querySelector(".notice.t-danger[role=\"alert\"]:not(.state-error)")?.textContent ?? "",
-      /outcome was not recorded/i,
-    );
+    // The strip says what happened, once: the unrecorded outcome is not repeated as an Action Failed
+    // notice above it (#2560).
+    assert.match(fixture.container.querySelector(".composer-mode.is-recovered")?.textContent ?? "",
+      /Recovered Queued Message.*This edit hasn't been saved yet\./);
+    assertNoDomNode(fixture.container.querySelector(".notice.t-danger[role=\"alert\"]:not(.state-error)"),
+      "a restored recovery's outcome is not also an Action Failed notice");
   } finally {
+    await unmountFixture(fixture);
+  }
+});
+
+test("a Save watched after a remount stays a notice when it fails before identity loads (#2560)", async () => {
+  const draft = deferred<ComposerDraft | null>();
+  const editResult = deferred<Awaited<ReturnType<ApiClient["editQueuedPrompt"]>>>();
+  const identity = {
+    context: {
+      userId: "user-1",
+      userName: "Test User",
+      organizationId: "org-1",
+      organizationName: "Test Organization",
+      role: "owner" as const,
+      deviceId: "device-1",
+      localBootstrap: false,
+    },
+    organizations: [],
+    memberships: [],
+    teams: [],
+  };
+  let identityGate: Promise<void> | null = null;
+  const fixture = await mountFixture(draft, {
+    runnerProtocolVersion: 99,
+    sessionPatch: {
+      queued: [{
+        id: "queue-1",
+        text: "Queued projection",
+        liveQueueObserved: true,
+        editable: true,
+        editRevision: "qer_exact",
+      }],
+    },
+    client: {
+      getIdentity: async () => {
+        if (identityGate) await identityGate;
+        return identity;
+      },
+      readQueuedPrompt: async (_sessionId, promptId) => ({
+        prompt: { promptId, text: "Original exact content", images: [], editRevision: "qer_exact" },
+      }),
+      editQueuedPrompt: async () => editResult.promise,
+    },
+  });
+  const notice = () => fixture.container.querySelector(".notice.t-danger[role=\"alert\"]:not(.state-error)");
+  try {
+    await resolveDraft(draft, "Displaced local draft");
+    await flushAsyncWork();
+    const edit = fixture.container.querySelector('button[aria-label="Edit Queued Message"]') as HTMLButtonElement;
+    await act(async () => { edit.click(); });
+    await flushAsyncWork();
+    await act(async () => {
+      fixture.composer.value = "Edit saved across a remount";
+      fireDomEvent.change(fixture.composer);
+    });
+    const save = fixture.container.querySelector('button[aria-label="Save Queued Message"]') as HTMLButtonElement;
+    await act(async () => { save.click(); });
+    await flushAsyncWork();
+
+    const identityLoaded = deferred<void>();
+    identityGate = identityLoaded.promise;
+    await fixture.remountWithDraftLoader(loadComposerDraft);
+    await flushAsyncWork();
+    assert.ok(fixture.container.querySelector('button[aria-label="Save Queued Message"] .spinner'),
+      "the remounted composer watches the Save in flight");
+
+    await act(async () => {
+      editResult.reject(new Error("The queued message changed before this edit was saved."));
+      await Promise.resolve();
+    });
+    await flushAsyncWork();
+    await act(async () => { identityLoaded.resolve(); });
+    await flushAsyncWork();
+
+    assert.match(fixture.container.querySelector(".composer-mode.is-recovered")?.textContent ?? "",
+      /Recovered Queued Message/);
+    assert.match(notice()?.textContent ?? "", /edit was not confirmed.*changed before/i,
+      "the Save this view watched fail keeps its reason, even when identity loads after it settles");
+  } finally {
+    await unmountFixture(fixture);
+  }
+});
+
+test("another tab's recovery is not taken for a watched Save that succeeded before identity loads (#2560)", async () => {
+  const draft = deferred<ComposerDraft | null>();
+  const editResult = deferred<Awaited<ReturnType<ApiClient["editQueuedPrompt"]>>>();
+  let identityGate: Promise<void> | null = null;
+  const fixture = await mountFixture(draft, {
+    runnerProtocolVersion: 99,
+    sessionPatch: {
+      queued: [{
+        id: "queue-1",
+        text: "Queued projection",
+        liveQueueObserved: true,
+        editable: true,
+        editRevision: "qer_exact",
+      }],
+    },
+    client: {
+      getIdentity: async () => {
+        if (identityGate) await identityGate;
+        return {
+          context: {
+            userId: "user-1",
+            userName: "Test User",
+            organizationId: "org-1",
+            organizationName: "Test Organization",
+            role: "owner" as const,
+            deviceId: "device-1",
+            localBootstrap: false,
+          },
+          organizations: [],
+          memberships: [],
+          teams: [],
+        };
+      },
+      readQueuedPrompt: async (_sessionId, promptId) => ({
+        prompt: { promptId, text: "Original exact content", images: [], editRevision: "qer_exact" },
+      }),
+      editQueuedPrompt: async () => editResult.promise,
+    },
+  });
+  try {
+    await resolveDraft(draft, "Displaced local draft");
+    await flushAsyncWork();
+    const edit = fixture.container.querySelector('button[aria-label="Edit Queued Message"]') as HTMLButtonElement;
+    await act(async () => { edit.click(); });
+    await flushAsyncWork();
+    await act(async () => {
+      fixture.composer.value = "Edit that is accepted";
+      fireDomEvent.change(fixture.composer);
+    });
+    const save = fixture.container.querySelector('button[aria-label="Save Queued Message"]') as HTMLButtonElement;
+    await act(async () => { save.click(); });
+    await flushAsyncWork();
+
+    const identityLoaded = deferred<void>();
+    identityGate = identityLoaded.promise;
+    await fixture.remountWithDraftLoader(loadComposerDraft);
+    await flushAsyncWork();
+    await act(async () => {
+      editResult.resolve(undefined as never);
+      await Promise.resolve();
+    });
+    await flushAsyncWork();
+
+    // Another tab's own failed Save of the same queued message, published before identity loads.
+    assert.equal(saveDurableQueuedEditRecovery({
+      instanceScope: fixture.instanceScope,
+      accountKey: queuedEditRecoveryAccountKey("org-1", "user-1"),
+      sessionId: fixture.sessionId,
+    }, {
+      edit: {
+        promptId: "queue-1",
+        text: "Original exact content",
+        images: [],
+        editRevision: "qer_exact",
+        displacedDraft: { text: "Other tab draft", images: [] },
+        submissionId: "other-tab-submission",
+      },
+      draft: { text: "Other tab edit", images: [] },
+      error: "Queued message edit was not confirmed. Other tab Save was rejected.",
+    }), true);
+    await act(async () => { identityLoaded.resolve(); });
+    await flushAsyncWork();
+
+    assert.match(fixture.container.querySelector(".composer-mode.is-recovered")?.textContent ?? "",
+      /Recovered Queued Message/);
+    assertNoDomNode(fixture.container.querySelector(".notice.t-danger[role=\"alert\"]:not(.state-error)"),
+      "a stored recovery from another Save attempt is said by the strip alone");
+  } finally {
+    await unmountFixture(fixture);
+  }
+});
+
+test("a restored queued edit shows its outcome only in the strip, and Use as New Message failures stay notices (#2560)", async () => {
+  const draft = deferred<ComposerDraft | null>();
+  let exportFailure: Error | null = new Error("The retained image is unavailable.");
+  const fixture = await mountFixture(draft, {
+    runnerProtocolVersion: 106,
+    sessionPatch: {
+      queued: [{
+        id: "queue-1",
+        text: "Changed on another client",
+        hasImages: true,
+        liveQueueObserved: true,
+        editable: true,
+        editRevision: "qer_newer",
+      }],
+    },
+    client: {
+      artifactExport: async () => {
+        if (exportFailure) throw exportFailure;
+        return new Blob([Buffer.from("image")], { type: "image/png" });
+      },
+    },
+  });
+  const recoveryScope = {
+    instanceScope: fixture.instanceScope,
+    accountKey: queuedEditRecoveryAccountKey("org-1", "user-1"),
+    sessionId: fixture.sessionId,
+  };
+  const notice = () => fixture.container.querySelector(".notice.t-danger[role=\"alert\"]:not(.state-error)");
+  try {
+    await resolveDraft(draft, "Ordinary draft");
+    assert.equal(saveDurableQueuedEditRecovery(recoveryScope, {
+      edit: {
+        promptId: "queue-1",
+        text: "Original queued content",
+        images: [],
+        editRevision: "qer_exact",
+        displacedDraft: { text: "Ordinary draft", images: [] },
+      },
+      draft: { text: "Recovered edit with an image", images: [materializedImageReference] },
+      error: "The prior queued message edit outcome was not recorded. Check the current queue before retrying.",
+    }), true);
+
+    await fixture.fullReloadWithDraftLoader(loadComposerDraft);
+    await flushAsyncWork();
+    const strip = fixture.container.querySelector(".composer-mode.is-recovered");
+    assert.match(strip?.textContent ?? "", /Recovered Queued Message.*changed elsewhere/i);
+    assertNoDomNode(notice(), "the strip's sentence is the recovery's only account of what happened");
+
+    const reuse = [...fixture.container.querySelectorAll("button")]
+      .find((button) => button.textContent === "Use as New Message") as HTMLButtonElement | undefined;
+    assert.ok(reuse);
+    await act(async () => { reuse.click(); });
+    await flushAsyncWork();
+    assert.ok(fixture.container.querySelector(".composer-mode.is-recovered"),
+      "a failed conversion keeps the recovery and its strip");
+    assert.match(notice()?.textContent ?? "",
+      /Recovered message was not converted because an attachment could not be retained\. The retained image is unavailable\./,
+      "a Use as New Message failure is still a composer notice");
+  } finally {
+    exportFailure = null;
     await unmountFixture(fixture);
   }
 });

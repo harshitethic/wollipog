@@ -1771,7 +1771,17 @@ function SessionDetailLoaded({
     storeRuntimeQueuedEditRecovery(key, queuedEditRecoveryScope.accountKey, recovery);
     return persistQueuedPromptEditRecovery(recovery);
   }, [persistQueuedPromptEditRecovery, queuedEditRecoveryScope]);
+  // The queued-edit Save attempt this composer watched in flight, kept until that recovery ends: its
+  // failure is this view's own action error, while an outcome restored from storage the strip says
+  // alone (#2560). It outlives the settlement, which may come before the recovery scope can load it,
+  // and names the attempt, so another tab's recovery for the same message is not taken for it.
+  const queuedEditSaveWatchedRef = useRef<{ key: string; submissionId: string } | null>(null);
+  const queuedEditSaveInFlight = queuedPromptEditMutationRecovery(activeComposerMutation)?.edit.submissionId;
+  if (queuedEditSaveInFlight) {
+    queuedEditSaveWatchedRef.current = { key: mutationKey, submissionId: queuedEditSaveInFlight };
+  }
   const clearQueuedPromptEditRecovery = useCallback((key: string): void => {
+    queuedEditSaveWatchedRef.current = null;
     clearRuntimeQueuedEditRecovery(key);
     if (queuedEditRecoveryScope) clearDurableQueuedEditRecovery(queuedEditRecoveryScope);
   }, [queuedEditRecoveryScope]);
@@ -1792,13 +1802,18 @@ function SessionDetailLoaded({
       replace(restored.draft.images);
       setHistIdx(-1);
     }
-    setError(restored.error ?? null);
+    // The Recovered Queued Message strip says what happened. Only a Save this view watched fail is
+    // also a notice, with the reason it failed; a stored outcome would repeat the strip (#2560).
+    const watched = queuedEditSaveWatchedRef.current;
+    const saveFailedHere = !pending && watched?.key === mutationKey &&
+      watched.submissionId === restored.edit.submissionId;
+    setError(saveFailedHere ? restored.error ?? null : null);
     commandSubmissionRetryRef.current = null;
     suppressedDraftRef.current = pending ? { sessionId } : null;
     draftHydratedSessionRef.current = sessionId;
     pendingHydrationCaretRef.current = null;
     pendingComposerFocusRestoreRef.current = null;
-  }, [replace, sessionId, setProgrammaticComposerText]);
+  }, [mutationKey, replace, sessionId, setProgrammaticComposerText]);
   // Tap-or-hold dictation (browser SpeechRecognition; hidden when unsupported, #2193).
   const dictation = useVoiceDictation((phrase) => {
     revealOrdinaryComposerRef.current("always");
@@ -2201,6 +2216,8 @@ function SessionDetailLoaded({
       restoreQueuedPromptEditRecovery(queuedEditRecovery, false, preserveQueuedEditDraft);
       return;
     }
+    // With the recovery scope known, no recovery means the watched Save left none to explain.
+    if (queuedEditRecoveryScope) queuedEditSaveWatchedRef.current = null;
     if (suppressedDraftRef.current?.sessionId !== sessionId) return;
     const completedQueuedEdit = queuedEditRef.current !== null;
     if (completedQueuedEdit) {
