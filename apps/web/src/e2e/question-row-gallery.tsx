@@ -1,5 +1,6 @@
 import type { AgentQuestion, QuestionAnswerSummaryEntry, SessionEvent, SessionEventPayload } from "@wollipog/protocol";
 import { EventTimeline } from "../components/EventTimeline.js";
+import { ViewerIdentityContext, viewerIdentity } from "../resolver-identity.js";
 import { deriveTimeline } from "../timeline.js";
 
 /**
@@ -82,6 +83,21 @@ add({ kind: "question_resolved", requestId: "policy", answered: true, resolution
   answers: [{ questionId: "review", selected: ["Proceed"] }] }, 12);
 add({ kind: "question_request", requestId: "awaiting", questions: [checks] }, 14);
 
+/** The only member of a personal installation reads every answer as their own. */
+const soloViewer = viewerIdentity({
+  context: {
+    userId: "user-local", userName: "Local owner", organizationId: "org", organizationName: "Personal organization",
+    role: "owner", deviceId: null, localBootstrap: true,
+  },
+  organizations: [],
+  memberships: [],
+  teams: [],
+});
+
 export function QuestionRowGallery() {
-  return <EventTimeline ariaLabel="Question Rows" items={deriveTimeline(events)} />;
+  return (
+    <ViewerIdentityContext.Provider value={soloViewer}>
+      <EventTimeline ariaLabel="Question Rows" items={deriveTimeline(events)} />
+    </ViewerIdentityContext.Provider>
+  );
 }

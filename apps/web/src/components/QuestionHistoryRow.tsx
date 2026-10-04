@@ -1,5 +1,7 @@
+import { useContext } from "react";
 import type { AgentQuestion, QuestionAnswerSummaryEntry } from "@wollipog/protocol";
 import { formatClock, formatRecordedTimestamp } from "../format.js";
+import { humanResolver, resolverName, ViewerIdentityContext, type ViewerIdentity } from "../resolver-identity.js";
 import { statusMeta, type StatusValue } from "../status-meta.js";
 import type { TimelineItem } from "../timeline.js";
 import { CheckIcon, QuestionIcon } from "./Icons.js";
@@ -63,8 +65,20 @@ export function questionAnswerLine(item: QuestionItem): string | null {
 
 const shortId = (id: string) => (id.length > 12 ? `${id.slice(0, 12)}…` : id);
 
+/**
+ * The member who answered, relative to the viewer (#2527): "you", their display name, or "another
+ * member". Null keeps the sentence neutral: the viewer is unknown, or in a shared organization the
+ * answer came from an older runner or control plane that recorded no member.
+ */
+function answeredBy(item: QuestionItem, viewer: ViewerIdentity | null): string | null {
+  // Without a summary or a member, an older peer's resolution cannot show a person answered.
+  if (!item.answeredByUserId && !item.answers) return null;
+  const resolver = humanResolver(viewer, item.answeredByUserId);
+  return resolver ? resolverName(resolver) : null;
+}
+
 /** "Answered by you at 12:31 AM", or who else settled it. */
-function resolutionSentence(item: QuestionItem): string | null {
+function resolutionSentence(item: QuestionItem, viewer: ViewerIdentity | null): string | null {
   if (item.answered === undefined) return null;
   const at = item.resolvedAt !== undefined && formatClock(item.resolvedAt) ? ` at ${formatClock(item.resolvedAt)}` : "";
   const parent = item.resolvedByParentSessionId ? `parent session ${shortId(item.resolvedByParentSessionId)}` : null;
@@ -76,7 +90,10 @@ function resolutionSentence(item: QuestionItem): string | null {
     case "expired": return `Expired${at}.`;
     case "provider_resolved": return `Resolved by the provider${at}.`;
     case "dismissed": return `Dismissed${at}.`;
-    default: return item.answers ? `Answered by you${at}.` : `Answered${at}.`;
+    default: {
+      const by = answeredBy(item, viewer);
+      return by ? `Answered by ${by}${at}.` : `Answered${at}.`;
+    }
   }
 }
 
@@ -114,6 +131,7 @@ export function QuestionHistoryRow({ item, open, onToggle }: {
   open: boolean;
   onToggle?: () => void;
 }) {
+  const viewer = useContext(ViewerIdentityContext);
   const title = questionTitle(item.questions);
   const answerLine = questionAnswerLine(item);
   const meta = statusMeta("question", questionOutcome(item));
@@ -121,7 +139,7 @@ export function QuestionHistoryRow({ item, open, onToggle }: {
   const timestamp = formatRecordedTimestamp(item.resolvedAt ?? item.createdAt);
   const multiple = item.questions.length > 1;
   const byQuestion = new Map((item.answered ? item.answers ?? [] : []).map((entry) => [entry.questionId, entry]));
-  const resolution = resolutionSentence(item);
+  const resolution = resolutionSentence(item, viewer);
   return (
     <div className="tl-question">
       <ToolStep

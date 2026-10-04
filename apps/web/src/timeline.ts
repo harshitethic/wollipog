@@ -224,6 +224,9 @@ export type TimelineItem =
       /** What was answered (#2188), recorded on the runner's resolution. Absent for a dismissal and
        * for an answer an older runner or control plane recorded. */
       answers?: QuestionAnswerSummaryEntry[];
+      /** The organization user who submitted the answer (#2527), recorded on the runner's
+       * resolution. Absent for a dismissal, a policy or parent answer, and from older peers. */
+      answeredByUserId?: string;
       /** When it was answered or otherwise resolved. */
       resolvedAt?: number;
     }
@@ -360,7 +363,7 @@ export const MAX_OPEN_PROVIDER_TEXT_ITEMS = 128;
 export const MAX_TRACKED_TOOL_CALL_STATEMENTS = AGENT_SPAWN_OBSERVATION_CAP;
 
 const GOVERNANCE_ACTOR_LABELS: Record<GovernanceActor["kind"], string> = {
-  human: "You",
+  human: "Member",
   policy: "Policy",
   agent: "Agent",
   system: "System",
@@ -380,8 +383,8 @@ function nativePolicyHookDecision(ev: SessionEvent): GovernanceDecision | null {
     : payload.outcome === "aborted" ? "Approval Aborted"
     : payload.actor.kind === "system" && payload.outcome === "denied" ? "Blocked Fail-Closed"
     : payload.outcome === "allowed"
-      ? payload.actor.kind === "human" ? "Approved by You" : "Allowed by Policy"
-      : payload.actor.kind === "human" ? "Denied by You" : "Blocked by Policy";
+      ? payload.actor.kind === "human" ? "Approved" : "Allowed by Policy"
+      : payload.actor.kind === "human" ? "Denied" : "Blocked by Policy";
   const detail = payload.outcome === "timed_out"
     ? "The policy deadline expired, so the tool was denied."
     : payload.outcome === "aborted"
@@ -396,13 +399,19 @@ function nativePolicyHookDecision(ev: SessionEvent): GovernanceDecision | null {
         ? "The suspended tool invocation was blocked."
         : "The matched policy denied this tool.";
   const actor = GOVERNANCE_ACTOR_LABELS[payload.actor.kind];
+  // A member's decision is named relative to the viewer when rendered (#2527); their user id is
+  // carried for that comparison and never shown.
+  const human: GovernanceDecision["human"] = label === "Approved" || label === "Denied"
+    ? { verb: label, ...(payload.actor.id ? { actorId: payload.actor.id } : {}) }
+    : undefined;
   return {
     auditId: payload.auditId,
     requestId: payload.requestId,
     label,
     detail,
     tone,
-    decidedBy: payload.actor.id ? `${actor} · ${payload.actor.id}` : actor,
+    ...(human ? { human } : {}),
+    decidedBy: payload.actor.id && payload.actor.kind !== "human" ? `${actor} · ${payload.actor.id}` : actor,
     ...(payload.governancePolicyId ? { policyId: payload.governancePolicyId } : {}),
     timestamp: ev.ts,
   };
@@ -1370,6 +1379,8 @@ export class TimelineBuilder {
               : {}),
             ...(Number.isFinite(ev.ts) ? { resolvedAt: ev.ts } : {}),
             ...(p.answered && p.answers ? { answers: p.answers } : {}),
+            // Each resolution says who settled it; a later one never keeps an earlier member.
+            answeredByUserId: p.answered ? p.answeredByUserId : undefined,
             ...(!p.answered ? { answeredByPolicies: undefined, answers: undefined } : {}) };
           this.markDirty(idx);
         }
