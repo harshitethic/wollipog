@@ -1,4 +1,4 @@
-import type { AgentSlashCommand, UnsupportedSlashCommand } from "@wollipog/protocol";
+import type { AgentDriverKind, AgentSlashCommand, UnsupportedSlashCommand } from "@wollipog/protocol";
 
 export type ComposerCommandSource = "app" | "provider";
 
@@ -106,7 +106,25 @@ export interface ComposerCommandTrigger {
 
 export type ComposerCommandResolution =
   | { kind: "plaintext"; text: string }
-  | { kind: "command"; command: ComposerCommand; arguments: string; originalText: string };
+  | { kind: "command"; command: ComposerCommand; arguments: string; originalText: string }
+  /** A message that starts with a slash token naming no command (#2176). It is never sent as it
+   * stands: `token` is the typed token, slash included, and `suggestions` are up to three
+   * available commands within a small edit distance of it, closest first. */
+  | { kind: "unknown"; token: string; suggestions: ComposerCommand[] };
+
+export interface ComposerCommandResolutionOptions {
+  /** Whether `$name` names a skill: Codex's spelling. Claude Code invokes its skills as `/name`,
+   * so a `$` there stays text (#1224). */
+  skillSigil?: boolean;
+  /** `reject` (the default) resolves an unmatched slash token as `unknown`; `plaintext` keeps the
+   * fallback that forwards it as ordinary text, for a session whose catalog can't name every
+   * command its agent runs. */
+  unknownCommands?: "reject" | "plaintext";
+  /** Lowercase names the agent advertises that the registry can't list (see
+   * `unlistedCommandNames`). A token naming one is sent as text, as before #2176, rather than
+   * refused as unknown. */
+  unlistedNames?: ReadonlySet<string>;
+}
 
 export type ComposerCommandMatchKind = "none" | "exact" | "prefix" | "boundary" | "substring" | "fuzzy";
 
@@ -152,6 +170,17 @@ function advertisedName(value: string): { name: string; comparisonName: string }
   return /^[\p{L}\p{N}_][\p{L}\p{N}_.:-]*$/u.test(name)
     ? { name, comparisonName: name.toLowerCase() }
     : null;
+}
+
+/** The names an agent advertises that the registry's name grammar can't list, lowercased. They are
+ * real commands, so the unknown-command rule must not refuse them. */
+export function unlistedCommandNames(commands: readonly Pick<AgentSlashCommand, "name">[]): Set<string> {
+  const names = new Set<string>();
+  for (const command of commands) {
+    const name = command.name.trim().replace(/^\//, "");
+    if (name && !/\s/u.test(name) && !advertisedName(name)) names.add(name.toLowerCase());
+  }
+  return names;
 }
 
 function optionalText(value: string | undefined): string | undefined {
@@ -413,16 +442,118 @@ export function buildComposerCommandRegistry(input: {
   return [...apps, ...providerCommands, ...unsupportedCommands];
 }
 
+/**
+ * Whether this session's composer refuses an unknown slash token (#2176) instead of sending it as
+ * text. Refusing is only safe where the catalog names every command the agent runs.
+ *
+ * Codex, Pi and ACP agents don't run slash text they don't advertise, so an unmatched token is a
+ * typo and is always refused there. Claude Code does run its built-ins (`/compact`, `/context`)
+ * when they arrive as prompt text, and a runner reports them only once it forwards Claude Code's
+ * init-time catalog with source `builtin` (#1224); its disk commands are `user` or `project`. A
+ * Claude Code catalog without a built-in comes from an older runner, which keeps the plain-text
+ * fallback so those commands still run.
+ */
+export function composerRejectsUnknownCommands(
+  driver: AgentDriverKind | undefined,
+  slashCommands: readonly Pick<AgentSlashCommand, "source">[],
+): boolean {
+  return driver !== "claude-code" || slashCommands.some((command) => command.source === "builtin");
+}
+
+/** Optimal string alignment distance: an insertion, deletion, substitution or swap of two adjacent
+ * characters each costs one, so `reveiw` is one step from `review`. With a `limit`, any distance
+ * past it is reported as `limit + 1` without finishing the table: a pasted path at the start of a
+ * message must not cost a full table per command on every render. */
+export function commandEditDistance(left: string, right: string, limit = Number.POSITIVE_INFINITY): number {
+  const a = [...left];
+  const b = [...right];
+  if (Math.abs(a.length - b.length) > limit) return limit + 1;
+  // Three rows: the one being filled and the two a transposition looks back to.
+  let before = new Array<number>(b.length + 1).fill(0);
+  let previous = Array.from({ length: b.length + 1 }, (_, j) => j);
+  let current = new Array<number>(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i += 1) {
+    current[0] = i;
+    let rowMinimum = current[0];
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      let best = Math.min(previous[j]! + 1, current[j - 1]! + 1, previous[j - 1]! + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        best = Math.min(best, before[j - 2]! + 1);
+      }
+      current[j] = best;
+      rowMinimum = Math.min(rowMinimum, best);
+    }
+    // A cell looks back at most two rows, so once two rows in a row are past the limit, no later
+    // cell can come back under it.
+    if (rowMinimum > limit && Math.min(...previous) > limit) return limit + 1;
+    [before, previous, current] = [previous, current, before];
+  }
+  return Math.min(previous[b.length]!, limit + 1);
+}
+
+const MAX_COMMAND_SUGGESTIONS = 3;
+
+/** Up to three available commands close to a typed name (without its slash), closest first. The
+ * allowance grows with the name, one edit per three characters, so a short token doesn't match
+ * everything. */
+export function suggestComposerCommands(
+  typedName: string,
+  commands: readonly ComposerCommand[],
+): ComposerCommand[] {
+  const typed = typedName.toLowerCase();
+  if (!typed) return [];
+  const allowance = Math.max(1, Math.floor([...typed].length / 3));
+  return commands
+    .flatMap((command) => {
+      if (!command.available) return [];
+      const name = command.name.toLowerCase();
+      // A namespaced command (`superpowers:brainstorming`) is also close to its own last part, which
+      // is what a person usually types.
+      const unqualified = name.slice(name.lastIndexOf(":") + 1);
+      const distance = Math.min(
+        commandEditDistance(typed, command.invocationAlias.toLowerCase(), allowance),
+        commandEditDistance(typed, name, allowance),
+        unqualified !== name ? commandEditDistance(typed, unqualified, allowance) : allowance + 1,
+      );
+      return distance <= allowance ? [{ command, distance }] : [];
+    })
+    .sort((left, right) =>
+      left.distance - right.distance
+      || groupOrder(left.command) - groupOrder(right.command)
+      || ordinalCompare(left.command.label, right.command.label))
+    .slice(0, MAX_COMMAND_SUGGESTIONS)
+    .map(({ command }) => command);
+}
+
+/** Replace a message's leading slash token with a command's and keep the rest of the message; the
+ * caret goes after the inserted token. */
+export function replaceLeadingCommandToken(
+  text: string,
+  command: ComposerCommand,
+): { text: string; caret: number } {
+  const match = /^(\s*)\/\S*[^\S\n]*/u.exec(text);
+  const insertion = `/${command.invocationAlias} `;
+  if (!match) return { text: `${insertion}${text}`, caret: insertion.length };
+  const start = match[1]!.length;
+  return {
+    text: `${text.slice(0, start)}${insertion}${text.slice(match[0].length)}`,
+    caret: start + insertion.length,
+  };
+}
+
 export function resolveComposerCommandInvocation(
   text: string,
   commands: readonly ComposerCommand[],
-  options: {
-    /** Whether `$name` names a skill: Codex's spelling. Claude Code invokes its skills as `/name`,
-     * so a `$` there stays text (#1224). */
-    skillSigil?: boolean;
-  } = {},
+  options: ComposerCommandResolutionOptions = {},
 ): ComposerCommandResolution {
   const trimmed = text.trim();
+  // `//x` and `\/x` mark a message that starts with a slash as text: the escape is removed and `/x`
+  // is sent as it stands.
+  if (trimmed.startsWith("//") || trimmed.startsWith("\\/")) {
+    const escape = text.indexOf(trimmed[0]!);
+    return { kind: "plaintext", text: `${text.slice(0, escape)}${text.slice(escape + 1)}` };
+  }
   const skillReference = options.skillSigil === false ? null : /^\$([^\s]+)(?:\s+([\s\S]*))?$/.exec(trimmed);
   if (skillReference) {
     // `$name` is Codex's skill spelling: it names only a skill, and ordinary `$` text stays text.
@@ -457,7 +588,11 @@ export function resolveComposerCommandInvocation(
       (left.providerSource ? PROVIDER_INVOCATION_PRECEDENCE[left.providerSource] : 4) -
         (right.providerSource ? PROVIDER_INVOCATION_PRECEDENCE[right.providerSource] : 4) ||
       ordinalCompare(left.id, right.id))[0] : undefined);
-  if (!command) return { kind: "plaintext", text };
+  if (!command) {
+    return options.unknownCommands === "plaintext" || options.unlistedNames?.has(alias)
+      ? { kind: "plaintext", text }
+      : { kind: "unknown", token: `/${match[1]!}`, suggestions: suggestComposerCommands(match[1]!, commands) };
+  }
   return {
     kind: "command",
     command,

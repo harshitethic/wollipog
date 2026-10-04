@@ -201,13 +201,30 @@ test("Ctrl+Enter steers without an optimistic echo while Enter, Shift+Enter, IME
   await expect(composer).toHaveValue("/review ");
   await expect.poll(() => page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.steeringRequests().length)).toBe(1);
 
-  await composer.fill("/rev");
-  await expect(page.getByRole("listbox")).toBeVisible();
+  await composer.fill("/review the diff");
   // The settled steer holds the composer through the same bookkeeping.
   await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
   await page.keyboard.press("Control+Enter");
   await expect.poll(() => page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.steeringRequests().length)).toBe(2);
-  await expect.poll(() => page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.steeringRequests()[1]?.text)).toBe("/rev");
+  await expect.poll(() => page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.steeringRequests()[1]?.text))
+    .toBe("/review the diff");
+  await expect(composer).toHaveValue("");
+
+  // An unknown command is not steered either (#2176). Send as Text in the notice steers it as typed.
+  // `/rev` is a prefix of `/review` rather than a typo of it, so no close match is offered.
+  await composer.fill("/rev");
+  await expect(page.getByRole("listbox")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
+  await page.keyboard.press("Control+Enter");
+  const notice = page.locator('.session-notice-slot .notice.t-warning[role="alert"]');
+  await expect(notice.locator(".notice-body"))
+    .toHaveText("“/rev” isn't a recognized command, so nothing was sent.");
+  await expect(composer).toHaveValue("/rev");
+  await expect.poll(() => page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.steeringRequests().length)).toBe(2);
+  await notice.getByRole("button", { name: "Send as Text" }).click();
+  await expect.poll(() => page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.steeringRequests().length)).toBe(3);
+  await expect.poll(() => page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.steeringRequests()[2]?.text)).toBe("/rev");
+  await expect.poll(() => page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.promptRequests().length)).toBe(1);
 });
 
 test("ordinary Send and steering are mutually exclusive in both directions", async ({ page }) => {
@@ -682,6 +699,20 @@ async function hitArea(page: Page, name: string) {
     };
   });
 }
+
+test("a queued edit keeps a leading unknown slash token as text and never offers Send as Text (#2176)", async ({ page }) => {
+  await seedEditableQueue(page);
+  await page.getByTestId("queued-prompt-queue-edit").getByRole("button", { name: "Edit Queued Message" }).click();
+  const composer = page.locator(".composer-input");
+  await composer.fill("/zzzz");
+  // The plain no-match row: Send as Text would start a new message beside the one being edited.
+  await expect(page.locator(".picker-empty")).toHaveText("No commands match “/zzzz”.");
+  await expect(page.locator(".picker").getByRole("button", { name: "Send as Text" })).toHaveCount(0);
+  // Enter belongs to the edit's save, which keeps the text as it stands: no refusal, no new message.
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".session-notice-slot .notice.t-warning")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => window.__WOLLIPOG_PROJECT_INBOX_E2E__.promptRequests().length)).toBe(0);
+});
 
 test("editing a queued message is a 40px strip in the card, a check in the Send seat and the selected row (#2194)", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
