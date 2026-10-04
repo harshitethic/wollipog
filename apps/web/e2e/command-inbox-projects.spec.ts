@@ -73,6 +73,111 @@ async function previewVisibleAnchor(page: Page) {
   });
 }
 
+type RowOffsetSample = { key: string; offset: number | null };
+
+/**
+ * Runs `action` and follows one row of the reader through every painted frame (#2426). Without
+ * `key`, it waits for the reader to scroll (a page lands in the press's own task) and follows the
+ * row then at the top; with `key`, it follows that row from the first frame. Recording ends
+ * `durationMs` after it starts or, with `untilRowsGrow`, `durationMs` after the list gains a row.
+ * Samples are read only inside the browser's rendering step, never in a task between frames: a
+ * read there forces a style recalculation that would start a short transition early and hide the
+ * very frame under test. Each frame is read once in a rAF callback, and again in a ResizeObserver
+ * callback — every frame, and whenever the list, its rows or the reader resize — created after the
+ * list's own observers, so it reads the geometry their corrections leave for the paint. A row that
+ * moves for a single painted frame and moves back still shows.
+ */
+async function recordRowOffsets(
+  page: Page,
+  reader: Locator,
+  action: () => Promise<unknown>,
+  { key, untilRowsGrow = false, durationMs = 300 }: { key?: string; untilRowsGrow?: boolean; durationMs?: number } = {},
+) {
+  await reader.evaluate((element, options) => {
+    const scrollTop = element.scrollTop;
+    const rowCount = () => Number(element.querySelector<HTMLElement>("[data-virtual-total]")?.dataset.virtualTotal ?? 0);
+    const initialRowCount = rowCount();
+    const rows = () => [...element.querySelectorAll<HTMLElement>("[data-virtual-row]")];
+    const samples: Array<{ key: string; offset: number | null }> = [];
+    const probe = window as typeof window & {
+      __rowOffsets?: Promise<{ samples: typeof samples; completed: boolean }>;
+    };
+    probe.__rowOffsets = new Promise((resolve) => {
+      const startedAt = performance.now();
+      let trackedKey: string | null = options.key ?? null;
+      let windowStart: number | null = trackedKey != null && !options.untilRowsGrow ? startedAt : null;
+      let done = false;
+      const observed = new Set<Element>();
+      const resized = new ResizeObserver(() => sample());
+      // A box of the recorder's own, resized every frame, so its observer reports in every frame's
+      // first delivery — after the callbacks of every observer created before it.
+      const tick = document.createElement("div");
+      tick.style.cssText = "position: fixed; top: 0; left: 0; height: 0; width: 1px; visibility: hidden;";
+      document.body.append(tick);
+      const observe = () => {
+        for (const target of [tick, element, element.querySelector("[data-virtual-total]"), ...rows()]) {
+          if (target && !observed.has(target)) {
+            observed.add(target);
+            resized.observe(target);
+          }
+        }
+      };
+      const finish = (completed: boolean) => {
+        done = true;
+        resized.disconnect();
+        tick.remove();
+        resolve({ samples, completed });
+      };
+      const sample = () => {
+        if (done) return;
+        const now = performance.now();
+        const viewport = element.getBoundingClientRect();
+        if (trackedKey == null && Math.abs(element.scrollTop - scrollTop) >= 1) {
+          trackedKey = rows().find((candidate) => {
+            const rect = candidate.getBoundingClientRect();
+            return rect.bottom > viewport.top && rect.top < viewport.bottom;
+          })?.dataset.virtualKey ?? null;
+          if (!options.untilRowsGrow) windowStart = now;
+        }
+        if (options.untilRowsGrow && windowStart == null && rowCount() > initialRowCount) windowStart = now;
+        if (trackedKey != null) {
+          const row = rows().find((candidate) => candidate.dataset.virtualKey === trackedKey);
+          samples.push({ key: trackedKey, offset: row ? row.getBoundingClientRect().top - viewport.top : null });
+        }
+        observe();
+      };
+      const frame = () => {
+        sample();
+        tick.style.width = tick.style.width === "1px" ? "2px" : "1px";
+        const now = performance.now();
+        if (windowStart != null && now - windowStart >= options.durationMs) finish(true);
+        else if (now - startedAt >= 5_000) finish(false);
+        else requestAnimationFrame(frame);
+      };
+      observe();
+      requestAnimationFrame(frame);
+    });
+  }, { key, untilRowsGrow, durationMs });
+  await action();
+  const recorded = await page.evaluate(() =>
+    (window as typeof window & { __rowOffsets?: Promise<{ samples: RowOffsetSample[]; completed: boolean }> })
+      .__rowOffsets!);
+  expect(recorded.completed, "the recorder saw the reader move or the list grow").toBe(true);
+  return recorded.samples;
+}
+
+/** The largest distance the followed row moved from where it was in the first recorded frame. */
+function rowDrift(samples: RowOffsetSample[]): number {
+  expect(samples.length).toBeGreaterThan(2);
+  const [first] = samples;
+  expect(first!.offset).not.toBeNull();
+  return Math.max(...samples.map((sample) => sample.offset == null ? Infinity : Math.abs(sample.offset - first!.offset!)));
+}
+
+function expectRowStill(samples: RowOffsetSample[]) {
+  expect(rowDrift(samples), JSON.stringify(samples)).toBeLessThanOrEqual(2);
+}
+
 async function settlePreviewLayout(page: Page, frames = 12) {
   await page.evaluate((count) => new Promise<void>((resolve) => {
     let remaining = count;
@@ -596,33 +701,112 @@ test("an event-heavy Inbox preview fills its opening viewport before expansion",
 
 test("real Inbox preview paging preserves ownership with reduced motion", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
-  await page.goto("/command-inbox-projects-e2e.html?scenario=preview-follow");  const reader = page.getByRole("region", { name: "Session Preview Activity" });
+  await page.goto("/command-inbox-projects-e2e.html?scenario=preview-follow");
+  const reader = page.getByRole("region", { name: "Session Preview Activity" });
   const follow = page.locator(".detail-scroll[data-follow-tail-state]");
   await expect(reader.locator("[data-virtual-row]").first()).toBeVisible();
   await expect.poll(async () => (await previewScrollMetrics(page)).distanceFromTail).toBeLessThanOrEqual(2);
   await page.locator(".inbox-list").focus();
   const before = await settledPreviewScrollMetrics(page);
 
-  await page.keyboard.press("Shift+Space");
+  // The rows the page mounts measure in the frames after it lands, and the row at the top of the
+  // reader must not move while they do — not even for one frame (#2426).
+  expectRowStill(await recordRowOffsets(page, reader, () => page.keyboard.press("Shift+Space")));
   await expect(follow).toHaveAttribute("data-follow-tail-state", "previewing");
-  await expect.poll(async () => (await previewScrollMetrics(page)).scrollTop)
-    .toBeLessThan(before.scrollTop - before.clientHeight * 0.35);
-  // Rows mounted by the page measure in the frames after it lands; the property under test is that
-  // the STREAM leaves the viewport alone, so read the anchor once paging has settled. (Without the
-  // reserved strip the preview is taller, and that first measurement moved the anchor past 12px.)
-  await settlePreviewLayout(page);
+  expect((await previewScrollMetrics(page)).scrollTop).toBeLessThan(before.scrollTop - before.clientHeight * 0.35);
   const anchor = await previewVisibleAnchor(page);
   expect(anchor).not.toBeNull();
-  await page.evaluate(() => {
+  // The streamed row lands below the viewport; the anchor stays put in every frame until it has.
+  expectRowStill(await recordRowOffsets(page, reader, () => page.evaluate(() => {
     window.__WOLLIPOG_PROJECT_INBOX_E2E__.emitAgentMessage(
       "session-alpha",
       "Reduced-motion streamed output must leave the preview viewport untouched. ".repeat(12),
     );
-  });
+  }), { key: anchor!.key, untilRowsGrow: true }));
   await expect(follow).toHaveAttribute("data-follow-tail-state", "previewing");
-  await expect.poll(async () => (await previewVisibleAnchor(page))?.key).toBe(anchor!.key);
-  await expect.poll(async () => Math.abs((await previewVisibleAnchor(page))!.offset - anchor!.offset)).toBeLessThan(12);
+  const streamed = await previewVisibleAnchor(page);
+  expect(streamed?.key).toBe(anchor!.key);
+  expect(Math.abs(streamed!.offset - anchor!.offset)).toBeLessThanOrEqual(2);
 });
+
+for (const reducedMotion of ["reduce", "no-preference"] as const) {
+  test(`paging keeps the landed row still while paged-in rows measure (${reducedMotion} motion)`, async ({ page }) => {
+    await page.emulateMedia({ reducedMotion });
+    await page.goto("/command-inbox-projects-e2e.html?scenario=preview-follow");
+    const preview = page.getByRole("region", { name: "Session Preview Activity" });
+    const follow = page.locator(".detail-scroll[data-follow-tail-state]");
+    await expect(preview.locator("[data-virtual-row]").first()).toBeVisible();
+    await expect.poll(async () => (await previewScrollMetrics(page)).distanceFromTail).toBeLessThanOrEqual(2);
+    await page.locator(".inbox-list").focus();
+    await settledPreviewScrollMetrics(page);
+    expectRowStill(await recordRowOffsets(page, preview, () => page.keyboard.press("Shift+Space")));
+    await expect(follow).toHaveAttribute("data-follow-tail-state", "previewing");
+
+    // Page Up from the Session Reading keys, in the expanded session.
+    await page.getByRole("button", { name: "Expand Session" }).click();
+    const reader = page.getByRole("region", { name: "Session Activity" });
+    await expect(reader.locator("[data-virtual-row]").first()).toBeVisible();
+    await reader.focus();
+    await page.keyboard.press("End");
+    await expect(follow).toHaveAttribute("data-follow-tail-state", "following");
+    await expect.poll(() => reader.evaluate((element) =>
+      element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThanOrEqual(2);
+    await settlePreviewLayout(page);
+    expectRowStill(await recordRowOffsets(page, reader, () => page.keyboard.press("Shift+Space")));
+    await expect(follow).toHaveAttribute("data-follow-tail-state", "paused");
+  });
+}
+
+for (const fault of ["row transition", "observer jump"] as const) {
+  test(`the painted-frame row recorder sees a row that moves for one frame (${fault})`, async ({ page }) => {
+    // Negative controls for the paging tests above. "row transition" puts back the transition #2426
+    // removed, which paints a scroll correction a frame before the rows it compensates for.
+    // "observer jump" moves the reader in a ResizeObserver callback, before paint, in the first frame
+    // after the page lands, and moves it back straight after that paint.
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.goto("/command-inbox-projects-e2e.html?scenario=preview-follow");
+    if (fault === "row transition") {
+      await page.addStyleTag({ content: "[data-virtual-row] { transition-property: transform !important; }" });
+    }
+    const reader = page.getByRole("region", { name: "Session Preview Activity" });
+    await expect(reader.locator("[data-virtual-row]").first()).toBeVisible();
+    await expect.poll(async () => (await previewScrollMetrics(page)).distanceFromTail).toBeLessThanOrEqual(2);
+    await page.locator(".inbox-list").focus();
+    await settledPreviewScrollMetrics(page);
+    if (fault === "observer jump") {
+      await reader.evaluate((element) => {
+        const landedFrom = element.scrollTop;
+        // In the first frame after the page lands, resize a box this fault owns. Its observer,
+        // created before the recorder's, moves the reader in that frame's first delivery, after the
+        // frame's rAF reads; the move back runs after the paint and before the next rAF, so only
+        // the recorder's observer-phase read can see the frame.
+        const trigger = document.createElement("div");
+        trigger.style.cssText = "position: fixed; top: 0; left: 0; height: 0; width: 1px; visibility: hidden;";
+        document.body.append(trigger);
+        let armed = false;
+        const jump = new ResizeObserver(() => {
+          if (!armed) return;
+          jump.disconnect();
+          trigger.remove();
+          element.scrollTop -= 20;
+          setTimeout(() => { element.scrollTop += 20; }, 0);
+        });
+        jump.observe(trigger);
+        const watch = () => {
+          if (Math.abs(element.scrollTop - landedFrom) < 1) {
+            requestAnimationFrame(watch);
+            return;
+          }
+          armed = true;
+          trigger.style.width = "2px";
+        };
+        requestAnimationFrame(watch);
+      });
+    }
+    const samples = await recordRowOffsets(page, reader, () => page.keyboard.press("Shift+Space"));
+    expect(rowDrift(samples), JSON.stringify(samples)).toBeGreaterThan(2);
+  });
+}
 
 test("real Inbox reading hints and resume keys match preview and expanded follow state", async ({ page }) => {
   await page.goto("/command-inbox-projects-e2e.html?scenario=preview-follow");
