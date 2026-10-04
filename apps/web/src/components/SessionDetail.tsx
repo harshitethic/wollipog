@@ -5959,13 +5959,19 @@ function SessionDetailLoaded({
                 followTail.onWheel(event);
               }}
               onPointerDown={(event) => {
-                if (event.pointerType === "touch") markTouchEarlierActivityIntent(event.clientY);
-                else markPointerEarlierActivityIntent(event.currentTarget);
+                if (event.pointerType === "touch") {
+                  markTouchEarlierActivityIntent(event.clientY);
+                  // A touch pauses following on the press, as its touchstart does. A drag the
+                  // floating tail control hands over (#2425) arrives as pointer events only.
+                  followTail.onTouchStart();
+                } else markPointerEarlierActivityIntent(event.currentTarget);
               }}
               onPointerMove={(event) => {
                 if (event.pointerType === "touch") {
                   markTouchEarlierActivityMovement(event.clientY);
                   requestEarlierFromTouchAtHead(event.clientY, event.target);
+                  // The press already paused; a drag that reaches the tail must be able to resume.
+                  return;
                 }
                 followTail.onPointerMove(event);
               }}
@@ -6141,6 +6147,7 @@ function SessionDetailLoaded({
               shortcut={isMobile
                 ? null
                 : shortcutDisplay(mode === "preview" ? "inbox-follow-latest-end" : "session-reading-latest-end")}
+              readerRef={scrollRef}
               onJump={followTail.follow}
               onShowNotSent={showFirstUndelivered}
               onFocusLost={keepFocusInReader}

@@ -102,6 +102,145 @@ export function useOffscreenReceipts(
   return offscreen;
 }
 
+/** Pixels per wheel line or page, for browsers that report the wheel in those units (Firefox). */
+const WHEEL_LINE_PX = 40;
+/** How far a touch may wander before it is a drag rather than a tap. */
+const TOUCH_SLOP_PX = 8;
+/** A drag that ends on the control is not a tap on it, whatever click the browser sends after. */
+const DRAG_CLICK_SUPPRESS_MS = 600;
+
+function wheelPixelsY(event: WheelEvent, reader: HTMLElement): number {
+  if (event.deltaMode === 1) return event.deltaY * WHEEL_LINE_PX;
+  if (event.deltaMode === 2) return event.deltaY * reader.clientHeight;
+  return event.deltaY;
+}
+
+/**
+ * The control floats over the reader without being inside its scroller, so on its own a wheel or a
+ * touch drag that starts on it has nothing to scroll (#2425). Hand that input to the reader: the
+ * reader's listeners receive the same wheel and touch pointer events they would have received
+ * beside the control, so following pauses and resumes and earlier activity loads exactly as it
+ * does there, and the reader then scrolls by the input's distance. Clicks, taps and keys still
+ * belong to the control.
+ */
+function useScrollPassThrough(
+  anchorRef: RefObject<HTMLElement | null>,
+  readerRef: RefObject<HTMLElement | null>,
+): void {
+  useEffect(() => {
+    const anchor = anchorRef.current;
+    const view = anchor?.ownerDocument.defaultView;
+    if (!anchor || !view) return;
+
+    const onWheel = (event: WheelEvent) => {
+      const reader = readerRef.current;
+      // Ctrl+wheel and a trackpad pinch zoom the page; they never scroll the reader.
+      if (!reader || event.ctrlKey || event.deltaY === 0) return;
+      event.preventDefault();
+      const relayed = new view.WheelEvent("wheel", {
+        bubbles: true,
+        cancelable: true,
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+        deltaZ: event.deltaZ,
+        deltaMode: event.deltaMode,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        screenX: event.screenX,
+        screenY: event.screenY,
+        buttons: event.buttons,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        metaKey: event.metaKey,
+      });
+      if (!reader.dispatchEvent(relayed)) return;
+      reader.scrollBy({ top: wheelPixelsY(event, reader) });
+    };
+
+    // CSS gives the control `touch-action: none`, so the browser leaves a touch on it to us for
+    // the whole gesture, and we play the part of the browser's own pan. The reader hears every
+    // step of the touch as pointer events, which drive its touch handling (following pauses on the
+    // press; earlier activity loads when the drag pulls at the head). The gesture is followed on
+    // the window, not the anchor: the control can vanish mid-drag (the drag reaches the tail, or
+    // recovery ends) and the rest of it then lands on whatever is under the finger.
+    let drag: { pointerId: number; startY: number; lastY: number; dragging: boolean } | null = null;
+    let suppressClickUntil = 0;
+    const relayed = new WeakSet<Event>();
+    const relayPointer = (reader: HTMLElement, event: PointerEvent) => {
+      // Input that already landed in the reader reached its listeners on its own.
+      if (event.target instanceof view.Node && reader.contains(event.target)) return;
+      const copy = new view.PointerEvent(event.type, {
+        bubbles: true,
+        cancelable: true,
+        pointerId: event.pointerId,
+        pointerType: event.pointerType,
+        isPrimary: event.isPrimary,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        screenX: event.screenX,
+        screenY: event.screenY,
+        button: event.button,
+        buttons: event.buttons,
+        width: event.width,
+        height: event.height,
+        pressure: event.pressure,
+      });
+      relayed.add(copy);
+      reader.dispatchEvent(copy);
+    };
+    const onPointerMove = (event: PointerEvent) => {
+      const reader = readerRef.current;
+      if (!drag || relayed.has(event) || event.pointerId !== drag.pointerId || !reader) return;
+      relayPointer(reader, event);
+      if (!drag.dragging && Math.abs(event.clientY - drag.startY) < TOUCH_SLOP_PX) return;
+      drag.dragging = true;
+      reader.scrollBy({ top: drag.lastY - event.clientY });
+      drag.lastY = event.clientY;
+    };
+    const endDrag = () => {
+      drag = null;
+      view.removeEventListener("pointermove", onPointerMove);
+      view.removeEventListener("pointerup", onPointerEnd);
+      view.removeEventListener("pointercancel", onPointerEnd);
+    };
+    const onPointerEnd = (event: PointerEvent) => {
+      if (!drag || relayed.has(event) || event.pointerId !== drag.pointerId) return;
+      const reader = readerRef.current;
+      if (reader) relayPointer(reader, event);
+      if (drag.dragging) suppressClickUntil = event.timeStamp + DRAG_CLICK_SUPPRESS_MS;
+      endDrag();
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      suppressClickUntil = 0;
+      const reader = readerRef.current;
+      if (!reader || event.pointerType !== "touch" || !event.isPrimary) return;
+      endDrag();
+      drag = { pointerId: event.pointerId, startY: event.clientY, lastY: event.clientY, dragging: false };
+      relayPointer(reader, event);
+      view.addEventListener("pointermove", onPointerMove);
+      view.addEventListener("pointerup", onPointerEnd);
+      view.addEventListener("pointercancel", onPointerEnd);
+    };
+    const onClickCapture = (event: MouseEvent) => {
+      // A keyboard activation (detail 0) is always the person's own choice.
+      if (event.detail === 0 || event.timeStamp > suppressClickUntil) return;
+      suppressClickUntil = 0;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    anchor.addEventListener("wheel", onWheel, { passive: false });
+    anchor.addEventListener("pointerdown", onPointerDown);
+    anchor.addEventListener("click", onClickCapture, true);
+    return () => {
+      endDrag();
+      anchor.removeEventListener("wheel", onWheel);
+      anchor.removeEventListener("pointerdown", onPointerDown);
+      anchor.removeEventListener("click", onClickCapture, true);
+    };
+  }, [anchorRef, readerRef]);
+}
+
 /**
  * A zero-height anchor between the reader and the composer column, with the control floating
  * --space-3 above it. The anchor is always mounted and takes no height, so showing or hiding the
@@ -110,6 +249,7 @@ export function useOffscreenReceipts(
 export function TranscriptTailControl({
   view,
   shortcut,
+  readerRef,
   onJump,
   onShowNotSent,
   onFocusLost,
@@ -117,6 +257,8 @@ export function TranscriptTailControl({
   view: TranscriptTailView;
   /** The resume chord, when the reading keys are active on this surface. */
   shortcut: string | null;
+  /** The transcript scroller the control floats over, which scrolling on the control moves. */
+  readerRef: RefObject<HTMLElement | null>;
   onJump: () => void;
   onShowNotSent: () => void;
   /** The focused control went away (jumped, or replaced by a status): keep focus in the reader. */
@@ -124,6 +266,7 @@ export function TranscriptTailControl({
 }) {
   const anchorRef = useRef<HTMLDivElement>(null);
   const heldFocusRef = useRef(false);
+  useScrollPassThrough(anchorRef, readerRef);
   // Runs after every commit. If the control held focus at the last commit and this one removed or
   // replaced it, focus has fallen to the page; hand it to the reader. Focus the person moved
   // elsewhere themselves is left alone.
