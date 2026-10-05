@@ -44,17 +44,19 @@ import {
   foldRetries,
   mergeWork,
   ownsSubagent,
+  reportedExitCode,
   retryIdentity,
   retryNeighbours,
   sameWork,
   splitStepTitle,
+  statesExitCode,
   stepObjectIsPath,
   subagentName,
   summarizeWork,
   workspaceRelativePath,
   type WorkLedger,
 } from "../work-steps.js";
-import { StepOutput, StepStatus, ToolStep, toolIcon, WorkLedgerLine } from "./ToolStep.js";
+import { StepExitCode, StepOutput, StepStatus, ToolStep, toolIcon, WorkLedgerLine } from "./ToolStep.js";
 import { statusMeta, toolStatusMeta } from "../status-meta.js";
 import { StatusBadge } from "./StatusBadge.js";
 import { ReadonlyReferenceChip } from "./images.js";
@@ -2476,10 +2478,42 @@ function stepLabel(title: string, status: string, fact?: string): string {
   return [title, fact, toolStatusMeta(status).label].filter(Boolean).join(" · ");
 }
 
+/** The exit code a failed step states on its own line, when its provider reported one (#2456). */
+const stepExitCode = (item: ToolItem, failed: boolean): number | undefined =>
+  failed ? reportedExitCode(item.exitCode, item.text) : undefined;
+
+/** Full content loaded from a reference, which reports whether it already states the step's
+ * reported exit code, so the step's own line can give way to it (#2456). */
+function FullStepOutput({ text, failed, exitCode, index, report }: {
+  text: string;
+  failed: boolean;
+  exitCode?: number;
+  index: number;
+  report: (index: number, states: boolean) => void;
+}) {
+  const states = failed && exitCode !== undefined && statesExitCode(text, exitCode);
+  useBrowserLayoutEffect(() => {
+    if (!states) return;
+    report(index, true);
+    return () => report(index, false);
+  }, [states, index, report]);
+  return <StepOutput text={text} failed={failed} exitCode={exitCode} />;
+}
+
 function ToolOutput({ item, failed }: { item: ToolItem; failed: boolean }) {
+  const [statedInFull, setStatedInFull] = useState<ReadonlySet<number>>(() => new Set());
+  const report = useCallback((index: number, states: boolean) => setStatedInFull((current) => {
+    if (current.has(index) === states) return current;
+    const next = new Set(current);
+    if (states) next.add(index);
+    else next.delete(index);
+    return next;
+  }), []);
+  const exitCode = statedInFull.size ? undefined : stepExitCode(item, failed);
   return (
     <>
-      {item.text && <StepOutput text={item.text} failed={failed} />}
+      {exitCode !== undefined && <StepExitCode code={exitCode} />}
+      {item.text && <StepOutput text={item.text} failed={failed} exitCode={item.exitCode} />}
       {item.referencedText?.map((fragment, index) => (
         <EventPayloadContent
           key={`${fragment.refs[0]?.artifactId ?? index}:${index}`}
@@ -2489,7 +2523,9 @@ function ToolOutput({ item, failed }: { item: ToolItem; failed: boolean }) {
           label="Tool Content"
           appendFull
         >
-          {(text, full) => full ? <StepOutput text={text} failed={failed} /> : null}
+          {(text, full) => full
+            ? <FullStepOutput text={text} failed={failed} exitCode={item.exitCode} index={index} report={report} />
+            : null}
         </EventPayloadContent>
       ))}
     </>
@@ -2526,7 +2562,7 @@ function ToolCallStep({ item, attempts, open, onToggle }: {
         </li>
       ))}
     </ol>
-  ) : hasToolOutput(item) ? <ToolOutput item={item} failed={failed} /> : null;
+  ) : hasToolOutput(item) || stepExitCode(item, failed) !== undefined ? <ToolOutput item={item} failed={failed} /> : null;
   return (
     <ToolStep
       icon={toolIcon(item.toolKind)}
