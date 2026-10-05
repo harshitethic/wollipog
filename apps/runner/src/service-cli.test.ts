@@ -8,6 +8,7 @@ import { PROTOCOL_VERSION } from "@wollipog/protocol";
 import type { McpFetch } from "./session-management-mcp.js";
 import { executableFromUnit, runServiceCli, type ServiceHost, type ServiceIo } from "./service-cli.js";
 import { CONTROL_PLANE_UNIT, RUNNER_UNIT, serviceLayout } from "./systemd-service.js";
+import { stagingFilesystem } from "./release-staging.js";
 
 const LOCAL_TOKEN = "L".repeat(43);
 const RUNNER_TOKEN = `wollipogr_${"r".repeat(43)}`;
@@ -38,12 +39,26 @@ function fake(t: { after(fn: () => void): void }, options: {
   const root = mkdtempSync(join(tmpdir(), "wollipog-svc-cli-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const home = options.home ?? join(root, "home");
-  mkdirSync(home, { recursive: true });
+  mkdirSync(home, { recursive: true, mode: 0o755 });
   const execs: string[] = [];
   const out: string[] = [];
   const err: string[] = [];
   const env: NodeJS.ProcessEnv = options.system ? { WOLLIPOG_SYSTEM_PREFIX: join(root, "sysroot") } : {};
   const layout = serviceLayout(options.system ? "system" : "user", { home, user: "op", env });
+  // Synthetic system-mode identities cover the real staging helper without root/chown. Every
+  // path and descriptor is mapped consistently; the syscall behavior remains real and private.
+  const opened = new Map<number, string>();
+  const identity = (stat: ReturnType<typeof stagingFilesystem.lstat>, path: string) => options.system && path.startsWith(root)
+    ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: BigInt(path === layout.dataDir ? options.accountUid ?? MY_UID : 0) }) as typeof stat
+    : stat;
+  const stagingFs = {
+    ...stagingFilesystem,
+    euid: () => options.system ? 0 : MY_UID,
+    open: (...args: Parameters<typeof stagingFilesystem.open>) => { const fd = stagingFilesystem.open(...args); opened.set(fd, String(args[0])); return fd; },
+    lstat: (path: string) => identity(stagingFilesystem.lstat(path), path),
+    fstat: (fd: number) => identity(stagingFilesystem.fstat(fd), opened.get(fd) ?? ""),
+    close: (fd: number) => { stagingFilesystem.close(fd); opened.delete(fd); },
+  };
   const tokenPath = () => {
     if (options.tokenPathFromEnv && existsSync(layout.controlPlaneEnvFile)) {
       const match = /CONTROL_PLANE_LOCAL_TOKEN_FILE="([^"]+)"/u.exec(readFileSync(layout.controlPlaneEnvFile, "utf8"));
@@ -135,6 +150,7 @@ function fake(t: { after(fn: () => void): void }, options: {
     fetch,
     fetchJson: async () => ({ ok: false, status: 500, text: async () => "" }),
     download: async () => { throw new Error("no downloads in this fake"); },
+    stagingFilesystem: stagingFs,
     arch: "x64",
     sleep: async () => { clock += 1_000; },
     now: () => clock,
@@ -526,16 +542,16 @@ function releaseFixture(f: Fake, options: { version?: string; webBundle?: boolea
     ...f.host,
     arch: "x64",
     fetchJson: async (url) => ({ ok: true, status: 200, text: async () => JSON.stringify({ tag_name: `v${version}`, assets, url }) }),
-    download: async (url, destination) => {
+    download: async (url, sink) => {
       downloads.push(url);
       const name = url.replace("https://dl/", "");
-      writeFileSync(destination, name === "SHA256SUMS" ? manifestText : files.get(name)!);
+      sink.end(name === "SHA256SUMS" ? manifestText : files.get(name)!);
     },
   };
-  return { host, downloads, version, badVersion: options.badVersion === true };
+  return { host, downloads, files, version, badVersion: options.badVersion === true };
 }
 
-test("service upgrade stages, verifies, swaps, restarts, and keeps the previous generation", async (t) => {
+test("service upgrade stages, verifies, swaps, restarts, and keeps the previous generation", { skip: process.platform !== "linux" }, async (t) => {
   const f = fake(t);
   assert.equal(await runServiceCli(["service", "install", ...bins(f), "--json"], f.host, f.io), 0, f.stderr());
   // Give the installed executables a version and make the env file name a web dist.
@@ -601,7 +617,7 @@ test("service upgrade stages, verifies, swaps, restarts, and keeps the previous 
   assert.deepEqual(fixture.downloads.map((u) => u.replace("https://dl/", "")).sort(), ["SHA256SUMS", "wollipog-control-plane-x86_64-unknown-linux-gnu", "wollipog-runner-x86_64-unknown-linux-gnu", "wollipog-web.tar.gz"]);
   const restarts = execs.filter((line) => line.includes("restart"));
   assert.deepEqual(restarts, [`systemctl --user restart ${CONTROL_PLANE_UNIT}`, `systemctl --user restart ${RUNNER_UNIT}`]);
-  assert.ok(!existsSync(join(f.layout.dataDir, "upgrades", "v9.9.9")), "staging is cleaned up");
+  assert.ok(!existsSync(join(f.layout.dataDir, "upgrades", "download-attempt-v1")), "the shared attempt is retired");
 
   // Running again is a no-op at the same release unless forced.
   const again = makeIo();
@@ -611,7 +627,7 @@ test("service upgrade stages, verifies, swaps, restarts, and keeps the previous 
   assert.equal(JSON.parse(again.stdout()).release, "v9.9.9");
 });
 
-test("service upgrade rolls back when the new control plane does not report the release version, and refuses bad downloads", async (t) => {
+test("service upgrade rolls back when the new control plane does not report the release version, and refuses bad downloads", { skip: process.platform !== "linux" }, async (t) => {
   const f = fake(t);
   assert.equal(await runServiceCli(["service", "install", ...bins(f), "--json"], f.host, f.io), 0, f.stderr());
   const cpBin = join(f.root, "control-plane");
@@ -640,7 +656,7 @@ test("service upgrade rolls back when the new control plane does not report the 
 
   // Tampered bytes fail verification before anything is staged for install.
   const tampered = makeIo();
-  const tamperedHost: ServiceHost = { ...wrongHost, download: async (url, destination) => { if (url.endsWith("SHA256SUMS")) return fixture.host.download(url, destination, {}); writeFileSync(destination, "tampered"); } };
+  const tamperedHost: ServiceHost = { ...wrongHost, download: async (url, sink) => { if (url.endsWith("SHA256SUMS")) return fixture.host.download(url, sink, {}); sink.end(Buffer.alloc(fixture.files.get(url.replace("https://dl/", ""))!.length)); } };
   assert.equal(await runServiceCli(["service", "upgrade", "--yes", "--json"], tamperedHost, tampered.io), 1);
   assert.match(JSON.parse(tampered.stdout()).error, /failed SHA-256 verification/u);
 
@@ -699,7 +715,7 @@ test("service upgrade rolls back when the new control plane does not report the 
   assert.ok(!existsSync(`${freshCp}.previous`));
 });
 
-test("service upgrade refuses a release without the web bundle when the control plane serves the dashboard, and upgrades runner-only hosts by unit state", async (t) => {
+test("service upgrade refuses a release without the web bundle when the control plane serves the dashboard, and upgrades runner-only hosts by unit state", { skip: process.platform !== "linux" }, async (t) => {
   const f = fake(t);
   assert.equal(await runServiceCli(["service", "install", ...bins(f), "--json"], f.host, f.io), 0, f.stderr());
   const cpBin = join(f.root, "control-plane");
@@ -738,4 +754,114 @@ test("service upgrade refuses a release without the web bundle when the control 
   assert.equal(readFileSync(runnerBin, "utf8"), "runner 9.9.9");
   assert.deepEqual(fetches.filter((url) => url.includes("/api/admin/")), [], "no loopback admin API is consulted for a runner-only host");
   assert.deepEqual(runnerRelease.downloads.map((u) => u.replace("https://dl/", "")).sort(), ["SHA256SUMS", "wollipog-runner-x86_64-unknown-linux-gnu"], "only the runner asset is fetched");
+});
+
+test("system upgrade supports service-owned and root-owned data directories and publisher-owned web roots", { skip: process.platform !== "linux" }, async (t) => {
+  for (const owner of ["service", "root"]) {
+    const f = fake(t, { system: true, uid: 0, accountUid: MY_UID });
+    assert.equal(await runServiceCli(["service", "install", "--system", ...bins(f), "--json"], f.host, f.io), 0, f.stderr());
+    const webDist = join(f.root, "web");
+    mkdirSync(webDist, { mode: 0o755 });
+    writeFileSync(join(webDist, "index.html"), "old");
+    writeFileSync(f.layout.controlPlaneEnvFile, readFileSync(f.layout.controlPlaneEnvFile, "utf8") + `WOLLIPOG_WEB_DIST="${webDist}"\n`);
+    const fixture = releaseFixture(f);
+    const base = f.host.stagingFilesystem!;
+    const dataStat = base.lstat(f.layout.dataDir);
+    let archiveRoot: typeof dataStat | undefined;
+    const identity = (stat: typeof dataStat) => {
+      const uid = archiveRoot && stat.dev === archiveRoot.dev && stat.ino === archiveRoot.ino ? BigInt(MY_UID + 1)
+        : owner === "root" && stat.dev === dataStat.dev && stat.ino === dataStat.ino ? 0n : stat.uid;
+      return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid }) as typeof stat;
+    };
+    const host: ServiceHost = {
+      ...fixture.host,
+      stagingFilesystem: { ...base, lstat: (path) => identity(base.lstat(path)), fstat: (fd) => identity(base.fstat(fd)) },
+      exec: async (command, args, options) => {
+        if (args[0] === "--version") return { code: 0, stdout: `${command.includes("/upgrades/") ? fixture.version : "0.22.0"}\n`, stderr: "" };
+        if (command === "tar") {
+          const extracted = join(args[args.indexOf("-C") + 1]!, "web");
+          mkdirSync(extracted, { mode: 0o755 });
+          writeFileSync(join(extracted, "index.html"), "new");
+          // GNU tar as root restores the archive publisher UID. Inject complete identities;
+          // never run real tar/chown or claim this test directory was actually root-owned.
+          archiveRoot = base.lstat(extracted);
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        return fixture.host.exec(command, args, options);
+      },
+      fetch: async (url, init) => {
+        const response = await fixture.host.fetch(url, init);
+        if (!url.endsWith("/api/admin/status")) return response;
+        const body = JSON.parse(await response.text());
+        return { ...response, text: async () => JSON.stringify({ ...body, appVersion: fixture.version }) };
+      },
+    };
+    const io = makeIo();
+    assert.equal(await runServiceCli(["service", "upgrade", "--system", "--yes", "--json"], host, io.io), 0, io.stdout() + io.stderr());
+    assert.equal(JSON.parse(io.stdout()).upgraded, true);
+    assert.equal(readFileSync(join(f.root, "wollipog-runner"), "utf8"), "runner 9.9.9");
+    assert.equal(readFileSync(`${join(f.root, "wollipog-runner")}.previous`, "utf8"), "#!/bin/sh\n");
+    assert.equal(readFileSync(join(webDist, "index.html"), "utf8"), "new");
+    assert.equal(readFileSync(join(`${webDist}.previous`, "index.html"), "utf8"), "old");
+    assert.ok(f.execs.some((line) => line.startsWith("chown -R ") && line.includes(webDist)), "existing post-swap ownership correction remains");
+    assert.equal(existsSync(join(f.layout.dataDir, "upgrades", "download-attempt-v1")), false);
+  }
+});
+
+test("upgrade admission rejects invalid capacity, duplicate metadata and interrupted staging before bodies or installation", { skip: process.platform !== "linux" }, async (t) => {
+  for (const scenario of ["zero size", "unsafe total", "duplicate", "interrupted"]) {
+    const f = fake(t);
+    assert.equal(await runServiceCli(["service", "install", ...bins(f), "--json"], f.host, f.io), 0, f.stderr());
+    const fixture = releaseFixture(f, { webBundle: false });
+    const parent = join(f.layout.dataDir, "upgrades");
+    if (scenario === "interrupted") {
+      mkdirSync(join(parent, "download-attempt-v1"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(parent, "download-attempt-v1", "owner.json"), "{incomplete", { mode: 0o600 });
+    }
+    for (const tag of scenario === "interrupted" ? ["v9.9.9", "v8.8.8"] : ["v9.9.9"]) {
+      const host: ServiceHost = { ...fixture.host, fetchJson: async (url, headers) => {
+        const response = await fixture.host.fetchJson(url, headers);
+        const body = JSON.parse(await response.text());
+        body.tag_name = tag;
+        if (scenario === "zero size") body.assets[0].size = 0;
+        if (scenario === "unsafe total") body.assets[0].size = Number.MAX_SAFE_INTEGER;
+        if (scenario === "duplicate") body.assets.push(body.assets[0]);
+        return { ...response, text: async () => JSON.stringify(body) };
+      } };
+      const io = makeIo();
+      const before = f.execs.length;
+      assert.equal(await runServiceCli(["service", "upgrade", "--yes", "--json"], host, io.io), 1);
+      assert.match(JSON.parse(io.stdout()).error, /declared asset sizes|safe total|duplicate|occupied|unknown/u);
+      assert.deepEqual(fixture.downloads, [], "admission failure reads no asset bodies");
+      assert.equal(readFileSync(join(f.root, "wollipog-runner"), "utf8"), "#!/bin/sh\n");
+      assert.equal(f.execs.slice(before).some((line) => line.includes("restart")), false);
+    }
+    if (scenario === "interrupted") assert.equal(readFileSync(join(parent, "download-attempt-v1", "owner.json"), "utf8"), "{incomplete");
+    else assert.equal(existsSync(parent), false);
+  }
+});
+
+test("cleanup failure after a healthy upgrade reports retained staging without rolling back installed bytes", { skip: process.platform !== "linux" }, async (t) => {
+  const f = fake(t);
+  assert.equal(await runServiceCli(["service", "install", ...bins(f), "--json"], f.host, f.io), 0, f.stderr());
+  const fixture = releaseFixture(f, { webBundle: false });
+  const host: ServiceHost = {
+    ...fixture.host,
+    stagingFilesystem: { ...f.host.stagingFilesystem!, unlink: (path) => { if (String(path).endsWith("/owner.json")) throw new Error("fixture retirement failure"); stagingFilesystem.unlink(path); } },
+    exec: async (command, args, options) => args[0] === "--version" ? { code: 0, stdout: `${command.includes("/upgrades/") ? fixture.version : "0.22.0"}\n`, stderr: "" } : fixture.host.exec(command, args, options),
+    fetch: async (url, init) => {
+      const response = await fixture.host.fetch(url, init);
+      if (!url.endsWith("/api/admin/status")) return response;
+      const body = JSON.parse(await response.text());
+      return { ...response, text: async () => JSON.stringify({ ...body, appVersion: fixture.version }) };
+    },
+  };
+  const io = makeIo();
+  const before = f.execs.length;
+  assert.equal(await runServiceCli(["service", "upgrade", "--yes", "--json"], host, io.io), 1);
+  assert.match(JSON.parse(io.stdout()).error, /completed and is healthy, but .*fixture retirement failure/u);
+  assert.equal(readFileSync(join(f.root, "wollipog-runner"), "utf8"), "runner 9.9.9");
+  assert.equal(readFileSync(`${join(f.root, "wollipog-runner")}.previous`, "utf8"), "#!/bin/sh\n");
+  assert.equal(f.execs.slice(before).filter((line) => line.includes("restart")).length, 2, "cleanup does not restart services for rollback");
+  assert.equal(existsSync(join(f.layout.dataDir, "upgrades", "download-attempt-v1", "owner.json")), true);
 });
