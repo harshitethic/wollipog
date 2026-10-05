@@ -202,6 +202,12 @@ import { useRemovedFocus } from "./useRemovedFocus.js";
 import { CampaignHeldChildren, type CampaignHeldChild } from "./CampaignHeldChildren.js";
 import { ComposerQuestionResponse } from "./ComposerQuestionResponse.js";
 import { useGovernanceAudit, useGovernanceTimeline } from "./useGovernanceAudit.js";
+import {
+  indexTranscriptDecisionRows,
+  transcriptRowForDecision,
+  type GovernanceDecision,
+  type TranscriptDecisionIndex,
+} from "../governance.js";
 import { SessionHeader } from "./SessionHeader.js";
 import { useWorktreeSetupSuggestion, WorktreeSetupNotice } from "./WorktreeSetupNotice.js";
 import { WorktreeRecoveryCard } from "./WorktreeRecoveryCard.js";
@@ -2908,6 +2914,13 @@ function SessionDetailLoaded({
     session.status === "running" || session.status === "starting",
     timelineHistoryKey,
   );
+  // Decision History's Show in Transcript: the loaded row that shows each decision's request. The
+  // index is built only when the panel asks, so a streamed chunk never walks the whole transcript.
+  const transcriptItemForDecision = useMemo(() => {
+    let index: TranscriptDecisionIndex | null = null;
+    return (decision: GovernanceDecision): number | undefined =>
+      transcriptRowForDecision(index ??= indexTranscriptDecisionRows(timelineItems), decision);
+  }, [timelineItems]);
   const automaticAccountSwitchNotice = useRef<AutomaticAccountSwitchNoticeState>({
     sessionId: session.id,
     seenThroughEventId: 0,
@@ -3579,7 +3592,7 @@ function SessionDetailLoaded({
     else if (restore.state === "paused") followTail.pause();
     else followTail.preview();
   }, [followTail.follow, followTail.pause, followTail.preview]);
-  const revealBackgroundParentTurn = useCallback((eventId: number) => {
+  const revealTranscriptItemFromPanel = useCallback((eventId: number) => {
     if (isMobile) rightPanelRef.current.close();
     revealCurrentOperation(eventId);
   }, [isMobile, revealCurrentOperation]);
@@ -7056,11 +7069,14 @@ function SessionDetailLoaded({
           reviewFocus={reviewFocus}
           onReviewFocusHandled={clearReviewFocus}
           items={items}
-          governanceDecisions={governanceDecisions}
-          governanceAvailable={governanceAudit.available}
-          governanceHasMore={governanceAudit.hasMore}
-          governanceLoadingOlder={governanceAudit.loadingOlder}
-          onLoadOlderGovernance={governanceAudit.loadOlder}
+          decisionHistory={governanceAudit.history}
+          decisionHistoryStatus={governanceAudit.status}
+          onRetryDecisionHistory={governanceAudit.retry}
+          decisionHistoryHasMore={governanceAudit.hasMore}
+          decisionHistoryLoadingOlder={governanceAudit.loadingOlder}
+          onLoadOlderDecisions={governanceAudit.loadOlder}
+          transcriptItemForDecision={transcriptItemForDecision}
+          onShowDecisionInTranscript={revealTranscriptItemFromPanel}
           descendantRequests={descendantRequests}
           descendantRequestStatus={descendantRequestStatus}
           campaignAvailability={campaignAvailability}
@@ -7081,7 +7097,7 @@ function SessionDetailLoaded({
             });
           }}
           parentTurnEventIds={backgroundParentTurnEventIds}
-          onOpenParentTurn={revealBackgroundParentTurn}
+          onOpenParentTurn={revealTranscriptItemFromPanel}
           backgroundInventoryError={backgroundInventoryError}
           onRetryBackgroundInventory={retryBackgroundInventory}
         />}
