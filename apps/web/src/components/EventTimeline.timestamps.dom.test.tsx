@@ -186,16 +186,39 @@ test("quiet active sessions keep the shared clock advancing", async () => {
     await act(async () => {
       root.render(<EventTimeline items={[{ kind: "review_decision", id: 30, reviewId: "point", reviewer: { kind: "policy" }, outcome: "denied", createdAt: startedAt }]} sessionActive />);
     });
-    assert.equal(container.querySelector("time [aria-hidden='true']")?.textContent, "just now");
+    assert.equal(container.querySelector(".tl-decision-time")?.textContent, "just now");
     assert.ok(tick, "an active session owns the clock even when all current rows are point-in-time records");
     now += 120_000;
     await act(async () => tick?.());
-    assert.equal(container.querySelector("time [aria-hidden='true']")?.textContent, "2m ago");
+    assert.equal(container.querySelector(".tl-decision-time")?.textContent, "2m ago");
   } finally {
     await act(async () => root.unmount());
     container.remove();
     Object.defineProperty(Date, "now", { configurable: true, writable: true, value: originalDateNow });
     Object.defineProperty(globalThis, "setInterval", { configurable: true, writable: true, value: originalSetInterval });
+  }
+});
+
+test("a settled transcript's decision reads its clock time, never a relative time that cannot advance", async () => {
+  let now = startedAt;
+  const originalDateNow = Date.now;
+  Object.defineProperty(Date, "now", { configurable: true, writable: true, value: () => now });
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const decision: TimelineItem[] = [{ kind: "review_decision", id: 32, reviewId: "settled", reviewer: { kind: "policy" }, outcome: "denied", createdAt: startedAt }];
+  const clockTime = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" }).format(new Date(startedAt));
+  try {
+    await act(async () => root.render(<EventTimeline items={decision} sessionActive={false} />));
+    assert.equal(container.querySelector(".tl-decision-time")?.textContent, clockTime);
+    now += 2 * 3_600_000;
+    await act(async () => root.render(<EventTimeline items={[...decision]} sessionActive={false} />));
+    assert.equal(container.querySelector(".tl-decision-time")?.textContent, clockTime, "still the clock time two hours later");
+    assert.doesNotMatch(container.textContent ?? "", /just now/);
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    Object.defineProperty(Date, "now", { configurable: true, writable: true, value: originalDateNow });
   }
 });
 
@@ -228,13 +251,13 @@ test("clock ticks update timestamp consumers without rerendering general timelin
     await act(async () => root.render(<EventTimeline items={countedItems} sessionActive />));
     const readsAfterMount = kindReads;
     assert.ok(readsAfterMount > 0);
-    assert.equal(container.querySelector("time [aria-hidden='true']")?.textContent, "just now");
+    assert.equal(container.querySelector(".tl-decision-time")?.textContent, "just now");
     assert.ok(tick);
 
     now += 120_000;
     await act(async () => tick?.());
 
-    assert.equal(container.querySelector("time [aria-hidden='true']")?.textContent, "2m ago");
+    assert.equal(container.querySelector(".tl-decision-time")?.textContent, "2m ago");
     assert.equal(kindReads, readsAfterMount,
       "the changing clock context reaches time consumers without reevaluating the row item");
   } finally {
@@ -293,7 +316,7 @@ test("the shared clock starts when enabled, pauses while hidden, republishes on 
     await act(async () => root.render(<EventTimeline items={pointItem} sessionActive />));
     assert.equal(intervalStarts, 1, "false-to-true starts the page clock");
     assert.equal(visibilityAdds, 1);
-    assert.equal(container.querySelector("time [aria-hidden='true']")?.textContent, "2m ago",
+    assert.equal(container.querySelector(".tl-decision-time")?.textContent, "2m ago",
       "enabling immediately publishes the current time");
 
     setVisibility("hidden");
@@ -304,7 +327,7 @@ test("the shared clock starts when enabled, pauses while hidden, republishes on 
     setVisibility("visible");
     await act(async () => document.dispatchEvent(new Event("visibilitychange")));
     assert.equal(intervalStarts, 2, "returning to the page restarts the timer");
-    assert.equal(container.querySelector("time [aria-hidden='true']")?.textContent, "3m ago",
+    assert.equal(container.querySelector(".tl-decision-time")?.textContent, "3m ago",
       "returning immediately republishes before the next interval");
 
     await act(async () => root.render(<EventTimeline items={pointItem} sessionActive={false} />));
