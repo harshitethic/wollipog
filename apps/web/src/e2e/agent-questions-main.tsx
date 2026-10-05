@@ -38,6 +38,8 @@ const shouldFail = params.get("failure") === "1";
 const renderInFallbackSlot = params.get("slot") === "1";
 const recoveryRequired = params.get("recovery") === "1";
 const recoveryCanResume = recoveryRequired && params.get("resume") === "1";
+// Keycaps are a fine pointer's hints; the session shows them where a keyboard is likely (#2196).
+const showKeyHints = params.get("keys") === "1";
 let shouldHold = params.get("hold") === "1";
 let releasePending: (() => void) | null = null;
 
@@ -112,6 +114,21 @@ const longQuestions: AgentQuestion[] = [
   },
 ];
 
+// A question whose text alone is taller than the card's cap above the transcript (#2196).
+const longTextQuestions: AgentQuestion[] = [{
+  id: "plan",
+  header: "Plan",
+  question: Array.from({ length: 30 }, (_, index) => `Paragraph ${index + 1} explains one more part of the plan.`).join("\n\n"),
+  options: [{ label: "Proceed" }, { label: "Hold" }],
+}];
+
+// Provider labels can hold one long identifier with nowhere to break (#2196).
+const longLabelQuestions: AgentQuestion[] = [{
+  id: "destination",
+  question: "Choose the live destination.",
+  options: [{ label: "Destination transcript_overflow_identifier_" + "x".repeat(120), description: "y".repeat(160) }, { label: "Staging" }],
+}];
+
 const replacementQuestions: AgentQuestion[] = [{
   id: "replacement",
   header: "Replacement",
@@ -180,6 +197,10 @@ function Fixture() {
   const [questions, setQuestions] = useState(
     params.get("set") === "long"
       ? longQuestions
+      : params.get("set") === "long-text"
+        ? longTextQuestions
+        : params.get("set") === "long-label"
+          ? longLabelQuestions
       : params.get("set") === "forms"
         ? formQuestions
         : params.get("set") === "rich"
@@ -251,7 +272,9 @@ function Fixture() {
       recoveryAction={recoveryCanResume ? "resume_answer" : undefined}
       runnerOnline={runnerOnline}
       onSessionUpdate={() => setResolved(true)}
-      showKeyHints={false}
+      showKeyHints={showKeyHints}
+      owner="Claude Code"
+      createdAt={askedAt}
     />
   );
   const composerContent = !resolved && responseStyle === "composer" && (!recoveryRequired || recoveryCanResume) ? (
