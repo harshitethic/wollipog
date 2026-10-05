@@ -5952,7 +5952,7 @@ function SessionDetailLoaded({
     title: pendingRequestsTitle(dockedRequests.length),
     icon: <RequestKindIcon request={dockedRequests[0]!} />,
     requestIds: dockedRequests.map((request) => request.requestId),
-    render: ({ trailing, revealRequestId }) => (
+    render: ({ trailing, revealRequestId, concealTrailing }) => (
       <RequestDock
         session={session}
         requests={dockedRequests}
@@ -5964,6 +5964,9 @@ function SessionDetailLoaded({
         showKeyHints={sessionReadingKeys}
         keyboardOpen={softwareKeyboardOpen}
         revealRequestId={revealRequestId}
+        followTailState={followTail.state}
+        readerRef={scrollRef}
+        onConceal={concealTrailing}
       />
     ),
   } : undefined;

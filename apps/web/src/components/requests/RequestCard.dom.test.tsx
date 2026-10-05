@@ -22,6 +22,8 @@ import { assertNoDomNode } from "../../dom-test-assertions.js";
 import { RequestCard, type RequestIntentHandler } from "./RequestCard.js";
 import { RequestDock, dockRequests } from "./RequestDock.js";
 import { decideDockedRequest, revealDockedRequest } from "./request-reveal.js";
+import type { FollowTailState } from "../../useFollowTail.js";
+import { SessionNoticeSlot } from "../SessionNoticeSlot.js";
 
 const domWindow = new Window({ url: "http://localhost/" });
 installDomTestCleanup(domWindow);
@@ -102,6 +104,8 @@ async function render(element: React.ReactElement, client: Partial<ApiClient> = 
     rerender: async (next: React.ReactElement) => {
       await act(async () => { root.render(<ApiProvider client={fullClient}>{next}</ApiProvider>); await tick(); });
     },
+    /** For a caller's own `act`, so the render batches with whatever else it does there. */
+    rerenderSync: (next: React.ReactElement) => { root.render(<ApiProvider client={fullClient}>{next}</ApiProvider>); },
     unmount: async () => { await act(async () => root.unmount()); container.remove(); },
   };
 }
@@ -624,6 +628,289 @@ test("a decision in flight survives expanding another request and coming back: n
     assert.equal(sent.length, 1, "no second decision for the same occurrence");
     await act(async () => { answer(); await tick(); });
     assert.equal(allow().getAttribute("aria-busy"), null);
+  } finally {
+    await view.unmount();
+  }
+});
+
+/** A dock beside a composer, under the transcript's follow-tail state (#2195). */
+function ReadingBackHarness({ pending, state }: { pending: PendingApproval | null; state: FollowTailState }) {
+  return (
+    <>
+      <RequestDock session={sessionWith(pending)} requests={dockRequests(prioritizedPendingRequests(pending))} runnerOnline
+        followTailState={state} />
+      <textarea aria-label="Composer" />
+    </>
+  );
+}
+
+/** Whether the dock shows its card: behind the strip it stays mounted, hidden. */
+const cardShown = (view: { container: HTMLElement }) => {
+  const card = view.container.querySelector<HTMLElement>(".request-dock-card");
+  return card !== null && !card.hidden && card.querySelector(".request-card") !== null;
+};
+
+test("reading back shrinks the dock to a strip with the title, its position and Expand; the tail restores it without moving focus", async () => {
+  const pending = permission();
+  const view = await render(<ReadingBackHarness pending={pending} state="following" />);
+  const strip = () => view.container.querySelector<HTMLElement>(".dock-strip");
+  try {
+    assert.ok(cardShown(view), "the card while following");
+    assertNoDomNode(strip());
+    const composer = view.container.querySelector("textarea")!;
+    await act(async () => { composer.focus(); });
+    await view.rerender(<ReadingBackHarness pending={pending} state="paused" />);
+    assert.equal(cardShown(view), false, "the strip takes the card's place");
+    assert.equal(view.container.querySelectorAll("[data-session-request-id]").length, 1, "the strip is the request's one region");
+    assert.ok(strip()?.hasAttribute("data-session-request-id"));
+    assert.equal(strip()?.querySelector(".dock-strip-title")?.textContent, "Run pnpm deploy?");
+    assert.equal(strip()?.querySelector(".dock-strip-position")?.textContent, "1 of 1");
+    const expand = strip()!.querySelector<HTMLButtonElement>("button")!;
+    assert.equal(expand.getAttribute("aria-label"), "Expand Request");
+    assert.equal(expand.textContent, "Expand");
+    assert.equal(view.container.querySelector(".request-dock")?.getAttribute("aria-label"), "Pending Requests");
+    // Inbox paging's programmatic scroll is not reading back.
+    await view.rerender(<ReadingBackHarness pending={pending} state="previewing" />);
+    assert.ok(cardShown(view));
+    await view.rerender(<ReadingBackHarness pending={pending} state="paused" />);
+    assert.ok(strip());
+    await view.rerender(<ReadingBackHarness pending={pending} state="following" />);
+    assert.equal(view.container.querySelector(".request-card h3")?.textContent, "Run pnpm deploy?");
+    assertNoDomNode(strip());
+    assert.equal(domWindow.document.activeElement, composer, "returning to the tail leaves focus where it was");
+  } finally {
+    await view.unmount();
+  }
+});
+
+test("activating the strip restores the card and focuses its heading; it stays expanded until the tail", async () => {
+  const pending = permission();
+  const view = await render(<ReadingBackHarness pending={pending} state="paused" />);
+  try {
+    await act(async () => { view.container.querySelector<HTMLButtonElement>(".dock-strip-expand")!.click(); });
+    const heading = view.container.querySelector(".request-card h3");
+    assert.equal(heading?.textContent, "Run pnpm deploy?");
+    assert.equal(domWindow.document.activeElement, heading);
+    await view.rerender(<ReadingBackHarness pending={pending} state="paused" />);
+    assert.ok(cardShown(view), "still reading back, the expanded card stays");
+    await view.rerender(<ReadingBackHarness pending={pending} state="following" />);
+    await view.rerender(<ReadingBackHarness pending={pending} state="paused" />);
+    assert.ok(view.container.querySelector(".dock-strip"), "the next reading back shrinks it again");
+    // The strip's whole row is the pointer target, not only Expand.
+    await act(async () => { view.container.querySelector<HTMLElement>(".dock-strip-title")!.click(); });
+    assert.equal(domWindow.document.activeElement, view.container.querySelector(".request-card h3"));
+  } finally {
+    await view.unmount();
+  }
+});
+
+test("A and D do nothing while the strip shows, and decide the request once it is expanded", async () => {
+  const decisions: unknown[] = [];
+  const pending = permission();
+  const view = await render(<ReadingBackHarness pending={pending} state="paused" />, {
+    approve: async (_id, body) => { decisions.push(body); return sessionWith(null); },
+  });
+  try {
+    await act(async () => {
+      assert.equal(decideDockedRequest("session-dock", "approve"), true, "the strip takes A, so no other request gets it");
+      assert.equal(decideDockedRequest("session-dock", "deny"), true);
+      await tick();
+    });
+    assert.deepEqual(decisions, [], "nothing is decided while the request cannot be read");
+    await act(async () => { view.container.querySelector<HTMLButtonElement>(".dock-strip-expand")!.click(); });
+    await act(async () => { assert.equal(decideDockedRequest("session-dock", "approve"), true); await tick(); });
+    assert.deepEqual(decisions, [{ requestId: "permission-deploy", optionId: "allow" }]);
+  } finally {
+    await view.unmount();
+  }
+});
+
+test("a request arriving while collapsed updates the strip's count, or its title when it outranks, and is announced once", async () => {
+  const announcement = (view: { container: HTMLElement }) =>
+    view.container.querySelector("[data-request-dock-announcement]")?.textContent;
+  const lower = await render(<ReadingBackHarness pending={signIn()} state="paused" />);
+  try {
+    assert.equal(lower.container.querySelector("[data-request-dock-announcement]")?.getAttribute("role"), "status");
+    assert.equal(announcement(lower), "", "nothing to announce for the request already there");
+    await lower.rerender(<ReadingBackHarness pending={{ ...signIn(), additionalRequests: [permission()] }} state="paused" />);
+    assert.equal(lower.container.querySelector(".dock-strip-title")?.textContent, "Sign In to Claude Code");
+    assert.equal(lower.container.querySelector(".dock-strip-position")?.textContent, "1 of 2");
+    assert.equal(announcement(lower), "Approval Required: Run pnpm deploy?");
+    const region = lower.container.querySelector("[data-request-dock-announcement]")!;
+    let changes = 0;
+    const observer = new domWindow.MutationObserver(() => { changes += 1; });
+    observer.observe(region as never, { childList: true, characterData: true, subtree: true });
+    await lower.rerender(<ReadingBackHarness pending={{ ...signIn(), additionalRequests: [permission()] }} state="paused" />);
+    observer.disconnect();
+    assert.equal(changes, 0, "a later render does not announce it again");
+    await lower.rerender(<ReadingBackHarness pending={{ ...signIn(), additionalRequests: [permission()] }} state="following" />);
+    assert.equal(announcement(lower), "", "the expanded card speaks for itself");
+  } finally {
+    await lower.unmount();
+  }
+  const higher = await render(<ReadingBackHarness pending={permission()} state="paused" />);
+  try {
+    await higher.rerender(<ReadingBackHarness pending={{ ...permission(), additionalRequests: [signIn()] }} state="paused" />);
+    assert.ok(higher.container.querySelector(".dock-strip"), "the strip never hides");
+    assert.equal(higher.container.querySelector(".dock-strip-title")?.textContent, "Sign In to Claude Code");
+    assert.equal(higher.container.querySelector(".dock-strip-position")?.textContent, "1 of 2");
+    assert.equal(announcement(higher), "Authentication Required: Sign In to Claude Code");
+  } finally {
+    await higher.unmount();
+  }
+});
+
+test("a repeated announcement is spoken again, and a new occurrence under the same request id is an arrival", async () => {
+  const region = (view: { container: HTMLElement }) => view.container.querySelector("[data-request-dock-announcement]")!;
+  const watch = (view: { container: HTMLElement }) => {
+    const changes: number[] = [];
+    const observer = new domWindow.MutationObserver((records) => { changes.push(records.length); });
+    observer.observe(region(view) as never, { childList: true, characterData: true, subtree: true });
+    return { changes, stop: () => observer.disconnect() };
+  };
+  // Two permissions with the same words: the first arrives and goes, the second arrives.
+  const twin = (requestId: string): PendingApproval => ({ ...permission(), requestId });
+  const view = await render(<ReadingBackHarness pending={signIn()} state="paused" />);
+  try {
+    await view.rerender(<ReadingBackHarness pending={{ ...signIn(), additionalRequests: [twin("first")] }} state="paused" />);
+    assert.equal(region(view).textContent, "Approval Required: Run pnpm deploy?");
+    await view.rerender(<ReadingBackHarness pending={signIn()} state="paused" />);
+    const watched = watch(view);
+    await view.rerender(<ReadingBackHarness pending={{ ...signIn(), additionalRequests: [twin("second")] }} state="paused" />);
+    watched.stop();
+    assert.equal(region(view).textContent, "Approval Required: Run pnpm deploy?");
+    assert.ok(watched.changes.length > 0, "the same words for a different request still change the live region");
+  } finally {
+    await view.unmount();
+  }
+
+  // The provider asks again under the same request id: a new occurrence, with new words.
+  const asked = (occurrenceId: string, title: string): PendingApproval => ({ ...permission(), occurrenceId, title });
+  const again = await render(<ReadingBackHarness pending={{ ...signIn(), additionalRequests: [asked("one", "Run pnpm deploy?")] }}
+    state="paused" />);
+  try {
+    assert.equal(region(again).textContent, "");
+    await again.rerender(<ReadingBackHarness pending={{ ...signIn(), additionalRequests: [asked("two", "Run pnpm deploy --force?")] }}
+      state="paused" />);
+    assert.equal(region(again).textContent, "Approval Required: Run pnpm deploy --force?");
+  } finally {
+    await again.unmount();
+  }
+});
+
+test("a card that shrinks under focus hands it to Expand, and a control elsewhere asking for the request restores it", async () => {
+  const pending = { ...permission(), additionalRequests: [signIn()] };
+  const view = await render(<ReadingBackHarness pending={pending} state="following" />);
+  try {
+    const reject = [...view.container.querySelectorAll<HTMLButtonElement>(".request-card-foot button")]
+      .find((button) => button.textContent === "Dismiss Recovery")!;
+    await act(async () => { reject.focus(); });
+    await view.rerender(<ReadingBackHarness pending={pending} state="paused" />);
+    assert.equal(domWindow.document.activeElement, view.container.querySelector(".dock-strip-expand"),
+      "focus stays in the dock rather than falling to the page");
+    await act(async () => { assert.equal(revealDockedRequest("session-dock", "permission-deploy"), true); });
+    const heading = view.container.querySelector(".request-card h3");
+    assert.equal(heading?.textContent, "Run pnpm deploy?");
+    assert.equal(domWindow.document.activeElement, heading);
+  } finally {
+    await view.unmount();
+  }
+});
+
+test("the notice slot's +N More menu in the card's head closes as the strip takes the card's place, with focus on Expand", async () => {
+  const pending = permission();
+  const entry = (key: string, title: string) =>
+    ({ key, severity: "info" as const, rank: 8, title, render: ({ trailing }: { trailing: React.ReactNode }) => <div>{trailing}</div> });
+  const skills = entry("skills", "Skills Unavailable");
+  const setup = entry("setup", "Set Up This Project");
+  // A transcript scroller whose room below the reading position the test sets: no room holds the strip
+  // back while paused, and a scroll into room lets it take over.
+  const scroller = domWindow.document.createElement("div") as unknown as HTMLElement;
+  let room = -1_000;
+  const metrics: Record<string, () => number> = { scrollHeight: () => room, scrollTop: () => 0, clientHeight: () => 0 };
+  for (const [name, value] of Object.entries(metrics)) {
+    Object.defineProperty(scroller, name, { configurable: true, get: value });
+  }
+  const readerRef = { current: scroller };
+  function SlotHarness({ state, entries = [skills], reader }: {
+    state: FollowTailState;
+    entries?: ReturnType<typeof entry>[];
+    reader?: typeof readerRef;
+  }) {
+    const session = sessionWith(pending);
+    const requests = dockRequests(prioritizedPendingRequests(pending));
+    return (
+      <SessionNoticeSlot
+        sessionId={session.id}
+        entries={entries}
+        lead={{
+          key: "request-dock",
+          title: "Pending Request",
+          icon: null,
+          requestIds: requests.map((request) => request.requestId),
+          render: ({ trailing, concealTrailing }) => (
+            <RequestDock session={session} requests={requests} runnerOnline headTrailing={trailing}
+              followTailState={state} onConceal={concealTrailing} readerRef={reader} />
+          ),
+        }}
+      />
+    );
+  }
+  const view = await render(<SlotHarness state="following" />);
+  try {
+    const more = view.container.querySelector<HTMLButtonElement>(".request-card .session-notice-more")!;
+    assert.equal(more.textContent, "+1 More");
+    await act(async () => { more.focus(); more.click(); });
+    const item = body().querySelector<HTMLElement>('[role="menuitem"]')!;
+    assert.equal(item.textContent, "Skills Unavailable");
+    await act(async () => { item.focus(); });
+    await view.rerender(<SlotHarness state="paused" />);
+    assert.ok(view.container.querySelector(".dock-strip"));
+    assertNoDomNode(body().querySelector('[role="menu"]'), "no notice menu is left open over the strip");
+    assert.equal(domWindow.document.activeElement, view.container.querySelector(".dock-strip-expand"));
+  } finally {
+    await view.unmount();
+  }
+
+  // The focused notice resolves in the same update a scroll lets the strip take over: its item is gone
+  // before the dock looks, and focus still lands on Expand rather than on the page.
+  const both = await render(<SlotHarness state="paused" entries={[skills, setup]} reader={readerRef} />);
+  try {
+    assert.ok(cardShown(both), "paused with no room below: the card stays");
+    const more = both.container.querySelector<HTMLButtonElement>(".request-card .session-notice-more")!;
+    await act(async () => { more.focus(); more.click(); });
+    const item = [...body().querySelectorAll<HTMLElement>('[role="menuitem"]')].find((candidate) =>
+      candidate.textContent === "Skills Unavailable")!;
+    await act(async () => { item.focus(); });
+    await both.rerender(<SlotHarness state="paused" entries={[skills, setup]} reader={readerRef} />);
+    await act(async () => {
+      room = 1_000;
+      scroller.dispatchEvent(new domWindow.Event("scroll") as unknown as Event);
+      both.rerenderSync(<SlotHarness state="paused" entries={[setup]} reader={readerRef} />);
+    });
+    assert.ok(both.container.querySelector(".dock-strip"));
+    assertNoDomNode(body().querySelector('[role="menu"]'));
+    assert.equal(domWindow.document.activeElement, both.container.querySelector(".dock-strip-expand"));
+  } finally {
+    await both.unmount();
+  }
+});
+
+test("the card behind the strip is the same card when it comes back, and its open menu closes with focus on Expand", async () => {
+  const pending = permission();
+  const view = await render(<ReadingBackHarness pending={pending} state="following" />);
+  try {
+    const card = view.container.querySelector(".request-card");
+    const more = view.container.querySelector<HTMLButtonElement>('[aria-label="More Choices"]')!;
+    await act(async () => { more.focus(); more.click(); });
+    const item = body().querySelector<HTMLElement>('[role="menuitem"]')!;
+    await act(async () => { item.focus(); });
+    await view.rerender(<ReadingBackHarness pending={pending} state="paused" />);
+    assertNoDomNode(body().querySelector('[role="menuitem"]'), "no menu is left open over the strip");
+    assert.equal(domWindow.document.activeElement, view.container.querySelector(".dock-strip-expand"));
+    await act(async () => { view.container.querySelector<HTMLButtonElement>(".dock-strip-expand")!.click(); });
+    assert.equal(view.container.querySelector(".request-card"), card,
+      "not remounted, so what was in progress on it (a sign-in code, an evidence review) is kept");
   } finally {
     await view.unmount();
   }

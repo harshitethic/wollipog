@@ -1427,6 +1427,101 @@ test("composer growth and shrink are layout-owned: following re-pins and a near-
   await expect(reader).toHaveAttribute("data-follow-tail-state", "paused");
 });
 
+/** The offset of the row `key` from the reader's top in every painted frame while `action` runs. */
+async function recordRowOffsets(page: Page, key: string, action: () => Promise<unknown>, frames = 24) {
+  await page.evaluate(({ rowKey, count }) => {
+    const host = window as typeof window & { __rowOffsets?: Promise<Array<number | null>> };
+    host.__rowOffsets = new Promise((resolve) => {
+      const offsets: Array<number | null> = [];
+      const sample = () => {
+        const reader = document.querySelector<HTMLElement>("[data-testid='reader']")!;
+        const row = reader.querySelector<HTMLElement>(`[data-virtual-key="${CSS.escape(rowKey)}"]`);
+        offsets.push(row ? row.getBoundingClientRect().top - reader.getBoundingClientRect().top : null);
+        if (offsets.length >= count) resolve(offsets);
+        else requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    });
+  }, { rowKey: key, count: frames });
+  await action();
+  return page.evaluate(() => (window as typeof window & { __rowOffsets?: Promise<Array<number | null>> }).__rowOffsets!);
+}
+
+test("the request dock shrinks to its strip and back without moving the first visible row (#2195)", async ({ page }) => {
+  await page.goto("/timeline-reflow-e2e.html?follow=1&dock=1");
+  const reader = page.getByTestId("reader");
+  const dock = page.locator(".request-dock");
+  await expect(dock.locator(".request-card")).toBeVisible();
+  await expect(reader).toHaveAttribute("data-follow-tail-state", "following");
+  // Inbox paging's previewing state leaves the card expanded, so the reader can settle well above
+  // the tail with the card still taking its height.
+  await page.getByTestId("preview-follow").click();
+  const anchor = await moveToStableReadingAnchor(page, 0.4);
+  await expect(dock.locator(".request-card")).toBeVisible();
+  const cardHeight = (await dock.boundingBox())!.height;
+
+  // Reading back: the strip gives the transcript its height back below the rows.
+  const collapse = await recordRowOffsets(page, anchor!.key!, async () => {
+    await page.getByTestId("pause-follow").click();
+    await expect(dock.locator(".dock-strip")).toBeVisible();
+  });
+  await expect(reader).toHaveAttribute("data-follow-tail-state", "paused");
+  expect((await dock.locator(".dock-strip").boundingBox())!.height).toBe(44);
+  expect(cardHeight).toBeGreaterThan(44 + 50);
+  expect(collapse.every((offset) => offset !== null && Math.abs(offset - anchor!.offset) <= 1), JSON.stringify(collapse))
+    .toBe(true);
+  const collapsed = await stableAnchor(page);
+  expect(collapsed.key).toBe(anchor!.key);
+  expect(Math.abs(collapsed.offset - anchor!.offset)).toBeLessThanOrEqual(1);
+
+  // Expand restores the card above the composer; the transcript gives the height back below the rows.
+  const expand = await recordRowOffsets(page, anchor!.key!, async () => {
+    await dock.getByRole("button", { name: "Expand Request" }).click();
+    await expect(dock.locator(".request-card")).toBeVisible();
+  });
+  await expect(dock.locator(".request-card h3")).toBeFocused();
+  await expect(reader).toHaveAttribute("data-follow-tail-state", "paused");
+  expect(expand.every((offset) => offset !== null && Math.abs(offset - anchor!.offset) <= 1), JSON.stringify(expand))
+    .toBe(true);
+  const expanded = await stableAnchor(page);
+  expect(expanded.key).toBe(anchor!.key);
+  expect(Math.abs(expanded.offset - anchor!.offset)).toBeLessThanOrEqual(1);
+});
+
+test("near the tail the dock keeps its card until the reader is far enough up that the strip cannot move the rows (#2195)", async ({ page }) => {
+  await page.goto("/timeline-reflow-e2e.html?follow=1&dock=1");
+  const reader = page.getByTestId("reader");
+  const dock = page.locator(".request-dock");
+  await expect(dock.locator(".request-card")).toBeVisible();
+  await expect(reader).toHaveAttribute("data-follow-tail-state", "following");
+  await page.getByTestId("preview-follow").click();
+  await reader.evaluate((element) => {
+    element.scrollTop = element.scrollHeight - element.clientHeight - 80;
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await waitForStableReaderGeometry(page);
+  const givenBack = (await dock.boundingBox())!.height - 44;
+  expect(givenBack).toBeGreaterThan(80);
+  const anchor = await stableAnchor(page);
+
+  // Paused 80px above the tail: the strip would give back more than there is below, so it waits.
+  const paused = await recordRowOffsets(page, anchor.key!, () => page.getByTestId("pause-follow").click());
+  await expect(reader).toHaveAttribute("data-follow-tail-state", "paused");
+  await expect(dock.locator(".request-card")).toBeVisible();
+  expect(paused.every((offset) => offset !== null && Math.abs(offset - anchor.offset) <= 1), JSON.stringify(paused)).toBe(true);
+
+  // Reading further up than that: the strip shows and the browser has nothing to clamp.
+  const target = await reader.evaluate((element, distance) => {
+    element.scrollTop -= distance;
+    element.dispatchEvent(new Event("scroll"));
+    return element.scrollTop;
+  }, Math.ceil(givenBack) + 40);
+  await expect(dock.locator(".dock-strip")).toBeVisible();
+  await waitForStableReaderGeometry(page);
+  expect(Math.abs(await reader.evaluate((element) => element.scrollTop) - target)).toBeLessThanOrEqual(1);
+  await expect(reader).toHaveAttribute("data-follow-tail-state", "paused");
+});
+
 test("a reader-driven return to a streaming tail resumes following", async ({ page }) => {
   await page.goto("/timeline-reflow-e2e.html?follow=1");
   const reader = page.getByTestId("reader");
