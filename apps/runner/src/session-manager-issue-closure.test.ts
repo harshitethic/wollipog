@@ -34,6 +34,7 @@ function fixture(t: TestContext, mode: CloseMode = "closed") {
   });
   let manager = new SessionManager(() => {}, () => {}, store, "test-runner");
   const commands: Command[] = [];
+  let origin = "example/project";
   const diskMeta = () => JSON.parse(readFileSync(join(store.sessionPath(sessionId), "meta.json"), "utf8")) as SessionMeta;
 
   // Only the OS command transport is replaced. The manager, context-command path, GitHub
@@ -45,7 +46,7 @@ function fixture(t: TestContext, mode: CloseMode = "closed") {
     let stdout = "";
     let error: ExecFileException | null = null;
     if (file === "git" && args.join(" ") === "remote get-url origin") {
-      stdout = "git@github.com:example/project.git";
+      stdout = `git@github.com:${origin}.git`;
     } else if (file === "gh" && args[0] === "api" && args[1] === "graphql") {
       stdout = JSON.stringify({ data: { repository } });
     } else if (file === "gh" && args[0] === "issue" && args[1] === "close") {
@@ -90,8 +91,8 @@ function fixture(t: TestContext, mode: CloseMode = "closed") {
     manager = new SessionManager(() => {}, () => {}, store, "test-runner");
     return store;
   };
-  return { root, repository, commands, inspect, execute, snapshot, restart, diskMeta,
-    store: () => store, mutations: () => commands.filter((command) => command.file === "gh" && command.args[0] === "issue") };
+  return { root, repository, commands, inspect, execute, snapshot, restart, diskMeta, scope: (message: Omit<Extract<import("@wollipog/protocol").CampaignIssueScopeMessage, {operation:"synchronize"}>, "sessionId" | "requestId" | "type">) => manager.campaignIssueScope({ type: "campaign_issue_scope", requestId: "scope", sessionId, ...message } as import("@wollipog/protocol").CampaignIssueScopeMessage),
+    setOrigin: (value: string) => { origin=value; }, manager: () => manager, store: () => store, mutations: () => commands.filter((command) => command.file === "gh" && command.args[0] === "issue") };
 }
 
 const digest = (snapshot: GithubIssueClosureSnapshot) => createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
@@ -190,4 +191,83 @@ test("an explicitly local target can inspect and execute a scoped closure", asyn
   assert.equal(result.ok, true, result.error ?? "Expected a successful runner response");
   assert.equal(result.result?.outcome, "closed");
   assert.equal(f.mutations().length, 1);
+});
+
+
+test("runner scope synchronization persists across recreation and refuses stale revisions and repositories", async (t) => {
+  const f=fixture(t);
+  const original = await f.snapshot();
+  const scope = { repository: "example/project", issueNumbers: [123,124], revision: 1, authorizedByUserId: "human", authorizedAt: Date.now() };
+  const applied=await f.scope({operation:"synchronize",scope});
+  assert.equal(applied.ok,true,applied.error ?? "Expected synchronization");
+  assert.deepEqual(f.diskMeta().orchestrator!.issueScope,scope);
+  f.restart();
+  assert.deepEqual(f.store().readMeta(sessionId)!.orchestrator!.issueNumbers,[123,124]);
+  assert.equal((await f.execute(original)).ok,false,"old closure without scope revision cannot execute");
+  assert.equal((await f.execute({...original,scopeRevision:1,repository:"other/project"})).ok,false,"repository is authority-bound");
+  const removed={...scope,issueNumbers:[124],revision:2};
+  assert.equal((await f.scope({operation:"synchronize",scope:removed})).ok,true);
+  assert.equal((await f.scope({operation:"synchronize",scope})).ok,false);
+  assert.equal((await f.scope({operation:"synchronize",scope:{...removed,issueNumbers:[123]}})).ok,false,"same revision cannot change authority");
+  assert.equal((await f.execute({...original,scopeRevision:1})).ok,false);
+  assert.equal(f.mutations().length,0);
+});
+
+test("a scope removal during provider preparation reaches the driver launch policy", async (t) => {
+  const f = fixture(t);
+  const initial = { repository: "example/project", issueNumbers: [issue], revision: 1, authorizedByUserId: "owner", authorizedAt: 1000 };
+  assert.equal((await f.scope({operation:"synchronize",scope:initial})).ok,true);
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>((resolve) => { enter=resolve; });
+  const gate = new Promise<void>((resolve) => { release=resolve; });
+  let launched: import("./drivers/driver.js").DriverOptions["orchestrator"];
+  const manager = f.manager() as unknown as {
+    providerHomeLeases: { acquire(): Promise<void>; stopAcquisitions(): void };
+    createDriver: (kind: string, options: import("./drivers/driver.js").DriverOptions) => never;
+    beginLaunchGeneration(id: string): number;
+    launch(meta: SessionMeta, resume: undefined, generation: number): Promise<boolean>;
+  };
+  manager.providerHomeLeases = { acquire: async () => { enter(); await gate; }, stopAcquisitions() {} };
+  manager.createDriver = (_kind, options) => { launched=options.orchestrator; throw new Error("capture-only driver"); };
+  const launching = manager.launch(f.store().readMeta(sessionId)!,undefined,manager.beginLaunchGeneration(sessionId));
+  try {
+    await entered;
+    assert.equal((await f.scope({operation:"synchronize",scope:{...initial,issueNumbers:[],revision:2}})).ok,true);
+  } finally { release(); }
+  await launching;
+  assert.deepEqual(launched?.issueNumbers,[],"the removed issue must not regain live permission authority");
+  assert.equal(launched?.issueScope?.revision,2);
+});
+
+test("a revisioned scope cannot launch a provider against a different GitHub origin", async (t) => {
+  const f=fixture(t);
+  const scope={repository:"example/project",issueNumbers:[issue],revision:1,authorizedByUserId:"owner",authorizedAt:1000};
+  assert.equal((await f.scope({operation:"synchronize",scope})).ok,true);
+  f.setOrigin("other/project");
+  let drivers=0;
+  const manager=f.manager() as unknown as {
+    createDriver: () => never;
+    beginLaunchGeneration(id:string):number;
+    launch(meta:SessionMeta,resume:undefined,generation:number):Promise<boolean>;
+  };
+  manager.createDriver=()=>{drivers++;throw new Error("must not construct provider");};
+  assert.equal(await manager.launch(f.store().readMeta(sessionId)!,undefined,manager.beginLaunchGeneration(sessionId)),false);
+  assert.equal(drivers,0);
+});
+
+test("same-revision synchronization with a changed origin withdraws live issue permission authority", async (t) => {
+  const f=fixture(t);
+  const scope={repository:"example/project",issueNumbers:[issue],revision:1,authorizedByUserId:"owner",authorizedAt:1000};
+  assert.equal((await f.scope({operation:"synchronize",scope})).ok,true);
+  const policy={strictProjectIsolation:true,issueNumbers:[issue],issueScope:scope};
+  const active=(f.manager() as unknown as {active:Map<string,{orchestratorLaunchPolicy:typeof policy}>}).active;
+  active.set(sessionId,{orchestratorLaunchPolicy:policy});
+  try {
+    f.setOrigin("other/project");
+    assert.equal((await f.scope({operation:"synchronize",scope})).ok,false);
+    assert.deepEqual(policy.issueNumbers,[],"origin mismatch must fail closed even without a higher revision");
+    f.setOrigin("example/project");
+    assert.equal((await f.scope({operation:"synchronize",scope})).ok,true);
+    assert.deepEqual(policy.issueNumbers,[issue]);
+  } finally {active.delete(sessionId);}
 });

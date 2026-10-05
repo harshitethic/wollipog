@@ -25212,3 +25212,188 @@ test("typed provider custom-text refusal retains the exact card and never dispat
     assert.ok(svc.answerQuestion(id, "typed-request", { typed: multiSelect ? ["True"] : "True" }, undefined, "submit").ok);
   }
 });
+
+
+test("human campaign scope recovery, additions, denial, removal and closure use separate exact approvals", async () => {
+  const { db, hub, svc } = makeHarness();
+  try {
+    const meta = runnerMeta();
+    meta.agents.find((agent) => agent.id === "test-orchestrator")!.capabilities = {
+      models: [], effortLevels: [], slashCommands: [], supportsImages: false, supportsApprovals: true, permissionModes: ["default", "orchestrator"],
+    };
+    db.registerRunner(meta, Date.now(), PROTOCOL_VERSION);
+    const created = svc.createSession({ runnerId: RUNNER_ID, workspaceId: WORKSPACE_ID, agentId: "test-orchestrator",
+      config: { permissionMode: "orchestrator" }, prompt: "Orchestrate epic #123." }, undefined, undefined, false, false, false, { defaultOwnerUserId: "owner" });
+    assert.ok(created.ok && created.data, created.error);
+    const id = created.data.id;
+    db.updateSessionStatus(id, "running", Date.now());
+    let synchronized = 0;
+    hub.requestHandler = (message) => {
+      if (message.type === "campaign_issue_scope") return { type: "campaign_issue_scope_result", requestId: message.requestId, sessionId: message.sessionId,
+        ok: true, repository: "team/repo", ...(message.operation === "synchronize" ? { revision: message.scope.revision } :
+          { candidates: (message.issues ?? [123,124]).map((number) => ({ issue: { repository: "team/repo", number }, title: `Issue ${number}`, source: "sub_issue" as const })) }) };
+      if (message.type === "github_issue_closure" && message.operation === "inspect") {
+        synchronized = message.scopeRevision ?? 0;
+        return { type: "github_issue_closure_result", requestId: message.requestId, sessionId: id, ok: true,
+          inspection: { repository: "team/repo", issue: message.issue, title: "Member", url: `https://github.com/team/repo/issues/${message.issue}`,
+            state: "OPEN", forgeDigest: "a".repeat(64), openPullRequests: [] } };
+      }
+      throw new Error("unexpected fixture command");
+    };
+    assert.equal(db.getSession(id)!.orchestratorPolicy!.issueScopeProposalEpic,123,"the proposal seed is stored before any runner echo");
+    const beforeScopeChild = svc.createSession({runnerId:RUNNER_ID,workspaceId:WORKSPACE_ID,agentId:AGENT_ID,prompt:"Fix issue 124.",config:{}},undefined,undefined,false,false,false,{parentSessionId:id});
+    assert.equal(beforeScopeChild.ok,false,"epic delegation requires confirmed issue scope");
+    assert.match(beforeScopeChild.error!,/Confirm the epic/);
+    const view = await svc.campaignIssueScope(id);
+    assert.ok(view.ok && view.data);
+    assert.deepEqual(view.data.issueNumbers, []);
+    const proposal = { requestId: "recover-epic-scope", expectedRevision: 0, additions: [{ repository: "team/repo", number: 123 }, { repository: "team/repo", number: 124 }], removals: [], explanation: "Include umbrella and member" };
+    const {default:Fastify}=await import("fastify");
+    const {registerCampaignIssueScopeRoutes}=await import("./campaign-issue-scope-routes.js");
+    const app=Fastify();
+    let principal: import("./identity.js").AuthPrincipal = {kind:"human",actorId:"owner",userId:"owner",userName:"Owner",organizationId:"org_personal",organizationName:"Personal",role:"owner",deviceId:"test",localBootstrap:false};
+    registerCampaignIssueScopeRoutes(app,{db,svc,requestPrincipal:()=>principal});
+    const read=await app.inject({method:"GET",url:`/api/sessions/${id}/campaign/issue-scope`});
+    assert.equal(read.statusCode,200,read.body);
+    assert.equal(read.json().canPropose,true);
+    principal={...principal,role:"viewer"};
+    const viewerProposal=await app.inject({method:"POST",url:`/api/sessions/${id}/campaign/issue-scope/proposals`,payload:proposal});
+    assert.equal(viewerProposal.statusCode,403);
+    principal={...principal,role:"owner"};
+    const ownerProposal=await app.inject({method:"POST",url:`/api/sessions/${id}/campaign/issue-scope/proposals`,payload:proposal});
+    assert.equal(ownerProposal.statusCode,201,ownerProposal.body);
+    await app.close();
+    const proposed = await svc.proposeCampaignIssueScope(id, proposal);
+    assert.ok(proposed.ok && proposed.data, proposed.error);
+    const decision = proposed.data;
+    assert.equal(decision.authority, "human");
+    assert.deepEqual(db.getSession(id)!.orchestratorPolicy!.issueNumbers ?? [], []);
+    assert.equal(svc.resolveWorkflowDecision(id,id,decision.occurrenceId,{outcome:"approve"},"orchestrator",{kind:"agent",id},()=>true).ok,false);
+    const approved = svc.resolveWorkflowDecision(id,id,decision.occurrenceId,{outcome:"approve"},"human",{kind:"human",id:"owner"},()=>true);
+    assert.ok(approved.ok, approved.error);
+    assert.equal(approved.data!.status, "consumed");
+    const policy = db.getSession(id)!.orchestratorPolicy!;
+    assert.deepEqual(policy.issueNumbers,[123,124]);
+    assert.equal(policy.issueScope!.revision,1);
+    assert.equal(policy.issueScope!.authorizedByUserId,"owner");
+    hub.online = false;
+    let offlineRequests = 0;
+    const onlineHandler = hub.requestHandler;
+    hub.requestHandler = () => { offlineRequests += 1; throw new Error("offline runner must not be queried"); };
+    const offlineView = await svc.campaignIssueScope(id);
+    assert.ok(offlineView.ok && offlineView.data, offlineView.error);
+    assert.deepEqual(offlineView.data.issueNumbers, [123,124]);
+    assert.equal(offlineView.data.repository, "team/repo");
+    assert.equal(offlineView.data.revision, 1);
+    assert.equal(offlineView.data.supported, false);
+    assert.match(offlineView.data.compatibilityMessage!, /disconnected/);
+    const offlineProposal = await svc.proposeCampaignIssueScope(id, {...proposal,requestId:"offline",expectedRevision:1});
+    assert.equal(offlineProposal.status, 409);
+    assert.equal(offlineRequests, 0, "offline scope reads return saved authority without runner RPCs");
+    assert.deepEqual(db.getSession(id)!.orchestratorPolicy!.issueNumbers, [123,124]);
+    assert.equal(db.getSession(id)!.orchestratorPolicy!.issueScope!.revision, 1);
+    hub.online = true;
+    hub.requestHandler = onlineHandler;
+    assert.equal(svc.resolveWorkflowDecision(id,id,decision.occurrenceId,{outcome:"approve"},"human",{kind:"human",id:"owner"},()=>true).ok,false);
+    assert.equal((await svc.proposeCampaignIssueScope(id,proposal)).ok,false);
+    db.updateSessionStatus(id,"running",Date.now());
+    const scopedChild=svc.createSession({runnerId:RUNNER_ID,workspaceId:WORKSPACE_ID,agentId:AGENT_ID,prompt:"Fix issue 124.",config:{}},undefined,undefined,false,false,false,{parentSessionId:id});
+    assert.ok(scopedChild.ok,scopedChild.error);
+    const closure = await svc.requestGithubIssueClosure(id,{requestId:"member-closure",issue:124,reason:"completed",explanation:"Delivered",evidence:["Verified PR"]});
+    assert.ok(closure.ok && closure.data?.decision, closure.error);
+    assert.equal(closure.data.decision.authority,"human");
+    assert.equal(synchronized,1);
+    assert.equal(closure.data.decision.status,"pending");
+    const deny = await svc.proposeCampaignIssueScope(id,{...proposal,requestId:"deny-addition",expectedRevision:1,additions:[{repository:"team/repo",number:125}]});
+    assert.ok(deny.ok && deny.data, deny.error);
+    assert.ok(svc.resolveWorkflowDecision(id,id,deny.data.occurrenceId,{outcome:"deny"},"human",{kind:"human",id:"owner"},()=>true).ok);
+    assert.deepEqual(db.getSession(id)!.orchestratorPolicy!.issueNumbers,[123,124]);
+    const stale = await svc.proposeCampaignIssueScope(id,{...proposal,requestId:"stale-addition",expectedRevision:1,additions:[{repository:"team/repo",number:126}]});
+    assert.ok(stale.ok && stale.data,stale.error);
+    const replacedClosure = await svc.requestGithubIssueClosure(id,{requestId:"changed-member-closure",issue:124,reason:"completed",explanation:"Changed evidence",evidence:["New PR"]});
+    assert.ok(replacedClosure.ok);
+    const staleApproval = svc.resolveWorkflowDecision(id,id,stale.data.occurrenceId,{outcome:"approve"},"human",{kind:"human",id:"owner"},()=>true);
+    assert.equal(staleApproval.ok,false,"affected decisions changed after proposal");
+    assert.deepEqual(db.getSession(id)!.orchestratorPolicy!.issueNumbers,[123,124]);
+    assert.equal(db.workflowDecisionByOccurrence(stale.data.occurrenceId)!.status,"revoked");
+    const remove = await svc.proposeCampaignIssueScope(id,{...proposal,requestId:"remove-member",expectedRevision:1,additions:[],removals:[{repository:"team/repo",number:124}]});
+    assert.ok(remove.ok && remove.data, remove.error);
+    assert.ok(svc.resolveWorkflowDecision(id,id,remove.data.occurrenceId,{outcome:"approve"},"human",{kind:"human",id:"owner"},()=>true).ok);
+    assert.deepEqual(db.getSession(id)!.orchestratorPolicy!.issueNumbers,[123]);
+    assert.equal(db.workflowDecisionByOccurrence(replacedClosure.data!.decision!.occurrenceId)!.status,"revoked");
+    assert.equal((await svc.requestGithubIssueClosure(id,{requestId:"removed-member",issue:124,reason:"completed",explanation:"Delivered",evidence:["Verified PR"]})).ok,false);
+    db.registerRunner(meta, Date.now(),207);
+    const unsupported = await svc.proposeCampaignIssueScope(id,{...proposal,requestId:"old-runner",expectedRevision:2,additions:[{repository:"team/repo",number:126}]});
+    assert.equal(unsupported.ok,false);
+    assert.match(unsupported.error!,/protocol-v208/);
+    assert.equal(db.getSession(id)!.orchestratorPolicy!.issueScope!.revision,2);
+    await new Promise((resolve) => setTimeout(resolve,0));
+  } finally { db.close(); }
+});
+
+test("scope approval cannot authorize a stopped Orchestrator in another repository workspace", async () => {
+  const {db,hub,svc}=makeHarness();
+  try {
+    const meta=runnerMeta();
+    meta.workspaces.push({id:"other-workspace",name:"Other",path:"/repos/other"});
+    meta.agents.find((a)=>a.id==="test-orchestrator")!.capabilities={models:[],effortLevels:[],slashCommands:[],supportsImages:false,supportsApprovals:true,permissionModes:["default","orchestrator"]};
+    db.registerRunner(meta,Date.now(),PROTOCOL_VERSION);
+    const created=svc.createSession({runnerId:RUNNER_ID,workspaceId:WORKSPACE_ID,agentId:"test-orchestrator",config:{permissionMode:"orchestrator"},prompt:"Orchestrate issues #12 and #13.",orchestrator:{execution:{strictProjectIsolation:false}}},undefined,undefined,false,false,false,{defaultOwnerUserId:"owner"});
+    assert.ok(created.ok && created.data,created.error);
+    const id=created.data.id;
+    db.updateSessionStatus(id,"running",Date.now());
+    db.addProjectLocation(created.data.projectId!,{runnerId:RUNNER_ID,workspaceId:"other-workspace"});
+    const child=svc.createSession({runnerId:RUNNER_ID,workspaceId:"other-workspace",agentId:"test-orchestrator",config:{permissionMode:"orchestrator"},prompt:"Coordinate other work."},undefined,undefined,false,false,false,{parentSessionId:id});
+    assert.ok(child.ok && child.data,child.error);
+    assert.deepEqual(child.data.orchestratorPolicy!.issueNumbers??[],[]);
+    db.updateSessionStatus(child.data.id,"stopped",Date.now());
+    hub.requestHandler=(m)=> {
+      if(m.type!=="campaign_issue_scope") throw new Error("unexpected command");
+      return {type:"campaign_issue_scope_result",requestId:m.requestId,sessionId:m.sessionId,ok:true,repository:"team/repo",...(m.operation==="synchronize"?{revision:m.scope.revision}:{candidates:(m.issues??[]).map((number)=>({issue:{repository:"team/repo",number},title:"Member",source:"sub_issue" as const}))})};
+    };
+    const proposed=await svc.proposeCampaignIssueScope(id,{requestId:"add-member",expectedRevision:0,additions:[{repository:"team/repo",number:14}],removals:[],explanation:"Include member"});
+    assert.ok(proposed.ok && proposed.data,proposed.error);
+    const approved=svc.resolveWorkflowDecision(id,id,proposed.data.occurrenceId,{outcome:"approve"},"human",{kind:"human",id:"owner"},()=>true);
+    assert.ok(approved.ok,approved.error);
+    assert.deepEqual(db.getSession(child.data.id)!.orchestratorPolicy!.issueNumbers,[],"a stopped foreign workspace must receive no issue authority");
+    assert.deepEqual(db.campaignIssueScopeRootsForRunner(RUNNER_ID).map((s)=>s.id),[id],"reconnect selects each revisioned campaign once");
+    assert.deepEqual(db.campaignIssueScopeRootsForRunner("unrelated-runner"),[]);
+    const restarted=svc.restart(child.data.id);
+    assert.equal(restarted.ok,false,"restart must retain the campaign repository boundary");
+    assert.match(restarted.error!,/campaign.*repository workspace/);
+    await new Promise((resolve)=>setTimeout(resolve,0));
+  } finally {db.close();}
+});
+
+test("human-only campaigns can confirm scope and separately approve closure with Parent Control off", async () => {
+  const {db,hub,svc}=makeHarness();
+  try {
+    const meta=runnerMeta();
+    meta.agents.find((a)=>a.id==="test-orchestrator")!.capabilities={models:[],effortLevels:[],slashCommands:[],supportsImages:false,supportsApprovals:true,permissionModes:["default","orchestrator"]};
+    db.registerRunner(meta,Date.now(),PROTOCOL_VERSION);
+    const decisions={implementation_question:"human",pr_merge:"human",merged_branch_deletion:"human",follow_up_issue_publication:"human",ui_evidence_approval:"human"} as const;
+    const created=svc.createSession({runnerId:RUNNER_ID,workspaceId:WORKSPACE_ID,agentId:"test-orchestrator",config:{permissionMode:"orchestrator"},prompt:"Orchestrate epic #123.",orchestrator:{delegation:{parentControl:"off",decisions}}},undefined,undefined,false,false,false,{defaultOwnerUserId:"owner"});
+    assert.ok(created.ok && created.data,created.error);
+    const id=created.data.id;
+    assert.equal(created.data.parentControl,"off");
+    assert.equal(created.data.parentControlPolicy!.revision,0,"human-only fallback is materialized by SessionView");
+    db.updateSessionStatus(id,"running",Date.now());
+    hub.requestHandler=(m)=> {
+      if(m.type==="campaign_issue_scope") return {type:"campaign_issue_scope_result",requestId:m.requestId,sessionId:m.sessionId,ok:true,repository:"team/repo",...(m.operation==="synchronize"?{revision:m.scope.revision}:{candidates:(m.issues??[123]).map((number)=>({issue:{repository:"team/repo",number},title:"Epic",source:"umbrella" as const}))})};
+      if(m.type==="github_issue_closure") return {type:"github_issue_closure_result",requestId:m.requestId,sessionId:m.sessionId,ok:true,inspection:{repository:"team/repo",issue:123,title:"Epic",url:"https://github.com/team/repo/issues/123",state:"OPEN",forgeDigest:"a".repeat(64),openPullRequests:[]}};
+      throw new Error("unexpected command");
+    };
+    const proposed=await svc.proposeCampaignIssueScope(id,{requestId:"confirm",expectedRevision:0,additions:[{repository:"team/repo",number:123}],removals:[],explanation:"Include epic"});
+    assert.ok(proposed.ok && proposed.data,proposed.error);
+    assert.equal(proposed.data.authority,"human");
+    assert.equal(proposed.data.policyRevision,0);
+    const approved=svc.resolveWorkflowDecision(id,id,proposed.data.occurrenceId,{outcome:"approve"},"human",{kind:"human",id:"owner"},()=>true);
+    assert.ok(approved.ok,approved.error);
+    const closure=await svc.requestGithubIssueClosure(id,{requestId:"closure",issue:123,reason:"completed",explanation:"Delivered",evidence:["Verified"]});
+    assert.ok(closure.ok && closure.data?.decision,closure.error);
+    const resolved=svc.resolveWorkflowDecision(id,id,closure.data.decision.occurrenceId,{outcome:"approve"},"human",{kind:"human",id:"owner"},()=>true);
+    assert.ok(resolved.ok,resolved.error);
+    assert.equal(resolved.data!.status,"approved","scope approval did not consume the separate closure approval");
+    await new Promise((resolve)=>setTimeout(resolve,0));
+  } finally {db.close();}
+});
