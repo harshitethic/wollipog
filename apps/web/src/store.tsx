@@ -23,6 +23,7 @@ import type {
   UiToControlPlane,
 } from "@wollipog/protocol";
 import { CONTROL_PLANE_WS } from "./config.js";
+import { expireFollowTailAnchor } from "./useFollowTail.js";
 import { DEVICE_TOKEN_CHANGED_EVENT, deviceToken } from "./device-token.js";
 import {
   createBrowserUiConnection,
@@ -245,6 +246,9 @@ export interface EventWindowState {
   eventEpoch: number;
   /** Oldest seq loaded for this epoch. Older cached events exist below it when `hasOlder`. */
   baseSeq: number;
+  /** A completed provisional REST window's contiguous tail, excluding later live delivery.
+   * Kept while this slice stays visible; cache restoration clears its current-view attribution. */
+  provisionalRestTail?: { seq: number; recoveryGeneration: number };
   hasOlder: boolean;
   /** The read that produced this window reached the runner's tail. A budget-expired window reports
    * no older rows while still being a prefix, so completeness is tracked separately. */
@@ -574,9 +578,10 @@ function applyWindowBase(
     // An empty retry that reached the tail still settles completeness for the epoch; otherwise a
     // session whose first read expired stays partial forever despite an authoritative answer.
     if (priorValid) {
-      if (!action.recoveryComplete || priorValid.complete) return state.eventWindows;
+      if ((!action.recoveryComplete || priorValid.complete) && !priorValid.provisionalRestTail) return state.eventWindows;
+      const { provisionalRestTail: _receipt, ...retained } = priorValid;
       const promoted = new Map(state.eventWindows);
-      promoted.set(action.sessionId, { ...priorValid, complete: true });
+      promoted.set(action.sessionId, { ...retained, complete: priorValid.complete || action.recoveryComplete });
       return promoted;
     }
     const eventWindows = new Map(state.eventWindows);
@@ -598,6 +603,10 @@ function applyWindowBase(
   eventWindows.set(action.sessionId, {
     eventEpoch: action.eventEpoch,
     baseSeq: pageBase,
+    ...(action.recoveryRevision === -1 && action.recoveryComplete &&
+      contiguousEventHighWater(action.events, pageBase - 1) === action.events.at(-1)!.seq
+      ? { provisionalRestTail: { seq: action.events.at(-1)!.seq, recoveryGeneration: action.recoveryGeneration } }
+      : {}),
     hasOlder: action.windowHasOlder,
     // Completeness is monotonic within an epoch: a re-read that reaches the tail settles it, and a
     // later partial read cannot unsettle what was already proven complete.
@@ -716,8 +725,8 @@ function reducer(state: State, action: Action): State {
       return scanSessionStalls({ ...state, activityNow: action.now }, action.now);
     }
     case "navigate": {
-      // Drop event arrays (and shell scrollback) for sessions the new view doesn't display,
-      // so memory stays bounded to what's on screen (re-fetched on open).
+      // Drop off-screen streams from visible state. Store retains eligible reader windows in its
+      // separately bounded cache, without extending this view's subscriptions or shell output.
       const enteringSettings = state.view.name !== "settings" && action.view.name === "settings";
       const stayingInSettings = state.view.name === "settings" && action.view.name === "settings";
       const settingsReturnView = enteringSettings
@@ -1546,6 +1555,7 @@ interface StoreValue extends State {
   failOlderEventsLoad: (sessionId: string, error: string, requestedBase: number, eventEpoch?: number) => void;
   eventWindowBase: (sessionId: string) => number;
   loadSession: (session: SessionView) => void;
+  getSession: (sessionId: string) => SessionView | undefined;
   beginEventHistoryLoad: (
     sessionId: string,
     eventEpoch?: number,
@@ -1556,6 +1566,7 @@ interface StoreValue extends State {
   loadPodContext: (podId: string, entries: PodContextEntry[]) => void;
   eventHighWater: (sessionId: string) => number;
   recoveryAfter: (sessionId: string) => number;
+  recoveryReadAfter: (sessionId: string, eventEpoch: number, recoveryGeneration: number) => number;
   eventEpoch: (sessionId: string) => number;
   reconcileShellOutputs: (sessionId: string, shellIds: string[]) => void;
   loadShellHistory: (
@@ -1582,6 +1593,16 @@ export class Store {
   private inboxPersistenceEnabled = true;
   private attentionActivation = 0;
   private reconnectHandler: (() => boolean) | null = null;
+  /** Inactive readers retain one contiguous loaded slice, without remaining subscribed. Bounds
+   * apply to the entire slice: keeping a head and tail would silently lose the middle. */
+  private readonly readerCache = new Map<string, {
+    events: SessionEvent[];
+    eventEpoch: number;
+    history: EventHistoryState;
+    window?: EventWindowState;
+    bytes: number;
+  }>();
+  private readerCacheBytes = 0;
 
   constructor(
     initialView: View = { name: "inbox" },
@@ -1594,6 +1615,9 @@ export class Store {
       loadInboxState(instanceScope, inboxStorage),
       loadSessionFilters(instanceScope, inboxStorage),
     );
+    // A new Store owns no retained rows, even if a previous mount left a position in the shared
+    // hook cache. Do not let that stale position force a cold first open through the full log.
+    for (const sessionId of relevantSessions(this.state)) expireFollowTailAnchor(instanceScope, sessionId);
   }
 
   getState = (): State => this.state;
@@ -1606,8 +1630,16 @@ export class Store {
   };
 
   dispatch = (action: Action): void => {
-    const next = reducer(this.state, action);
+    let next = reducer(this.state, action);
     if (next === this.state) return;
+    // Explicit resets also cover rolling senders that omit the epoch. Their authoritative
+    // replacement must invalidate an inactive slice even when metadata still names its old epoch.
+    if (action.type === "msg" && action.msg.type === "session_events_reset" &&
+        this.readerCache.has(action.msg.sessionId)) {
+      this.dropReaderCache(action.msg.sessionId);
+      expireFollowTailAnchor(this.instanceScope, action.msg.sessionId);
+    }
+    next = this.reconcileReaderCache(this.state, next);
     const inboxChanged = next.inbox !== this.state.inbox;
     const filtersChanged = next.filters !== this.state.filters;
     this.state = next;
@@ -1617,6 +1649,98 @@ export class Store {
     if (filtersChanged) saveSessionFilters(next.filters, this.instanceScope, this.inboxStorage);
     for (const l of [...this.listeners]) l();
   };
+
+  private dropReaderCache(sessionId: string): void {
+    const cached = this.readerCache.get(sessionId);
+    if (cached) this.readerCacheBytes -= cached.bytes;
+    this.readerCache.delete(sessionId);
+  }
+
+  private reconcileReaderCache(previous: State, next: State): State {
+    const wasRelevant = relevantSessions(previous);
+    const isRelevant = relevantSessions(next);
+    const targeted = next.streamSubscriptions.mode === "targeted";
+    const snapshotChanged = next.snapshotRevision !== previous.snapshotRevision;
+    // An epoch is authoritative only on current servers. Legacy reconnects discard reader slices
+    // just as they discard visible history, so a missed reprocess cannot resurrect old events.
+    for (const [sessionId, cached] of this.readerCache) {
+      const session = next.sessions.get(sessionId);
+      if ((snapshotChanged && !targeted) || !session || sessionEventEpoch(session) !== cached.eventEpoch) {
+        this.dropReaderCache(sessionId);
+        expireFollowTailAnchor(this.instanceScope, sessionId);
+      }
+    }
+    for (const sessionId of wasRelevant) {
+      const previousEpoch = previous.eventEpochs.get(sessionId);
+      if (previousEpoch !== undefined && ((snapshotChanged && !targeted) ||
+          previousEpoch !== sessionEventEpoch(next.sessions.get(sessionId)))) {
+        expireFollowTailAnchor(this.instanceScope, sessionId);
+      }
+      if (isRelevant.has(sessionId)) continue;
+      this.dropReaderCache(sessionId);
+      const events = previous.events.get(sessionId);
+      const history = previous.eventHistory.get(sessionId);
+      const window = previous.eventWindows.get(sessionId);
+      const eventEpoch = previousEpoch ?? 0;
+      const base = window?.baseSeq ?? 1;
+      // In-flight recovery may already contain a distant live event. Its high-water mark cannot
+      // become a reopen cursor unless every intervening event is present in this exact epoch.
+      const retainable = targeted && next.sessions.has(sessionId) &&
+        eventEpoch === sessionEventEpoch(next.sessions.get(sessionId)) &&
+        events && events.length > 0 && events.length <= 2_000 && events[0]!.seq === base &&
+        contiguousEventHighWater(events, base - 1) === events.at(-1)!.seq &&
+        history?.eventEpoch === eventEpoch && history.everComplete &&
+        (!window || (window.eventEpoch === eventEpoch && window.complete));
+      if (!retainable) {
+        expireFollowTailAnchor(this.instanceScope, sessionId);
+        continue;
+      }
+      // UTF-8 accounting includes all event payloads (tool output, images and text), rather than
+      // just row count. Encode individually so the bound never needs a whole-transcript string.
+      let bytes = 0;
+      const encoder = new TextEncoder();
+      for (const event of events) {
+        bytes += encoder.encode(JSON.stringify(event)).byteLength;
+        if (bytes > 8 * 1024 * 1024) break;
+      }
+      if (bytes > 8 * 1024 * 1024) {
+        expireFollowTailAnchor(this.instanceScope, sessionId);
+        continue;
+      }
+      this.readerCache.set(sessionId, { events, history, window, eventEpoch, bytes });
+      this.readerCacheBytes += bytes;
+      while (this.readerCache.size > 8 || this.readerCacheBytes > 8 * 1024 * 1024) {
+        const oldest = this.readerCache.keys().next().value;
+        if (oldest === undefined) break;
+        this.dropReaderCache(oldest);
+        expireFollowTailAnchor(this.instanceScope, oldest);
+      }
+    }
+    for (const sessionId of isRelevant) {
+      if (wasRelevant.has(sessionId)) continue;
+      const cached = this.readerCache.get(sessionId);
+      this.dropReaderCache(sessionId);
+      // Fleet columns have no Load Earlier Activity control and must recover whole histories.
+      const fleet = next.view.name === "run" || next.view.name === "pod";
+      if (!cached || (fleet && isPartialHistory(cached.window))) {
+        expireFollowTailAnchor(this.instanceScope, sessionId);
+        continue;
+      }
+      const events = new Map(next.events).set(sessionId, cached.events);
+      const eventEpochs = new Map(next.eventEpochs).set(sessionId, cached.eventEpoch);
+      const eventHistory = new Map(next.eventHistory).set(sessionId, {
+        ...cached.history, recoveryGeneration: next.snapshotRevision, recoveryRevision: -1,
+        refreshing: true, error: null,
+      });
+      const eventWindows = new Map(next.eventWindows);
+      if (cached.window) {
+        const { provisionalRestTail: _receipt, ...retained } = cached.window;
+        eventWindows.set(sessionId, { ...retained, loadingOlder: false, error: null });
+      }
+      next = { ...next, events, eventEpochs, eventHistory, eventWindows };
+    }
+    return next;
+  }
 
   /** The provider's socket lifecycle owns the retry timer, so it registers how to bring it forward. */
   setReconnectHandler = (handler: (() => boolean) | null): void => {
@@ -1657,10 +1781,11 @@ export class Store {
     // Phone-width selection is intentionally transient. When desktop persistence resumes,
     // restore its last durable state before any socket-driven reducer can serialize the phone
     // selection. Prune preview-only streams and notify subscription synchronization as usual.
-    this.state = pruneViewStreams({
+    const next = pruneViewStreams({
       ...this.state,
       inbox: loadInboxState(this.instanceScope, this.inboxStorage),
     });
+    this.state = this.reconcileReaderCache(this.state, next);
     for (const listener of [...this.listeners]) listener();
   };
   setInboxSelection = (
@@ -1724,6 +1849,7 @@ export class Store {
     const window = this.state.eventWindows.get(sessionId);
     return window && window.eventEpoch === this.eventEpoch(sessionId) ? window.baseSeq : 0;
   };
+  getSession = (sessionId: string): SessionView | undefined => this.state.sessions.get(sessionId);
   loadSession = (session: SessionView): void =>
     this.dispatch({ type: "msg", msg: { type: "session_upsert", session } });
   beginEventHistoryLoad = (
@@ -1745,6 +1871,22 @@ export class Store {
     this.dispatch({ type: "pod_context_loaded", podId, entries });
   eventHighWater = (sessionId: string): number => eventHighWater(this.state.events.get(sessionId));
   recoveryAfter = (sessionId: string): number => this.state.streamRecoveryCursors.get(sessionId) ?? 0;
+  /** A completed provisional REST window can precede its subscription acknowledgement. It already
+   * replaced the visible slice while following, so the acknowledged read starts at that proven
+   * tail instead of replaying its omitted prefix if the reader paused meanwhile. This is local to
+   * the read: the frozen stream cursor stays unchanged, and distant live rows cannot raise it. */
+  recoveryReadAfter = (sessionId: string, eventEpoch: number, recoveryGeneration: number): number => {
+    const frozen = this.recoveryAfter(sessionId);
+    const window = this.state.eventWindows.get(sessionId);
+    const receipt = window?.provisionalRestTail;
+    const events = this.state.events.get(sessionId);
+    if (!events || this.state.snapshotRevision !== recoveryGeneration || this.eventEpoch(sessionId) !== eventEpoch ||
+        this.state.eventEpochs.get(sessionId) !== eventEpoch || window?.eventEpoch !== eventEpoch ||
+        !receipt || receipt.recoveryGeneration !== recoveryGeneration || window.baseSeq <= 0 ||
+        receipt.seq < window.baseSeq) return frozen;
+    const contiguous = contiguousEventHighWater(events, window.baseSeq - 1);
+    return contiguous >= receipt.seq ? Math.max(frozen, receipt.seq) : frozen;
+  };
   eventEpoch = (sessionId: string): number => sessionEventEpoch(this.state.sessions.get(sessionId));
   prepareSubscriptionRecovery = (revision: number, sessionIds: string[]): void =>
     this.dispatch({ type: "subscription_requested", revision, sessionIds });
@@ -2047,7 +2189,7 @@ export function useHasStore(): boolean {
 }
 
 /** Stable action handles (never cause re-renders). */
-export function useStoreActions(): Pick<Store, "dispatch" | "navigate" | "setInboxPersistenceEnabled" | "setInboxSelection" | "setInboxSplit" | "setInboxRatio" | "setFilters" | "loadEvents" | "loadOlderEvents" | "beginOlderEventsLoad" | "failOlderEventsLoad" | "eventWindowBase" | "loadSession" | "beginEventHistoryLoad" | "failEventHistoryLoad" | "loadPodContext" | "eventHighWater" | "recoveryAfter" | "eventEpoch" | "reconcileShellOutputs" | "loadShellHistory" | "removeShellOutput" | "reconnectNow"> {
+export function useStoreActions(): Pick<Store, "dispatch" | "navigate" | "setInboxPersistenceEnabled" | "setInboxSelection" | "setInboxSplit" | "setInboxRatio" | "setFilters" | "loadEvents" | "loadOlderEvents" | "beginOlderEventsLoad" | "failOlderEventsLoad" | "eventWindowBase" | "loadSession" | "getSession" | "beginEventHistoryLoad" | "failEventHistoryLoad" | "loadPodContext" | "eventHighWater" | "recoveryAfter" | "recoveryReadAfter" | "eventEpoch" | "reconcileShellOutputs" | "loadShellHistory" | "removeShellOutput" | "reconnectNow"> {
   return useStoreHandle();
 }
 
@@ -2113,11 +2255,13 @@ export function useStore(): StoreValue {
     failOlderEventsLoad: store.failOlderEventsLoad,
     eventWindowBase: store.eventWindowBase,
     loadSession: store.loadSession,
+    getSession: store.getSession,
     beginEventHistoryLoad: store.beginEventHistoryLoad,
     failEventHistoryLoad: store.failEventHistoryLoad,
     loadPodContext: store.loadPodContext,
     eventHighWater: store.eventHighWater,
     recoveryAfter: store.recoveryAfter,
+    recoveryReadAfter: store.recoveryReadAfter,
     eventEpoch: store.eventEpoch,
     reconcileShellOutputs: store.reconcileShellOutputs,
     loadShellHistory: store.loadShellHistory,

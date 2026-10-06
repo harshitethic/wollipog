@@ -61,11 +61,47 @@ And absence stops being evidence: a completed provider command or an accepted st
 message sits in an unloaded turn no longer resurrects a recovery receipt in the transcript, since
 against a bounded window that absence proves nothing.
 
-Two loads keep the forward chain. A reconnect gap is owned by the forward cursor frozen at
-subscription time, and a session whose reader has a saved position keeps loading the history that
-restoring that position depends on — the position can sit below the window, and the transcript list
-cannot yet restore an anchor against a windowed history. A control plane without backward reads is
-detected from the response shape and falls back to the forward chain unchanged.
+Reconnect recovery starts at the forward cursor frozen at subscription time, so live delivery
+cannot skip an outage gap. A following reader fetches at most four forward pages (800 events); a
+larger gap replaces the loaded slice with the bounded current tail window. Omitted rows remain
+reachable through **Load Earlier Activity**. A reader who pauses during those requests keeps the
+forward chain from the last applied cursor instead of losing their reading position. An arbitrarily
+large gap for a paused reader still drains forward: replacing its slice with the tail would lose
+the viewport it deliberately kept. Navigation
+retains up to eight inactive reader windows per instance, with at most 2,000 events per window and
+eight MiB of UTF-8 event payloads in total. Returning restores the contiguous loaded slice and
+paused position immediately, then recovers from its cursor. Inactive windows stay unsubscribed.
+Eviction, an oversized or gapped slice, a replaced event epoch, and a legacy-server reconnect expire
+the corresponding saved position, so reopening reads the bounded tail rather than walking from the
+start for an anchor whose rows are no longer retained. Fleet comparison views still discard partial
+windows and recover their whole histories.
+
+A bounded provisional REST tail read and a session-metadata read begin independently of the
+WebSocket subscription acknowledgement, so delayed stream setup cannot hold the transcript on
+Loading the Conversation or leave a superseded Starting status on screen. Their results are fenced
+by the session's event epoch and reconnect generation; they do not advance its frozen recovery
+cursor. If initial metadata still reports Starting, only that row is rechecked every two seconds,
+up to five additional reads. A newer live status, acknowledgement, navigation, epoch change, failed
+request, or connection-phase change stops the retries. The transcript is not re-fetched, and
+exhaustion retains the latest server-reported state.
+
+Once a mounted conversation has been acknowledged and its current history refresh has settled
+successfully, unrelated fleet
+subscription changes use ordinary forward recovery without repeating provisional REST reads.
+Connection loss resets that guard so a missing reconnect acknowledgement can use REST again.
+
+A completed contiguous provisional REST window supplies a cursor for the acknowledged read, even
+if the reader pauses after it paints. That cursor is capped at the recorded HTTP tail and belongs to
+the current event epoch and reconnect generation; newer live events cannot move it past a gap. The
+receipt stays valid while the same window remains visible, including a further provisional refresh
+that the reader pauses or that fails. Partial or normal tail replacements clear it, and restoring an
+inactive reader clears its current-view attribution. The frozen stream cursor is never advanced by
+deriving this read cursor. Without a proven window or a retained gap cursor, an opening read uses
+the bounded tail.
+
+A control plane without backward reads is detected before its response can replace the transcript
+and resumes the forward chain at its applied cursor. Obsolete epochs and cancelled recoveries do
+not start a tail replacement.
 
 ## Recorded timestamps and duration
 
