@@ -756,7 +756,10 @@ extending the settled one-bar session chrome app-wide.
   session that has stopped with no Stop pending or failed (`sessionArchivedAtRest()`). "+N" counts
   only the other conditions that need the person, never passive states (Result Pending, Transcript
   Delayed and Notification Pending are passive), so it is the same at every width. The Sessions rows,
-  the preview bar and the Board cards use the same function.
+  the preview bar and the Board cards use the same function. The Sessions preview bar (#2210) shows
+  its first badge and "+N" exactly; a row (`sessionRowStatus()`, #2209) shows the same badge with
+  three exceptions of its own: no badge for Awaiting Prompt, Returned for a fired reminder, and the
+  danger tone for a stalled session.
 - It opens the Session Status popover (§9.2, 340px; a bottom sheet on phones): the title, then one
   row per condition with its badge, one sentence and the action that resolves it where one exists
   (Review Request, Answer, Sign In…, Open for Background Work, Open Agents, Open Requests). Result
@@ -2095,6 +2098,12 @@ follows these rules so it never crowds out the conversation it asks about:
   into one-line rows (kind icon, title, owner, time; owner hidden on phones). Choosing a row brings
   that request to the top for this view; the priority order is unchanged. A and D act on the
   expanded request; a decision brings up the next one.
+- **In the Sessions preview** (#2210), which has no composer, the dock heads the preview directly
+  under the meta line, so Approve and Deny are under the cursor that selected the row, and A and D
+  act on it while focus stays in the list. It caps at half the preview with its body scrolling, and
+  never shrinks to the reading-back strip: there are no rows under it to give height back to. A
+  question is not answered in the preview: its card shows the question and **Answer in Session**
+  (Enter keycap), which opens the session with the question docked.
 - **The Request Card** (`components/requests/RequestCard.tsx`, #2179) is the dock's card and the
   Requests and Agents panels' card for a child's or a worker's request. Head line: the kind's 16px
   icon and label (`requestKindMeta()`: Permission, Budget, Tool Calls, Workflow Decision, UI Evidence,
