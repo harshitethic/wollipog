@@ -447,6 +447,132 @@ test("remounting on step 2 with a choice made returns to step 2 with the choice 
   }
 });
 
+/**
+ * happy-dom has no layout. Each question is as many lines tall as `lines` says for its text, and the
+ * clamp shows three of them, so the question reads as truncated exactly when it is longer than that.
+ */
+function stubQuestionLayout(lines: Record<string, number>) {
+  const proto = domWindow.HTMLElement.prototype as unknown as Record<string, unknown>;
+  const prior = {
+    scrollHeight: Object.getOwnPropertyDescriptor(proto, "scrollHeight"),
+    clientHeight: Object.getOwnPropertyDescriptor(proto, "clientHeight"),
+  };
+  const linesOf = (element: HTMLElement) =>
+    element.classList?.contains("question-text") ? lines[element.textContent ?? ""] ?? 1 : 0;
+  Object.defineProperty(proto, "scrollHeight", { configurable: true, get(this: HTMLElement) {
+    return linesOf(this) * 20;
+  } });
+  Object.defineProperty(proto, "clientHeight", { configurable: true, get(this: HTMLElement) {
+    const total = linesOf(this);
+    return (this.classList?.contains("is-clamped") ? Math.min(total, 3) : total) * 20;
+  } });
+  return {
+    restore() {
+      for (const [name, descriptor] of Object.entries(prior)) {
+        if (descriptor) Object.defineProperty(proto, name, descriptor);
+        else delete proto[name];
+      }
+    },
+  };
+}
+
+test("a capped card whose body is squeezed below a row scrolls as a whole, though nothing else resized (#2683)", async () => {
+  // happy-dom has no layout: a 300px card whose content fits, and a body given `room` of its 200px.
+  const proto = domWindow.HTMLElement.prototype as unknown as Record<string, unknown>;
+  const names = ["scrollHeight", "clientHeight", "offsetHeight"] as const;
+  const prior = Object.fromEntries(names.map((name) => [name, Object.getOwnPropertyDescriptor(proto, name)]));
+  const layout = { room: 120 };
+  const size = (element: HTMLElement, name: (typeof names)[number]) => {
+    if (element.classList?.contains("request-card-body")) return name === "scrollHeight" ? 200 : layout.room;
+    if (element.classList?.contains("question-card")) return 300;
+    return element.classList?.contains("question-text") ? 20 : 0;
+  };
+  for (const name of names) {
+    Object.defineProperty(proto, name, { configurable: true, get(this: HTMLElement) { return size(this, name); } });
+  }
+  // Resize delivery per observed element, as the browser does.
+  const observed: Array<{ target: Element; callback: () => void }> = [];
+  const priorObserver = (globalThis as { ResizeObserver?: unknown }).ResizeObserver;
+  (globalThis as { ResizeObserver?: unknown }).ResizeObserver = class {
+    constructor(private readonly callback: () => void) {}
+    observe(target: Element) { observed.push({ target, callback: this.callback }); }
+    unobserve() {}
+    disconnect() {
+      for (let index = observed.length - 1; index >= 0; index -= 1) {
+        if (observed[index]!.callback === this.callback) observed.splice(index, 1);
+      }
+    }
+  };
+  const { container, root } = mount();
+  try {
+    await renderBanner(root, [{ id: "plan", question: "Proceed?", options: [{ label: "Yes" }, { label: "No" }] }], true,
+      api, "question-cramped");
+    const card = container.querySelector<HTMLElement>(".question-card")!;
+    assert.equal(card.hasAttribute("data-card-scrolls"), false, "a body with a row's room scrolls on its own");
+    // A notice above the footer squeezes only the body: the card and the title keep their size.
+    layout.room = 30;
+    const body = container.querySelector(".request-card-body")!;
+    await act(async () => { for (const entry of observed.filter((candidate) => candidate.target === body)) entry.callback(); });
+    assert.equal(card.hasAttribute("data-card-scrolls"), true, "the card scrolls as a whole instead");
+  } finally {
+    await act(async () => { root.unmount(); });
+    container.remove();
+    for (const [name, descriptor] of Object.entries(prior)) {
+      if (descriptor) Object.defineProperty(proto, name, descriptor);
+      else delete proto[name];
+    }
+    (globalThis as { ResizeObserver?: unknown }).ResizeObserver = priorObserver;
+    clearQuestionDrafts("session-1", "question-cramped");
+  }
+});
+
+test("a long question shows Show Full Question, expands whole and collapses, keeping the choice and step (#2683)", async () => {
+  const long = "Campaign scope request epic-initial-scope is still pending, and dispatch waits on it.";
+  const questions: AgentQuestion[] = [
+    { id: "scope", question: long, options: [{ label: "Approve" }, { label: "Hold" }] },
+    { id: "window", question: "Choose a window", options: [{ label: "Morning" }, { label: "Evening" }] },
+  ];
+  const layout = stubQuestionLayout({ [long]: 8 });
+  const { container, root } = mount();
+  try {
+    await renderBanner(root, questions, true, api, "question-expand");
+    const title = () => container.querySelector<HTMLElement>(".question-text")!;
+    const toggle = () => container.querySelector<HTMLButtonElement>(".question-text-toggle");
+    assert.ok(title().classList.contains("is-clamped"));
+    assert.equal(toggle()?.textContent, "Show Full Question");
+    assert.equal(toggle()?.getAttribute("aria-expanded"), "false");
+    assert.equal(toggle()?.getAttribute("aria-controls"), title().id);
+
+    await act(async () => { row(container, "Approve").click(); });
+    await act(async () => { toggle()!.click(); });
+    assert.equal(title().classList.contains("is-clamped"), false, "expanded, the whole question shows");
+    assert.equal(toggle()?.textContent, "Show Less");
+    assert.equal(toggle()?.getAttribute("aria-expanded"), "true");
+    assert.equal(row(container, "Approve").checked, true, "expanding keeps the choice");
+
+    await act(async () => { toggle()!.click(); });
+    assert.ok(title().classList.contains("is-clamped"));
+    assert.equal(toggle()?.textContent, "Show Full Question");
+    assert.equal(row(container, "Approve").checked, true, "collapsing keeps the choice");
+
+    // A question that fits has no toggle; returning to the expanded one finds it as it was left.
+    await act(async () => { toggle()!.click(); });
+    await act(async () => { button(container, "next").click(); });
+    assert.equal(container.querySelector(".question-step-note")?.firstChild?.textContent, "Question 2 of 2");
+    assertNoDomNode(toggle(), "a question that fits has no toggle");
+    assert.ok(title().classList.contains("is-clamped"), "the next question starts clamped");
+    await act(async () => { button(container, "back").click(); });
+    assert.equal(title().classList.contains("is-clamped"), false);
+    assert.equal(toggle()?.textContent, "Show Less");
+    assert.equal(row(container, "Approve").checked, true, "the step keeps its choice");
+  } finally {
+    await act(async () => { root.unmount(); });
+    container.remove();
+    layout.restore();
+    clearQuestionDrafts("session-1", "question-expand");
+  }
+});
+
 test("options are native radios and checkboxes inside ChoiceRows, with no drawn glyphs", async () => {
   const { container, root } = mount();
   try {
