@@ -5643,6 +5643,10 @@ export class SessionManager {
     const priorResumeId = prior?.driver === driver && (driver === "codex-app-server" || driver === "pi")
       ? prior.agentSessionId
       : null;
+    // A fresh provider conversation keeps this Wollipog session's corrected lifetime baseline.
+    // Clearing it would lose the repair generation and make every subsequent snapshot stale.
+    const retainAccounting = !!priorResumeId || prior?.costReconciliationRevision !== undefined ||
+      prior?.costReconciliationRepairId !== undefined;
     const priorManagedPiState = prior?.adoptedProviderState?.driver === "pi"
       ? prior.adoptedProviderState
       : undefined;
@@ -5727,13 +5731,15 @@ export class SessionManager {
       orchestrator: (prior?.orchestrator?.issueScope?.revision ?? 0) > (spec.orchestrator?.issueScope?.revision ?? 0) ? prior?.orchestrator : spec.orchestrator ?? prior?.orchestrator,
       acpSessionContext,
       acpSessionOverrides,
-      tokensIn: priorResumeId ? (prior?.tokensIn ?? 0) : 0,
-      tokensOut: priorResumeId ? (prior?.tokensOut ?? 0) : 0,
+      tokensIn: retainAccounting ? (prior?.tokensIn ?? 0) : 0,
+      tokensOut: retainAccounting ? (prior?.tokensOut ?? 0) : 0,
       contextTokensUsed: priorResumeId ? prior?.contextTokensUsed : undefined,
       contextWindow: priorResumeId ? prior?.contextWindow : undefined,
-      costUsd: priorResumeId ? (prior?.costUsd ?? 0) : 0,
-      costReconciliationRevision: priorResumeId ? prior?.costReconciliationRevision : undefined,
-      costReconciliationDeltaUsd: priorResumeId ? prior?.costReconciliationDeltaUsd : undefined,
+      costUsd: retainAccounting ? (prior?.costUsd ?? 0) : 0,
+      costReconciliationRevision: retainAccounting ? prior?.costReconciliationRevision : undefined,
+      costReconciliationDeltaUsd: retainAccounting ? prior?.costReconciliationDeltaUsd : undefined,
+      costReconciliationIdentity: retainAccounting ? prior?.costReconciliationIdentity : undefined,
+      costReconciliationRepairId: retainAccounting ? prior?.costReconciliationRepairId : undefined,
       preview: priorResumeId ? (prior?.preview ?? null) : null,
       pendingApproval: null,
       // Manager-driven: a continued session is no longer a pristine transcript, so it isn't
@@ -5747,6 +5753,7 @@ export class SessionManager {
         ? prior.checkpointRefVersion
         : (this.runnerOwnerHash ? 2 : undefined),
       seq: prior?.seq ?? 0,
+      logEpoch: prior?.logEpoch,
       createdAt: prior?.createdAt ?? now,
       updatedAt: now,
       // Carry the last-turn snapshot + turn counter across restarts (like seq/createdAt) —
@@ -5785,6 +5792,19 @@ export class SessionManager {
           return;
         }
         prior = latest;
+        // Price/repair frames can commit while Restart waits for this serialized transition.
+        // Bind the replacement row to the latest lifetime baseline and generation, not its preview.
+        if (!!priorResumeId || latest.costReconciliationRevision !== undefined || latest.costReconciliationRepairId !== undefined) {
+          meta.costUsd = latest.costUsd;
+          meta.tokensIn = latest.tokensIn;
+          meta.tokensOut = latest.tokensOut;
+          meta.costReconciliationRevision = latest.costReconciliationRevision;
+          meta.costReconciliationDeltaUsd = latest.costReconciliationDeltaUsd;
+          meta.costReconciliationIdentity = latest.costReconciliationIdentity;
+          meta.costReconciliationRepairId = latest.costReconciliationRepairId;
+        }
+        meta.seq = latest.seq;
+        meta.logEpoch = latest.logEpoch;
         const latestMatchesWorkspace = latest.repoPath === repoPath &&
           agentContextKey(latest.context) === agentContextKey(context);
         shouldUseWorktree = spec.useWorktree || latestMatchesWorkspace && !!latest.worktreePath &&
@@ -13823,6 +13843,8 @@ export class SessionManager {
         costUsd: 0,
         costReconciliationRevision: undefined,
         costReconciliationDeltaUsd: undefined,
+        costReconciliationIdentity: undefined,
+        costReconciliationRepairId: undefined,
         preview: null,
         pendingApproval: null,
         providerCredentialScopeId: undefined,
@@ -14037,12 +14059,37 @@ export class SessionManager {
   /** Persist the control plane's cumulative priced cost and apply the existing hard budget to the
    * active turn. Codex reports token usage without USD, so this acknowledgement is the first
    * authoritative cost the runner can enforce. */
-  syncPricedSessionCost(sessionId: string, costUsd: number, revision?: number, correctionDeltaUsd?: number): void {
+  syncPricedSessionCost(sessionId: string, costUsd: number, revision?: number, correctionDeltaUsd?: number, coordinate?: import("@wollipog/protocol").PricedSessionCostMessage): void {
     if (!Number.isFinite(costUsd) || costUsd < 0) return;
     const current = this.store.readMeta(sessionId);
-    if (!current || !Number.isSafeInteger(revision ?? 0) || (revision ?? 0) < (current.costReconciliationRevision ?? 0)) return;
+    if (!current || !Number.isSafeInteger(revision ?? 0) || (revision ?? 0) < 0) return;
     const priorRevision = current.costReconciliationRevision ?? 0;
-    if ((revision ?? 0) > 0) {
+    const identity = coordinate?.costReconciliationIdentity;
+    const repair = coordinate?.costReconciliationRepair;
+    if ((revision ?? 0) > 0 && (!identity || !/^[a-f0-9]{64}$/.test(identity))) return;
+    if (repair) {
+      const expected = repair.expected;
+      // Evidence names the negotiated wire history, including dense sequence projection.
+      const wire = this.store.projectSnapshotForProtocol(this.snapshot(current), this.controlPlaneProtocolVersion());
+      if (!/^[a-f0-9]{64}$/.test(repair.id) || expected.revision !== priorRevision ||
+          expected.identity !== current.costReconciliationIdentity || expected.repairId !== current.costReconciliationRepairId ||
+          expected.deltaUsd !== (current.costReconciliationDeltaUsd ?? 0) ||
+          expected.costUsd !== current.costUsd || expected.tokensIn !== current.tokensIn || expected.tokensOut !== current.tokensOut ||
+          expected.seq !== wire.seq || expected.historyEpoch !== wire.historyEpoch ||
+          correctionDeltaUsd !== expected.deltaUsd || costUsd !== current.costUsd) {
+        this.log(JSON.stringify({ event: "claude_cost_acknowledgement_repair_refused", entryPoint: "control_plane", correlationId: repair.id, sessionId, reason: "expected_state_changed" }));
+        return;
+      }
+    } else {
+      if ((revision ?? 0) < priorRevision || coordinate?.costReconciliationRepairId !== current.costReconciliationRepairId) return;
+      if (priorRevision > 0 && revision === priorRevision && identity !== current.costReconciliationIdentity) return;
+      if ((revision ?? 0) > priorRevision) {
+        const base = coordinate?.costReconciliationBase;
+        if (!base || base.revision !== priorRevision || base.identity !== current.costReconciliationIdentity ||
+            base.deltaUsd !== (current.costReconciliationDeltaUsd ?? 0)) return;
+      }
+    }
+    if (!repair && (revision ?? 0) > 0) {
       if (!Number.isFinite(correctionDeltaUsd) || correctionDeltaUsd! > 0) return;
       if (revision === priorRevision && correctionDeltaUsd !== current.costReconciliationDeltaUsd) return;
       // Preserve provider usage accrued after the preview/commit but before this frame arrived.
@@ -14051,8 +14098,11 @@ export class SessionManager {
     }
     const updated = this.store.patchMeta(sessionId, { costUsd,
       ...(revision !== undefined ? { costReconciliationRevision: revision } : {}),
-      ...(correctionDeltaUsd !== undefined ? { costReconciliationDeltaUsd: correctionDeltaUsd } : {}) });
+      ...(correctionDeltaUsd !== undefined ? { costReconciliationDeltaUsd: correctionDeltaUsd } : {}),
+      ...(identity !== undefined ? { costReconciliationIdentity: identity } : {}),
+      ...(repair ? { costReconciliationRepairId: repair.id, costReconciliationIdentity: identity } : {}) });
     if (!updated) return;
+    if (repair) this.log(JSON.stringify({ event: "claude_cost_acknowledgement_repair_committed", entryPoint: "control_plane", correlationId: repair.id, sessionId }));
     this.send({ type: "session_runtime_updated", snapshot: this.snapshot(updated) });
 
     const entry = this.active.get(sessionId);

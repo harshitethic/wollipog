@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "@wollipog/test-support/bounded-child-process";
-import type { RunnerToControlPlane, SessionLaunchSpec, SessionQueueMessage } from "@wollipog/protocol";
+import { PROTOCOL_VERSION, type RunnerToControlPlane, type SessionLaunchSpec, type SessionQueueMessage } from "@wollipog/protocol";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -796,4 +796,74 @@ test("a reused task id does not cost the replaced conversation's result that is 
     manager?.shutdownAll();
     rmSync(f.root, { recursive: true, force: true });
   }
+});
+
+for (const revision of [0, 1, Number.MAX_SAFE_INTEGER]) test(`Claude Restart retains corrected lifetime accounting and repair generation: revision=${revision}`, { skip: !haveGit() }, async () => {
+  const f = fixture("accounting");
+  let manager: SessionManager | undefined;
+  try {
+    const spec = claudeSpec("s_restart_accounting", f.repo);
+    const prior = storedClaudeSession(spec.sessionId, f.repo, {
+      costUsd: 0.036, tokensIn: 40, tokensOut: 4, seq: 4, logEpoch: 1,
+      costReconciliationRevision: revision,
+      costReconciliationDeltaUsd: revision ? -0.004 : 0,
+      costReconciliationIdentity: revision ? "a".repeat(64) : undefined,
+      costReconciliationRepairId: revision === Number.MAX_SAFE_INTEGER ? undefined : "b".repeat(64),
+    });
+    f.store.create(prior);
+    const fake = fakeProvider();
+    manager = new SessionManager((message) => f.sent.push(message), () => {}, f.store, "runner", undefined,
+      fake.factory as never, f.dataDir, 1);
+    assert.equal(await manager.start(spec), true);
+    const restarted = f.store.readMeta(spec.sessionId)!;
+    for (const key of ["costUsd", "tokensIn", "tokensOut", "costReconciliationRevision", "costReconciliationDeltaUsd", "costReconciliationIdentity", "costReconciliationRepairId", "logEpoch"] as const) {
+      assert.equal(restarted[key], prior[key], `${key} survives a fresh provider conversation`);
+    }
+    assert.notEqual(restarted.agentSessionId, prior.agentSessionId, "Restart still starts a fresh Claude conversation");
+    fake.providers[0]!.cb.onEvent({ kind: "token_usage", costUsd: 0.001, inputTokens: 10, outputTokens: 1 });
+    const afterUsage = f.store.readMeta(spec.sessionId)!;
+    assert.ok(Math.abs(afterUsage.costUsd - 0.037) < 1e-12);
+    assert.equal(afterUsage.tokensIn, 50); assert.equal(afterUsage.tokensOut, 5);
+    const runtime = manager.snapshotForControlPlane(afterUsage);
+    assert.equal(runtime.costReconciliationRepairId, prior.costReconciliationRepairId);
+    assert.equal(runtime.costReconciliationIdentity, prior.costReconciliationIdentity);
+    assert.equal(runtime.historyEpoch, prior.logEpoch);
+  } finally { manager?.shutdownAll(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a repair committed while Restart waits for its row transition retains the latest generation", { skip: !haveGit() }, async () => {
+  const f = fixture("concurrent-repair");
+  let manager: SessionManager | undefined;
+  try {
+    const spec = claudeSpec("s_restart_concurrent_repair", f.repo);
+    f.store.create(storedClaudeSession(spec.sessionId, f.repo, { costUsd: 0.036, tokensIn: 40, tokensOut: 4,
+      seq: 4, logEpoch: 1, costReconciliationRevision: 1, costReconciliationDeltaUsd: -0.004,
+      costReconciliationIdentity: "a".repeat(64), costReconciliationRepairId: "b".repeat(64) }));
+    const fake = fakeProvider();
+    manager = new SessionManager((message) => f.sent.push(message), () => {}, f.store, "runner", undefined,
+      fake.factory as never, f.dataDir, 1);
+    const sm = manager;
+    const serialized = (sm as any).runWorktreeOperation.bind(sm);
+    let operations = 0;
+    (sm as any).runWorktreeOperation = (id: string, action: () => Promise<unknown>) => serialized(id, async () => {
+      // Release a queued mutation between start's prior read and its serialized row replacement.
+      if (++operations === 2) {
+        const current = f.store.readMeta(id)!;
+        const wire = f.store.projectSnapshotForProtocol(sm.snapshotForControlPlane(current), PROTOCOL_VERSION);
+        const frame = { type: "priced_session_cost" as const, sessionId: id, costUsd: current.costUsd,
+          costReconciliationRevision: 1, costReconciliationIdentity: current.costReconciliationIdentity,
+          costReconciliationDeltaUsd: -0.004, costReconciliationRepair: { id: "c".repeat(64), expected: {
+            revision: 1, identity: current.costReconciliationIdentity, repairId: current.costReconciliationRepairId,
+            deltaUsd: -0.004, costUsd: current.costUsd, tokensIn: current.tokensIn, tokensOut: current.tokensOut,
+            seq: wire.seq, historyEpoch: wire.historyEpoch! } } };
+        sm.syncPricedSessionCost(id, frame.costUsd, 1, -0.004, frame);
+        assert.equal(f.store.readMeta(id)!.costReconciliationRepairId, frame.costReconciliationRepair.id);
+      }
+      return action();
+    });
+    assert.equal(await sm.start(spec), true);
+    assert.ok(operations >= 2);
+    assert.equal(f.store.readMeta(spec.sessionId)!.costReconciliationRepairId, "c".repeat(64));
+    assert.equal(f.store.readMeta(spec.sessionId)!.costUsd, 0.036);
+  } finally { manager?.shutdownAll(); rmSync(f.root, { recursive: true, force: true }); }
 });

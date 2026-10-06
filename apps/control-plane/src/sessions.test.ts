@@ -46,7 +46,7 @@ import {
 } from "@wollipog/protocol";
 import { dispatch as dispatchManagerTool } from "../../runner/src/session-management-mcp.js";
 import { ControlPlaneDb } from "./db.js";
-import { applyClaudeReconciliation, previewClaudeReconciliation } from "./claude-cost-reconciliation.js";
+import { applyClaudeReconciliation, previewClaudeReconciliation, observeReconciliationRevision } from "./claude-cost-reconciliation.js";
 import { parseRateTable } from "./usage-pricing.js";
 import { automationCommandDigest, canonicalAutomationCommandJson } from "./automation-command-outbox.js";
 import { Hub, RunnerRequestNotSentError, RunnerRequestTimeoutError, type RunnerRequestResult } from "./hub.js";
@@ -76,7 +76,7 @@ import {
   type PreStagedDeliveryPlan,
 } from "./sessions.js";
 
-for (const scenario of ["downgrade", "revision-ahead", "stopped", "archived"]) test(`unsupported reconciled snapshot isolates its session and preserves enforcement: ${scenario}`, async () => {
+for (const scenario of ["downgrade", "revision-ahead", "identity-conflict", "stopped", "archived"]) test(`unsupported reconciled snapshot isolates its session and preserves enforcement: ${scenario}`, async () => {
   const { db, hub, svc } = makeHarness();
   const now = Date.now();
   try {
@@ -96,10 +96,10 @@ for (const scenario of ["downgrade", "revision-ahead", "stopped", "archived"]) t
     applyClaudeReconciliation(db, principal, evidence, previewClaudeReconciliation(db, principal, evidence).digest);
     db.updateSessionStatus("corrected", "completed", now + 2);
     db.updateSessionStatus("ordinary", "completed", now + 2);
-    db.registerRunner(runnerMeta(), now + 3, scenario === "revision-ahead" ? 199 : 198);
+    db.registerRunner(runnerMeta(), now + 3, scenario === "revision-ahead" || scenario === "identity-conflict" ? PROTOCOL_VERSION : 209);
     const snapshots = [
       snapshot({ id: "corrected", status: scenario === "stopped" || scenario === "archived" ? "running" : "completed",
-        costUsd: 0.03, seq: 2, historyEpoch: 1, ...(scenario === "revision-ahead" ? { costReconciliationRevision: 2 } : {}) }),
+        costUsd: 0.03, seq: 2, historyEpoch: 1, ...(scenario === "revision-ahead" ? { costReconciliationRevision: 2 } : scenario === "identity-conflict" ? { costReconciliationRevision: 1, costReconciliationIdentity: "f".repeat(64), costReconciliationDeltaUsd: -0.01 } : {}) }),
       snapshot({ id: "ordinary", title: "Updated Ordinary", status: "completed", costUsd: 0.004, seq: 0 }),
     ];
     if (scenario === "stopped") { db.updateSessionStatus("corrected", "running", now + 4); assert.ok(svc.stop("corrected").ok); }
@@ -25442,4 +25442,36 @@ test("human-only campaigns can confirm scope and separately approve closure with
     assert.equal(resolved.data!.status,"approved","scope approval did not consume the separate closure approval");
     await new Promise((resolve)=>setTimeout(resolve,0));
   } finally {db.close();}
+});
+
+for (const protocol of [199, 209, PROTOCOL_VERSION]) test(`fenced Claude usage ingestion retains budget enforcement without an unbound price: protocol=${protocol}`, () => {
+  const { db, hub } = makeHarness();
+  const logs: string[] = [];
+  const svc = new SessionsService(db, hub as unknown as Hub, { info() {}, error() {}, warn(message: string) { logs.push(message); } });
+  const now = Date.now(), id = "fenced-usage";
+  try {
+    db.registerRunner(runnerMeta(), now, PROTOCOL_VERSION);
+    db.createSession({ id, runnerId: RUNNER_ID, workspaceId: null, agentId: AGENT_ID, driver: "claude-code",
+      title: id, useWorktree: false, config: { costBudgetUsd: 0.025 }, now });
+    const first = db.appendEvent(id, { kind: "token_usage", costUsd: 0.01, model: "claude-test" }, now, { accrueUsage: true, runnerSeq: 1, historyEpoch: 1 });
+    const second = db.appendEvent(id, { kind: "token_usage", costUsd: 0.02, model: "claude-test" }, now + 1, { accrueUsage: true, runnerSeq: 2, historyEpoch: 1 });
+    const evidence = { sessionId: id, eventEpoch: 0, historyEpoch: 1, importAuthorized: true, sourceSha256: "a".repeat(64), records: [
+      { eventId: first.id, conversation: "b".repeat(64), process: "c".repeat(64), boundary: "origin", startUsd: 0, endUsd: 0.01, model: "claude-test", scope: "query-tree" },
+      { eventId: second.id, conversation: "b".repeat(64), process: "d".repeat(64), boundary: "resume", startUsd: 0.01, endUsd: 0.02, model: "claude-test", scope: "query-tree" },
+    ] };
+    const principal = { kind: "human" as const, actorId: "owner", userId: "owner", userName: "Owner", organizationId: "org_personal", organizationName: "Personal", role: "owner" as const, deviceId: "device", localBootstrap: false };
+    applyClaudeReconciliation(db, principal, evidence, previewClaudeReconciliation(db, principal, evidence).digest);
+    observeReconciliationRevision(db, id, Number.MAX_SAFE_INTEGER);
+    db.registerRunner(runnerMeta(), now + 2, protocol);
+    db.updateSessionCostBudget(id, 0.025, now + 2);
+    db.updateSessionStatus(id, "running", now + 2);
+    hub.sentToRunner.length = 0;
+    assert.doesNotThrow(() => svc.onSessionEvent(id, { kind: "token_usage", costUsd: 0.006, inputTokens: 10, outputTokens: 1, model: "claude-test" }));
+    assert.equal(db.sessionCostUsd(id), 0.026);
+    assert.equal(db.getSession(id)?.status, "input_required");
+    assert.equal(db.getSession(id)?.pendingApproval?.kind, "cost_budget");
+    assert.equal(hub.sentOfType("priced_session_cost").length, 0, "an unavailable correction prefix never sends an unbound fallback price");
+    assert.ok(logs.map((line) => { try { return JSON.parse(line); } catch { return {}; } }).some((event) =>
+      event.event === "cost_reconciliation_price_deferred" && event.sessionId === id && event.entryPoint === "runner"));
+  } finally { db.close(); }
 });

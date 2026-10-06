@@ -1,8 +1,9 @@
+import { acknowledgementRepairFrame } from "./claude-cost-repair.js";
 import { scopeView, scopeSnapshot, scopeParticipants, scopeCompatibility, campaignNeedsEpicScope } from "./campaign-issue-scope.js";
 import { initialCampaignEpic } from "./campaign-issue-scope-seed.js";
 import { normalizeCampaignIssueScopeSnapshot, titleFromPrompt, type CampaignIssueScopeRequest, type CampaignIssueScopeView } from "@wollipog/protocol";
 import { normalizeIssueClosureSnapshot, issueClosureActiveChildren } from "./github-issue-closure.js";
-import { observeReconciliationRevision, normalizeReconciledSnapshot, reconciliationDeltaUsd, reconciliationRevision } from "./claude-cost-reconciliation.js";
+import { observeReconciliationSnapshot, reconciliationSnapshotAvailable, correctionFrame, latestReconciliationRepair, normalizeReconciledSnapshot, reconciliationRevision } from "./claude-cost-reconciliation.js";
 import type { GithubIssueClosureRequest, GithubIssueClosureResult } from "@wollipog/protocol";
 /**
  * Session orchestration: the control-plane brain that turns UI commands into
@@ -12693,14 +12694,23 @@ export class SessionsService {
         this.db.getRunner(session.runnerId)?.protocolVersion,
         "pricedSessionCost",
       )) {
-        this.hub.sendToRunner(session.runnerId, {
-          type: "priced_session_cost",
-          sessionId,
-          costUsd: this.db.sessionCostUsd(sessionId),
-          ...(runnerSupportsProtocol(this.db.getRunner(session.runnerId)?.protocolVersion, "costReconciliation") && reconciliationRevision(this.db, sessionId) > 0
-            ? { costReconciliationRevision: reconciliationRevision(this.db, sessionId),
-              costReconciliationDeltaUsd: reconciliationDeltaUsd(this.db, sessionId) } : {}),
-        });
+        let frame: import("@wollipog/protocol").PricedSessionCostMessage | undefined;
+        if (reconciliationRevision(this.db, sessionId) > 0 || latestReconciliationRepair(this.db, sessionId)) {
+          const supportsIdentity = runnerSupportsProtocol(this.db.getRunner(session.runnerId)?.protocolVersion, "costReconciliationIdentity");
+          if (supportsIdentity) {
+            try { frame = correctionFrame(this.db, sessionId); }
+            catch { /* Missing correction provenance defers price synchronization. */ }
+          }
+          if (!frame) {
+            // Retain accepted usage and budget enforcement while missing provenance fences price sync.
+            // Never strip the coordinate and fall back to an unbound cumulative price.
+            this.log.warn(JSON.stringify({ event: "cost_reconciliation_price_deferred", entryPoint: "runner",
+              runnerId: session.runnerId, sessionId, reason: supportsIdentity ? "correction_prefix_unavailable" : "runner_upgrade_required" }));
+          }
+        } else {
+          frame = { type: "priced_session_cost", sessionId, costUsd: this.db.sessionCostUsd(sessionId) };
+        }
+        if (frame) this.hub.sendToRunner(session.runnerId, frame);
       }
       // Guardrail card gate: pause + ask once a policy rule trips. A v47 runner independently
       // cancels the active turn at the normalized usage threshold; v106 also applies that gate to
@@ -13594,12 +13604,20 @@ export class SessionsService {
     const sessionId = snapshot.id;
     if (this.db.getSession(sessionId)?.runnerId !== runnerId) return false;
     const revision = reconciliationRevision(this.db, sessionId);
-    const acknowledged = snapshot.costReconciliationRevision ?? 0;
-    const observed = observeReconciliationRevision(this.db, sessionId, acknowledged);
-    const revisionUnavailable = !Number.isSafeInteger(acknowledged) || acknowledged < 0 ||
-      Math.max(acknowledged, observed) > revision;
+    const pendingRepair = latestReconciliationRepair(this.db, sessionId);
+    observeReconciliationSnapshot(this.db, snapshot);
+    if (pendingRepair && !pendingRepair.confirmed && latestReconciliationRepair(this.db, sessionId)?.confirmed) {
+      this.log.info(JSON.stringify({ event: "claude_cost_acknowledgement_repair_confirmed", entryPoint: "runner", correlationId: pendingRepair.digest, runnerId, sessionId }));
+    }
+    const revisionUnavailable = !reconciliationSnapshotAvailable(this.db, snapshot);
+    if (revisionUnavailable) {
+      try {
+        const repair = acknowledgementRepairFrame(this.db, sessionId);
+        if (repair) this.hub.sendToRunner(runnerId, repair);
+      } catch { /* Retain this session's fence; a disconnected transport cannot affect peers. */ }
+    }
     if (!revisionUnavailable && (revision === 0 || runnerSupportsProtocol(
-      this.db.getRunner(runnerId)?.protocolVersion, "costReconciliation"))) return false;
+      this.db.getRunner(runnerId)?.protocolVersion, "costReconciliationIdentity"))) return false;
     this.log.warn(JSON.stringify({ event: revisionUnavailable ? "cost_reconciliation_revision_unavailable" :
       "cost_reconciliation_runner_upgrade_required", runnerId, sessionId }));
     return true;
@@ -13609,10 +13627,8 @@ export class SessionsService {
     const revision = reconciliationRevision(this.db, sessionId);
     if (revision <= acknowledgedRevision) return;
     const session = this.db.getSession(sessionId);
-    if (!session || !runnerSupportsProtocol(this.db.getRunner(session.runnerId)?.protocolVersion, "costReconciliation")) return;
-    this.hub.sendToRunner(session.runnerId, { type: "priced_session_cost", sessionId,
-      costUsd: this.db.sessionCostUsd(sessionId), costReconciliationRevision: revision,
-      costReconciliationDeltaUsd: reconciliationDeltaUsd(this.db, sessionId) });
+    if (!session || !runnerSupportsProtocol(this.db.getRunner(session.runnerId)?.protocolVersion, "costReconciliationIdentity")) return;
+    this.hub.sendToRunner(session.runnerId, correctionFrame(this.db, sessionId, acknowledgedRevision));
   }
 
   /** Lazy-hydrate a session's event timeline from the runner (the box owns the log). Called when a
