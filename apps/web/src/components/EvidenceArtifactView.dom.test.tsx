@@ -119,7 +119,13 @@ async function mount(session: SessionView, artifactExport: ApiClient["artifactEx
   ));
   // Fetch, digest, and the state update each settle on their own turn.
   for (let turn = 0; turn < 6; turn += 1) await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
-  const button = (name: string) => [...container.querySelectorAll<HTMLButtonElement>(".request-card-foot button")]
+  // The digest runs on SubtleCrypto, which no number of turns waits for under load. Keep waiting while
+  // a tile is still downloading or hashing, but only so long: a test may hold a download on purpose.
+  const settledBy = Date.now() + 2_000;
+  while (container.querySelector('.ev-media[data-status="loading"]') && Date.now() < settledBy) {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
+  }
+  const button =(name: string) => [...container.querySelectorAll<HTMLButtonElement>(".request-card-foot button")]
     .find((candidate) => candidate.textContent === name)!;
   // Tiles are named by media type (#2197): "Screenshot", or "Screenshot 1" when there are several.
   const checkbox = (name: string) =>
@@ -577,5 +583,272 @@ test("a failed image is reported to the card inside the error event, before any 
   } finally {
     await act(async () => root.unmount());
     container.remove();
+  }
+});
+
+// The Evidence Viewer (#2207). It is portalled to the document, outside the card.
+const viewer = () => domWindow.document.querySelector('[role="dialog"]') as unknown as HTMLElement | null;
+const viewerTitle = () => viewer()?.querySelector(".modal-title")?.textContent ?? null;
+const viewerButton = (name: string) => [...viewer()?.querySelectorAll<HTMLButtonElement>(".modal-foot button") ?? []]
+  .find((candidate) => candidate.textContent?.replace(/[←→]/gu, "").trim() === name)!;
+const filmstrip = () => [...viewer()?.querySelectorAll<HTMLButtonElement>(".ev-strip-thumb") ?? []];
+const press = async (key: string) => {
+  const target = (domWindow.document.activeElement ?? viewer()) as unknown as HTMLElement;
+  await act(async () => {
+    target.dispatchEvent(new domWindow.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }) as unknown as Event);
+  });
+};
+// Focus comes back on a timer once the dialog has gone.
+const settleFocus = async () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+/** Waits for the card to reach a state: a download and its digest settle on no fixed number of turns. */
+const settle = async (reached: () => boolean, what: string) => {
+  const deadline = Date.now() + 5_000;
+  while (!reached()) {
+    assert.ok(Date.now() < deadline, `timed out waiting for ${what}`);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
+  }
+};
+const screenshots = (count: number) => Array.from({ length: count }, (_, index) =>
+  artifactItem({ evidenceId: `viewport-${index + 1}`, artifactId: `art_${index + 1}` }));
+const openTile = async (view: Awaited<ReturnType<typeof mount>>, evidenceId: string) => {
+  const thumb = view.tile(evidenceId).querySelector<HTMLButtonElement>(".ev-thumb")!;
+  thumb.focus();
+  await act(async () => thumb.click());
+};
+
+test("the second tile opens Screenshot 2 of 4, and the arrow keys, Previous and Next step through the items", async () => {
+  domWindow.localStorage.clear();
+  const view = await mount(sessionWith(screenshots(4)), async () => new Blob([PNG]));
+  try {
+    await view.decode("load");
+    await openTile(view, "viewport-2");
+    assert.equal(viewerTitle(), "Screenshot 2 of 4");
+    assert.equal(viewer()?.querySelector(".ev-viewer-id")?.textContent, "viewport-2", "the id is the secondary text");
+    const image = viewer()?.querySelector<HTMLImageElement>(".ev-viewer-stage img");
+    assert.equal(image?.getAttribute("alt"), "Screenshot 2");
+    assert.match(image?.getAttribute("src") ?? "", /^blob:/u, "the viewer shows the tile's checked bytes");
+    assert.equal(domWindow.document.activeElement, viewerButton("Mark Reviewed and Next") as unknown as Element,
+      "opening from a tile focuses the viewer's primary");
+    await press("ArrowRight");
+    assert.equal(viewerTitle(), "Screenshot 3 of 4");
+    await press("ArrowLeft");
+    assert.equal(viewerTitle(), "Screenshot 2 of 4");
+    await act(async () => viewerButton("Next").click());
+    assert.equal(viewerTitle(), "Screenshot 3 of 4");
+    await act(async () => viewerButton("Previous").click());
+    viewerButton("Previous").focus();
+    await act(async () => viewerButton("Previous").click());
+    assert.equal(viewerTitle(), "Screenshot 1 of 4");
+    assert.equal(viewerButton("Previous").disabled, true, "nothing comes before the first item");
+    assert.equal(domWindow.document.activeElement, viewerButton("Mark Reviewed and Next") as unknown as Element,
+      "a step that turns disabled under focus hands it to the primary");
+    await press("ArrowLeft");
+    assert.equal(viewerTitle(), "Screenshot 1 of 4", "← on the first item stays put");
+    assert.deepEqual(filmstrip().map((thumb) => thumb.textContent),
+      ["Screenshot 1", "Screenshot 2", "Screenshot 3", "Screenshot 4"]);
+    assert.equal(filmstrip()[0]!.getAttribute("aria-current"), "true");
+    await act(async () => filmstrip()[3]!.click());
+    assert.equal(viewerTitle(), "Screenshot 4 of 4", "a thumbnail jumps to its item");
+    assert.equal(viewerButton("Next").disabled, true);
+    // The footer's labels are Title Case; its foot-note is a sentence.
+    assert.equal(viewer()?.querySelector(".ev-viewer-note")?.textContent, "0 of 4 reviewed");
+    assert.equal(viewer()?.querySelector(".modal-foot input[type=checkbox]")?.closest("label")?.textContent, "Reviewed");
+  } finally {
+    await view.unmount();
+  }
+});
+
+test("the viewer skips every item the grid shows as blocked", async () => {
+  domWindow.localStorage.clear();
+  const items = [
+    ...screenshots(4),
+    // An image type the card cannot draw (Can't Show, named "Screenshot 5") and one that is only a
+    // link: neither is a viewer target.
+    artifactItem({ evidenceId: "vector", artifactId: "art_vector", mediaType: "image/svg+xml" }),
+    { evidenceId: "link-only", uri: "https://evidence.example/link.png", sha256: PNG_SHA },
+  ];
+  const view = await mount(sessionWith(items), async (artifactId) =>
+    new Blob([artifactId === "art_3" ? Buffer.from("substituted") : PNG]));
+  try {
+    await view.decode("load");
+    assert.equal(view.tile("viewport-3").querySelector(".ev-blocked-label")?.textContent, "Doesn't Match");
+    assertNoDomNode(view.tile("viewport-3").querySelector(".ev-thumb"), "a blocked tile has nothing to open");
+    await openTile(view, "viewport-2");
+    assert.equal(viewerTitle(), "Screenshot 2 of 5");
+    await press("ArrowRight");
+    assert.equal(viewerTitle(), "Screenshot 4 of 5", "→ skips the item that doesn't match");
+    await act(async () => viewerButton("Previous").click());
+    assert.equal(viewerTitle(), "Screenshot 2 of 5", "Previous skips it too");
+    assert.deepEqual(filmstrip().map((thumb) => thumb.dataset.evidenceId), ["viewport-1", "viewport-2", "viewport-4"],
+      "the filmstrip holds only viewable items");
+    await act(async () => viewerButton("Next").click());
+    assert.equal(viewerButton("Next").disabled, true, "the link and the unshowable file come after nothing");
+  } finally {
+    await view.unmount();
+  }
+});
+
+test("Mark Reviewed and Next marks the item, moves on and closes on the last, returning focus to its tile", async () => {
+  domWindow.localStorage.clear();
+  const view = await mount(sessionWith(screenshots(4)), async () => new Blob([PNG]));
+  try {
+    await view.decode("load");
+    await openTile(view, "viewport-3");
+    assert.equal(viewerTitle(), "Screenshot 3 of 4");
+    await act(async () => viewerButton("Mark Reviewed and Next").click());
+    assert.equal(viewerTitle(), "Screenshot 4 of 4");
+    assert.equal(view.container.querySelector(".ev-progress")?.textContent, "1 of 4 reviewed", "the grid counts it");
+    assert.equal(view.checkbox("Screenshot 3")!.checked, true, "the tile's mark is the same mark");
+    assert.equal(viewer()?.querySelector(".ev-viewer-note")?.textContent, "1 of 4 reviewed");
+    const marked = filmstrip().find((thumb) => thumb.dataset.evidenceId === "viewport-3")!;
+    assert.ok(marked.hasAttribute("data-reviewed"), "the filmstrip shows the mark");
+    assert.ok(marked.querySelector(".ev-strip-mark"));
+    assert.equal(marked.textContent, "Screenshot 3, Reviewed");
+    assert.equal(domWindow.document.activeElement, viewerButton("Mark Reviewed and Next") as unknown as Element,
+      "focus stays on the primary to review the next item");
+    await act(async () => viewerButton("Mark Reviewed and Next").click());
+    assertNoDomNode(viewer(), "the last item closes the viewer");
+    assert.equal(view.container.querySelector(".ev-progress")?.textContent, "2 of 4 reviewed");
+    await settleFocus();
+    assert.equal(domWindow.document.activeElement, view.tile("viewport-4").querySelector(".ev-thumb"),
+      "focus returns to the tile of the item last shown");
+
+    // The viewer's Reviewed checkbox clears a mark as the tile's does.
+    await openTile(view, "viewport-4");
+    const reviewed = viewer()!.querySelector<HTMLInputElement>(".modal-foot input[type=checkbox]")!;
+    assert.equal(reviewed.checked, true);
+    await act(async () => reviewed.click());
+    assert.equal(view.container.querySelector(".ev-progress")?.textContent, "1 of 4 reviewed");
+  } finally {
+    await view.unmount();
+  }
+});
+
+test("closing the viewer after stepping returns focus to the tile of the item last shown", async () => {
+  domWindow.localStorage.clear();
+  const view = await mount(sessionWith(screenshots(4)), async () => new Blob([PNG]));
+  try {
+    await view.decode("load");
+    await openTile(view, "viewport-1");
+    await press("ArrowRight");
+    await press("ArrowRight");
+    assert.equal(viewerTitle(), "Screenshot 3 of 4");
+    await press("Escape");
+    assertNoDomNode(viewer());
+    await settleFocus();
+    assert.equal(domWindow.document.activeElement, view.tile("viewport-3").querySelector(".ev-thumb"));
+  } finally {
+    await view.unmount();
+  }
+});
+
+test("marks made in the viewer survive a reload", async () => {
+  domWindow.localStorage.clear();
+  const first = await mount(sessionWith(screenshots(4)), async () => new Blob([PNG]));
+  try {
+    await first.decode("load");
+    await openTile(first, "viewport-1");
+    await act(async () => viewerButton("Mark Reviewed and Next").click());
+    await act(async () => viewerButton("Mark Reviewed and Next").click());
+    assert.equal(viewerTitle(), "Screenshot 3 of 4");
+  } finally {
+    await first.unmount();
+  }
+  const reloaded = await mount(sessionWith(screenshots(4)), async () => new Blob([PNG]));
+  try {
+    await reloaded.decode("load");
+    assert.equal(reloaded.container.querySelector(".ev-progress")?.textContent, "2 of 4 reviewed");
+    assert.equal(reloaded.checkbox("Screenshot 1")!.checked, true);
+    assert.equal(reloaded.checkbox("Screenshot 2")!.checked, true);
+    assert.equal(reloaded.checkbox("Screenshot 3")!.checked, false);
+    await openTile(reloaded, "viewport-2");
+    assert.deepEqual(filmstrip().map((thumb) => thumb.hasAttribute("data-reviewed")), [true, true, false, false]);
+  } finally {
+    await reloaded.unmount();
+    domWindow.localStorage.clear();
+  }
+});
+
+test("stepping onto an item still loading keeps focus in the viewer, and closing there returns it to that tile", async () => {
+  domWindow.localStorage.clear();
+  // Screenshot 2's download is held, so the viewer moves onto an item it cannot show yet.
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const view = await mount(sessionWith(screenshots(3)), async (artifactId) => {
+    if (artifactId === "art_2") await held;
+    return new Blob([PNG]);
+  });
+  try {
+    await view.decode("load");
+    await openTile(view, "viewport-1");
+    const primary = viewerButton("Mark Reviewed and Next");
+    assert.equal(domWindow.document.activeElement, primary as unknown as Element);
+    await act(async () => primary.click());
+    assert.equal(viewerTitle(), "Screenshot 2 of 3");
+    assert.equal(viewer()?.querySelector(".ev-viewer-stage .ev-loading")?.textContent, "Loading…");
+    assert.equal(primary.getAttribute("aria-disabled"), "true", "an item not shown yet cannot be marked");
+    assert.equal(primary.disabled, false, "but the primary keeps focus rather than dropping it out of the dialog");
+    assert.equal(domWindow.document.activeElement, primary as unknown as Element);
+    await act(async () => primary.click());
+    assert.equal(viewerTitle(), "Screenshot 2 of 3", "activating the unavailable primary does nothing");
+    assert.equal(view.container.querySelector(".ev-progress")?.textContent, "1 of 3 reviewed");
+    await press("ArrowLeft");
+    assert.equal(viewerTitle(), "Screenshot 1 of 3", "the arrow keys still reach the viewer");
+    await press("ArrowRight");
+    await press("Escape");
+    assertNoDomNode(viewer());
+    await settleFocus();
+    assert.equal(domWindow.document.activeElement, view.tile("viewport-2"),
+      "focus returns to the loading item's own tile, not to the tile the viewer was opened from");
+    release();
+    for (let turn = 0; turn < 6; turn += 1) await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  } finally {
+    release();
+    await view.unmount();
+  }
+});
+
+test("focus stays in the viewer when another item fails and takes the filmstrip with it", async () => {
+  domWindow.localStorage.clear();
+  // Screenshot 2 is held, then turns out not to match: the viewer is left with one item and no filmstrip.
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const view = await mount(sessionWith(screenshots(2)), async (artifactId) => {
+    if (artifactId !== "art_2") return new Blob([PNG]);
+    await held;
+    return new Blob([Buffer.from("substituted")]);
+  });
+  try {
+    await view.decode("load");
+    await openTile(view, "viewport-1");
+    const thumb = filmstrip()[0]!;
+    thumb.focus();
+    assert.equal(domWindow.document.activeElement, thumb as unknown as Element);
+    release();
+    await settle(() => view.tile("viewport-2").querySelector(".ev-blocked-label")?.textContent === "Doesn't Match",
+      "Screenshot 2 to read Doesn't Match");
+    assert.equal(viewerTitle(), "Screenshot 1 of 2", "the item shown stays");
+    assert.deepEqual(filmstrip(), [], "one item left has no filmstrip");
+    assert.equal(domWindow.document.activeElement, viewerButton("Mark Reviewed and Next") as unknown as Element,
+      "focus moves to the primary instead of falling out of the dialog");
+  } finally {
+    release();
+    await view.unmount();
+  }
+});
+
+test("an item that fails while the viewer shows it leaves the viewer, and its tile says why", async () => {
+  domWindow.localStorage.clear();
+  const view = await mount(sessionWith(screenshots(2)), async () => new Blob([PNG]));
+  try {
+    await view.decode("load");
+    await openTile(view, "viewport-2");
+    const image = viewer()!.querySelector<HTMLImageElement>(".ev-viewer-stage img")!;
+    await act(async () => { image.dispatchEvent(new domWindow.Event("error") as unknown as Event); });
+    assertNoDomNode(viewer(), "bytes that cannot be drawn are never left on screen as evidence");
+    assert.equal(view.tile("viewport-2").querySelector(".ev-blocked-label")?.textContent, "Can't Load");
+    assertNoDomNode(view.checkbox("Screenshot 2"));
+  } finally {
+    await view.unmount();
   }
 });
