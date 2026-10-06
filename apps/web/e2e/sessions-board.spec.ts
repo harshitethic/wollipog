@@ -14,7 +14,7 @@ const PAGE = "/sessions-board-e2e.html";
 
 async function openHarness(page: Page, path = "/") {
   await page.goto(`${PAGE}?path=${encodeURIComponent(path)}`);
-  await expect(page.locator(".inbox-list-pane > .toolbar")).toBeVisible();
+  await expect(page.locator(".page-tabs .tabs-bar")).toBeVisible();
 }
 
 function harnessPath(page: Page): string | null {
@@ -23,10 +23,10 @@ function harnessPath(page: Page): string | null {
 
 /** The Sessions tab row's search field against its tabs, measured in the page. */
 function toolbarGeometry(page: Page) {
-  return page.locator(".inbox-list-pane > .toolbar").evaluate((toolbar) => {
+  return page.locator(".page-tabs .tabs-bar").evaluate((toolbar) => {
     const input = toolbar.querySelector<HTMLInputElement>(".inbox-search input")!;
     const search = input.closest(".inbox-search")!.getBoundingClientRect();
-    const tabs = toolbar.querySelector(".inbox-tabs")!.getBoundingClientRect();
+    const tabs = toolbar.querySelector(".tabs")!.getBoundingClientRect();
     // An input's scrollWidth ignores its placeholder, so the placeholder is measured in the input's font.
     const style = getComputedStyle(input);
     const context = document.createElement("canvas").getContext("2d")!;
@@ -36,7 +36,13 @@ function toolbarGeometry(page: Page) {
       inputWidth: input.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
       placeholderWidth: context.measureText(input.placeholder).width,
       searchOwnRow: search.bottom <= tabs.top || search.top >= tabs.bottom,
-      contained: toolbar.scrollWidth <= toolbar.clientWidth,
+      // Every part of the bar is inside it. A touch target's hit area (`::after`) may reach into
+      // the page gutter, so the parts are measured rather than the bar's scrollWidth.
+      contained: [...toolbar.children].every((child) => {
+        const box = child.getBoundingClientRect();
+        const bar = toolbar.getBoundingClientRect();
+        return box.left >= bar.left - 0.5 && box.right <= bar.right + 0.5;
+      }),
     };
   });
 }
@@ -481,7 +487,7 @@ test("long-pressed rows and cards pin their target, persist the state, and expos
   await expect(page.locator(".inbox-view.expanded")).toHaveCount(0);
 
   await page.reload();
-  await expect(page.locator(".inbox-list-pane > .toolbar")).toBeVisible();
+  await expect(page.locator(".page-tabs .tabs-bar")).toBeVisible();
   const persistedQueued = page.locator(".inbox-row-shell", { hasText: "Queued Session" });
   await expect(persistedQueued.getByLabel("Pinned Session")).toBeVisible();
   await persistedQueued.click({ button: "right" });

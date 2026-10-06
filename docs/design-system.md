@@ -823,9 +823,10 @@ A row of tools above the content they act on: search, filters, view switches and
 
 - `.toolbar`: one row, `display: flex; align-items: center; gap: var(--space-2); min-width: 0`.
   Every control in it uses one control height (§3.2).
-- The toolbar is only the row. Where it sits (the Sessions tab bar, the Archive filter card, the
+- The toolbar is only the row. Where it sits (the Board's filters, the Archive filter card, the
   space above a machine list) is the region's decision, written as that region's rule on
-  `.toolbar` (`.inbox-list-pane > .toolbar`). Regions do not define their own toolbar class.
+  `.toolbar` (`.board-wrap > .toolbar`). Regions do not define their own toolbar class. The
+  Sessions tab row's tools sit in its tab bar's `.tabs-tools` (§10.1).
 - `.filter-btn` (`FilterButton`) is the phone "Filters" button that opens the filter sheet (§15.1):
   a `.btn` that says "Filters", with `aria-haspopup="dialog"`. While any filter is applied it is
   `.is-set`, which gives it the `--control-outline` edge of a chosen control (§3.1), and it shows
@@ -1451,8 +1452,16 @@ compact widths, detail sub-views.
 - Counts: 4px after the label, `--type-micro` `--text-faint`, tabular. An attention count uses a warning
   count badge (§11.4) instead.
 - Overflow: horizontal scroll with a 24px edge fade on the clipped side; the active tab scrolls into
-  view on load. On phones, more than 4 tabs become a Select-styled "view picker" in the app bar.
+  view on load, clear of the fade. On phones, more than 4 tabs become a Select-styled "view picker"
+  in the app bar.
 - Tabs change the URL.
+- **Tab bar** (`.tabs-bar`, Sessions' groups, #2180): a row of user-named tabs that can run long.
+  The tab row, then a `.icon-btn.sm` list button (`ChevronDown`, "All Groups") that opens a §9.1
+  menu of `menuitemradio` rows, one per tab in tab order (the name, the plain count, its badges and
+  the trailing check on the current one), then `.tabs-tools` at the far end for the row's tools
+  (search, filters). A tab's label is at most 200px and ends in an ellipsis, with the full name in
+  its tooltip; the count and badges never truncate. Two tabs with the same name add what tells them
+  apart as quiet text ("Docs Site on Build Server 02").
 
 ### 10.2 Segmented Control (Switch the Mode or Filter of the Same Content)
 
