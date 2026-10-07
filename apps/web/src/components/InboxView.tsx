@@ -1,5 +1,5 @@
 import { type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { prioritizedPendingRequests, providerSupportsConversationFork, type SessionReminderView, type SessionView, type SetSessionReminderRequest, type SnoozeScheduleInput, type SourceLocation } from "@wollipog/protocol";
+import { prioritizedPendingRequests, providerSupportsConversationFork, type BoardColumn, type SessionReminderView, type SessionView, type SetSessionReminderRequest, type SnoozeScheduleInput, type SourceLocation } from "@wollipog/protocol";
 import { archiveAndStopMessage, archiveResultMessage, archiveResultTone, sessionArchiveRequiresStop } from "../archive-actions.js";
 import { sessionArchiveActionRefusal, sessionCommandRefusal } from "../session-command-permissions.js";
 import {
@@ -66,7 +66,7 @@ import { PageHeader } from "./PageHeader.js";
 import { shortcutDisplay } from "../shortcuts.js";
 import { sessionDisplayTitle } from "../session-title.js";
 import { Board } from "./Board.js";
-import { BoardFilterTools } from "./BoardFilters.js";
+import { BoardFiltersSheet, BoardFilterStrip, BoardFilterTools } from "./BoardFilters.js";
 import type { SessionsViewMode } from "../sessions-view-mode.js";
 import { loadSessionsListWidth, saveSessionsListWidth, type SessionsPreviewLayout } from "../sessions-preview-layout.js";
 import { useSessionsPreviewLayout } from "../use-sessions-preview-layout.js";
@@ -246,6 +246,10 @@ export function InboxView({
   // Board mode renders no list rows, so the browsing-order lease has nothing to protect there —
   // and a hold captured on the board would present a stale "Apply New Order" back in list mode.
   const boardMode = viewMode === "board" && expandedSessionId === null;
+  // The phone Board's column (#2216) lives here rather than in the Board, which No Matches replaces
+  // while a search finds nothing; it is forgotten when the Board closes.
+  const [boardColumn, setBoardColumn] = useState<BoardColumn | null>(null);
+  if (!boardMode && boardColumn !== null) setBoardColumn(null);
   const browsingOrderLease = expandedSessionId === null && !boardMode && (isMobile || !inboxAway);
   const browsingOrderLeaseRef = useRef(browsingOrderLease);
   browsingOrderLeaseRef.current = browsingOrderLease;
@@ -1510,7 +1514,8 @@ export function InboxView({
         // While the page's state offers New Session, the bar does not (§12.1, #2220).
         onNewSession={stateOffersNewSession ? undefined : newSession}
         newSessionShortcut={shortcutDisplay("new-session")}
-        boardTools={boardMode ? <BoardFilterTools sessions={boardSessions} /> : undefined}
+        boardFilters={boardMode ? <BoardFiltersSheet sessions={boardSessions} /> : undefined}
+        boardFilterStrip={boardMode ? <BoardFilterStrip sessions={boardSessions} /> : undefined}
       />
     )}
     {!expanded && !isMobile && (
@@ -1696,6 +1701,8 @@ export function InboxView({
             }}
             onNewSession={newSession}
             onSessionMenu={openSessionMenuAt}
+            column={boardColumn}
+            onColumnChange={setBoardColumn}
           />
         ) : listSkeleton ? (
           <SessionsListSkeleton count={syncingCount} threeRow={isMobile} />
