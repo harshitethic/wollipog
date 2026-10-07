@@ -991,7 +991,7 @@ variant by default and offers side by side as a user preference (§6.3).
   (§6.2). `.master-detail-state` takes both panes' place for an empty collection or a load error
   (§6.1, §12). `DetailSkeleton` (`common.tsx`) is the detail's loading state. The page resets the
   detail's `scrollTop` on each route, and on a phone it restores the list's position on Back. The
-  resize handle is not built yet.
+  side-by-side resize handle is not built yet; Sessions' stacked divider is (§6.3).
 
 ### 6.1 The Default Detail State (No Selection)
 
@@ -1062,8 +1062,9 @@ master-detail pages stay side by side.
   own trailing column, so hover never hides the time or the status.
 - **Keyboard.** F6 and Shift+F6 cycle rail → list → preview (§16.1). ↑/↓ move the selection and the
   preview follows; keys that act on the previewed item (page the preview, approve, open) work while
-  focus stays in the list. Tab from the list reaches the divider, then the preview bar. Escape in the
-  preview returns focus to the selected row.
+  focus stays in the list. Tab and Shift+Tab in the list switch groups (kept by epic #2227, #2180),
+  so the divider is reached with F6 into the preview, then Shift+Tab back through it; in the preview
+  Tab and Shift+Tab are plain focus moves. Escape in the preview returns focus to the selected row.
 - **Side by side as a preference.** Sessions offers the §6 side-by-side grid as **Preview Right**
   (list 400px, 280–440, vertical divider with the hover-only grip of §6). The choice is a per-device
   preference with **Preview Below** as the default; it is set by an icon segmented control right
@@ -1073,6 +1074,21 @@ master-detail pages stay side by side.
   is always stacked and the control is hidden, which also keeps the compact header to its budget
   (§15.2). Phones have no preview (§6.2), whatever the preference.
 - **Empty.** An empty list replaces both panes with one state (§6.1); no divider is drawn.
+- **Built (#2217), Preview Below.** `.inbox-view` takes `.master-detail.sessions-md` on desktop and
+  tablet, and stays a flex column on a phone, on the board and in an open session. InboxView measures
+  the split area and `--row-h-2` and sets `--sessions-list-rows` (the stored ratio's whole rows, in
+  `sessions-split.ts`); the grid derives `--sessions-list-h` from it, so a density change keeps whole
+  rows. A drag sets `--sessions-list-h` on the grid until the release snaps it, and only a release or
+  a key stores a ratio: the middle of the chosen row, so a reload rounds back to the same count. The
+  panes and `.master-detail-resize` are placed by grid row, so Preview Right (#2219) can place them by
+  column. The divider draws the hairline itself, on the preview's first pixel, so the list's last row
+  keeps its full height; its keyboard focus draws the 2px `--focus` line over a transparent outline,
+  which forced colors paints. The stored range stays 25–75% and bounds the row range too, so every
+  count survives a reload: where the split area is taller than about 930px (56px rows) Home stops at
+  the 25% floor rather than three rows, and End at the 75% cap. An unfinished drag (the divider
+  unmounts for the board or a phone width) clears its height. The docked request card at the top of
+  the preview sits in an opaque slot with a 1px `--border` hairline and `--elev-1`, so the transcript
+  visibly scrolls beneath it.
 
 ---
 
