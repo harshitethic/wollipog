@@ -24,6 +24,7 @@ import { RequestDock, dockRequests } from "./RequestDock.js";
 import { decideDockedRequest, revealDockedRequest } from "./request-reveal.js";
 import type { FollowTailState } from "../../useFollowTail.js";
 import { SessionNoticeSlot } from "../SessionNoticeSlot.js";
+import { useIsMobile } from "../useIsMobile.js";
 
 const domWindow = new Window({ url: "http://localhost/" });
 installDomTestCleanup(domWindow);
@@ -377,13 +378,335 @@ test("a machine-owner-only sign-in shows its reason as text and the button refer
       .find((button) => button.textContent === "Start Sign-In")!;
     assert.equal(start.disabled, true);
     assert.equal(domWindow.document.getElementById(start.getAttribute("aria-describedby")!)?.textContent,
-      "Only the machine owner or an organization admin can start sign-in.");
+      "Only a machine owner or organization admin can sign in on this machine.");
     const dismiss = [...mountPoint.querySelectorAll<HTMLButtonElement>(".request-card-foot button")]
       .find((button) => button.textContent === "Dismiss Recovery")!;
     assert.equal(dismiss.disabled, false, "the other choices stay available");
   } finally {
     await act(async () => root.unmount());
     mountPoint.remove();
+  }
+});
+
+/** A Request Card with the session's runner in the store, as the dock renders it. */
+async function renderWithRunner(element: React.ReactElement, runner: Partial<RunnerView>, client: Partial<ApiClient> = {}) {
+  const mountPoint = domWindow.document.createElement("div") as unknown as HTMLDivElement;
+  domWindow.document.body.append(mountPoint as never);
+  const root = createRoot(mountPoint);
+  class FakeSocket implements UiSocket {
+    readonly readyState = UI_SOCKET_OPEN;
+    onopen: (() => void) | null = null;
+    onmessage: ((event: { data: string }) => void) | null = null;
+    onclose: ((event: { code: number }) => void) | null = null;
+    onerror: (() => void) | null = null;
+    send() {}
+    close() {}
+    push(message: ControlPlaneToUi) { this.onmessage?.({ data: JSON.stringify(message) }); }
+  }
+  const socket = new FakeSocket();
+  const connection: UiConnectionRuntime = {
+    instanceId: "request-card-runner",
+    runtimeKey: "request-card-runner:1",
+    createSocket: () => socket,
+    onCredentialChange: () => () => {},
+    close() {},
+  };
+  const navigation: ViewNavigation = { current: () => ({ name: "inbox" }), push: () => {}, listen: () => () => {} };
+  const fullClient = {
+    ...api,
+    listAllSessions: async () => ({ sessions: [] }),
+    authenticationCurrentIdentity: async () => ({
+      identity: { status: "authenticated", emailSupported: true, email: "person@example.test", observedAt: Date.now() },
+    }),
+    authenticationAccounts: async () => ({ accounts: [] }),
+    ...client,
+  } as unknown as ApiClient;
+  const draw = (next: React.ReactElement) => (
+    <ApiProvider client={fullClient}>
+      <StoreProvider connection={connection} navigation={navigation}>{next}</StoreProvider>
+    </ApiProvider>
+  );
+  await act(async () => { root.render(draw(element)); await Promise.resolve(); });
+  const snapshot = {
+    type: "snapshot",
+    capabilities: { sessionSubscriptions: false, boundedDelivery: false, paginatedSessionHistory: false, projects: true },
+    runners: [{
+      runnerId: "runner-1", hostname: "studio", displayName: "Studio", os: "linux", status: "online", agents: [],
+      workspaces: [], connectedAt: 1, lastSeen: 1, protocolVersion: 999, canManage: true, providerLogins: [], ...runner,
+    }],
+    boxes: [], sessions: [], runs: [], pods: [],
+  } as unknown as UiSnapshotMessage;
+  await act(async () => { socket.push(snapshot); await tick(); await tick(); });
+  return {
+    container: mountPoint as unknown as HTMLElement,
+    unmount: async () => { await act(async () => root.unmount()); mountPoint.remove(); },
+  };
+}
+
+/** The runner's sign-in options (session-manager.ts `providerAuthenticationOptions`, acp.ts `chooseAuthMethod`). */
+const AUTH = {
+  acceptCurrent: { optionId: "auth:accept-current", name: "Use Current Account", kind: "allow_once" },
+  login: { optionId: "auth:login", name: "Start Sign-In", kind: "allow_once" },
+  revalidate: { optionId: "auth:revalidate", name: "Recheck Authentication", kind: "allow_once" },
+  dismiss: { optionId: "auth:dismiss", name: "Dismiss Recovery", kind: "reject_once" },
+  cancel: { optionId: "auth:cancel", name: "Cancel Sign-In", kind: "reject_once" },
+} as const;
+const recovery = (options: PendingApproval["options"], title = "Authentication Required — Claude Code"): PendingApproval => ({
+  requestId: "provider-auth:card", kind: "authentication", title, options,
+  context: { toolName: "Claude Code", input: "Provider: Claude Code\nRun `claude auth login` in that exact context." },
+});
+const signInSession = (request: PendingApproval, overrides: Partial<SessionView> = {}) =>
+  sessionWith(request, { providerAccountId: "claude-work", providerAccountLabel: "Claude Work", ...overrides });
+
+test("each sign-in state has exactly one primary, or only Cancel Sign-In while a sign-in runs (#2198)", async () => {
+  const methods = recovery([
+    { optionId: "auth_1_method_1", name: "OpenCode Zen", kind: "allow_once", description: "Sign in at opencode.ai." },
+    { optionId: "auth_1_method_2", name: "API key", kind: "allow_once", description: "Read the key from this machine." },
+    { optionId: "auth_1_cancel", name: "Cancel sign-in", kind: "reject_once" },
+  ], "Sign in to OpenCode");
+  const cases: Array<[string, PendingApproval, Partial<SessionView>, string[], boolean]> = [
+    ["signed in as a different account", recovery([AUTH.acceptCurrent, AUTH.revalidate, AUTH.dismiss]), {},
+      ["Dismiss Recovery", "Choose Another Account…", "Use Current Account (primary)"], true],
+    ["a different account, where the runner can also sign in", recovery([AUTH.acceptCurrent, AUTH.login, AUTH.revalidate,
+      AUTH.dismiss]), {}, ["Dismiss Recovery", "Start Sign-In", "Choose Another Account…", "Use Current Account (primary)"], true],
+    ["signed out", recovery([AUTH.login, AUTH.revalidate, AUTH.dismiss]), {},
+      ["Dismiss Recovery", "Choose Another Account…", "Start Sign-In (primary)"], true],
+    ["signed out on the machine's default sign-in", recovery([AUTH.login, AUTH.revalidate, AUTH.dismiss]),
+      { providerAccountId: undefined, providerAccountLabel: undefined },
+      ["Dismiss Recovery", "Start Sign-In (primary)"], true],
+    ["read-only", recovery([AUTH.revalidate, AUTH.dismiss]), {},
+      ["Dismiss Recovery", "Choose Another Account…", "Recheck Authentication (primary)"], false],
+    ["sign-in methods", methods, { driver: "acp" }, ["Cancel Sign-In", "Start Sign-In (primary)"], false],
+    ["sign-in running", recovery([AUTH.cancel], "Signing In — Claude Code"), {}, ["Cancel Sign-In"], false],
+  ];
+  for (const [state, request, overrides, expected, checkAgain] of cases) {
+    const view = await renderWithRunner(
+      <RequestCard session={signInSession(request, overrides)} request={request} runnerOnline presentation="dock" />, {});
+    try {
+      assert.deepEqual(footer(view.container), expected, state);
+      assert.equal(view.container.querySelectorAll(".request-card .primary").length, expected.some((name) =>
+        name.endsWith("(primary)")) ? 1 : 0, `${state}: one primary in the whole card`);
+      const check = [...view.container.querySelectorAll("button")].find((button) => button.textContent === "Check Again");
+      assert.equal(Boolean(check), checkAgain, `${state}: Check Again`);
+      assert.equal(view.container.querySelector(".request-card button[title]")?.outerHTML ?? null, null, `${state}: no button has a title`);
+      assert.equal(view.container.querySelector(".request-card-head svg.lucide-key-round") !== null, true, `${state}: KeyRound`);
+    } finally {
+      await view.unmount();
+    }
+  }
+});
+
+test("without the recovery body, Recheck Authentication stays a footer secondary", async () => {
+  // The Requests panel reads a Claude Code child's sign-in with its ACP parent's driver, so the
+  // recovery body (and its Check Again) does not render there.
+  const decisions: unknown[] = [];
+  const request = recovery([AUTH.login, AUTH.revalidate, AUTH.dismiss]);
+  const view = await renderWithRunner(
+    <RequestCard session={signInSession(request, { driver: "acp" })} request={request} runnerOnline presentation="panel" />, {},
+    { approve: async (_id, body) => { decisions.push(body); return signInSession(request); } },
+  );
+  try {
+    assert.deepEqual(footer(view.container), ["Dismiss Recovery", "Recheck Authentication", "Start Sign-In (primary)"]);
+    assert.equal(view.container.querySelectorAll(".request-card .primary").length, 1);
+    const recheck = [...view.container.querySelectorAll<HTMLButtonElement>(".request-card-foot > button")]
+      .find((button) => button.textContent === "Recheck Authentication")!;
+    await act(async () => { recheck.click(); await tick(); await tick(); });
+    assert.deepEqual(decisions, [{ requestId: "provider-auth:card", optionId: "auth:revalidate" }]);
+  } finally {
+    await view.unmount();
+  }
+});
+
+test("Check Again on the Last Checked fact runs the runner's recheck; Dismiss Recovery sits at the far left", async () => {
+  const decisions: unknown[] = [];
+  const request = recovery([AUTH.acceptCurrent, AUTH.revalidate, AUTH.dismiss]);
+  const view = await renderWithRunner(
+    <RequestCard session={signInSession(request)} request={request} runnerOnline presentation="dock" />, {},
+    { approve: async (_id, body) => { decisions.push(body); return signInSession(request); } },
+  );
+  try {
+    const lastChecked = [...view.container.querySelectorAll("dt")].find((dt) => dt.textContent === "Last Checked")!;
+    const check = lastChecked.nextElementSibling!.querySelector<HTMLButtonElement>("button")!;
+    assert.equal(check.textContent, "Check Again");
+    await act(async () => { check.click(); await tick(); await tick(); });
+    assert.deepEqual(decisions, [{ requestId: "provider-auth:card", optionId: "auth:revalidate" }]);
+    const dismiss = view.container.querySelector(".request-card-foot > button")!;
+    assert.equal(dismiss.textContent, "Dismiss Recovery");
+    assert.ok(dismiss.classList.contains("request-card-tertiary") && dismiss.classList.contains("ghost"));
+    // The runner's guidance waits behind Request Details; the facts lead.
+    assert.equal(view.container.querySelector(".request-card-body > .code-well")?.outerHTML ?? null, null);
+    assert.ok(view.container.querySelector(".request-card-body > details.disclosure .code-well"));
+    assert.equal(view.container.querySelector('.request-card-body dl[aria-label="Policy Match Context"]')?.outerHTML ?? null, null);
+  } finally {
+    await view.unmount();
+  }
+});
+
+test("on a phone, Dismiss Recovery and Choose Another Account… overflow into ⋯, and focus follows a crossing", async () => {
+  const decisions: unknown[] = [];
+  let settle: () => void = () => undefined;
+  const request = recovery([AUTH.acceptCurrent, AUTH.revalidate, AUTH.dismiss]);
+  const setViewport = async (width: number) => {
+    await act(async () => { domWindow.happyDOM.setViewport({ width, height: 844 }); await tick(); });
+  };
+  await setViewport(390);
+  const view = await renderWithRunner(
+    <RequestCard session={signInSession(request)} request={request} runnerOnline presentation="dock" />, {},
+    {
+      approve: async (_id, body) => {
+        decisions.push(body);
+        if ((body as { optionId: string }).optionId === "auth:accept-current") await new Promise<void>((done) => { settle = done; });
+        return signInSession(request);
+      },
+    },
+  );
+  const items = () => [...(domWindow.document.querySelectorAll('[data-request-card-menu] [role="menuitem"]') as unknown as NodeListOf<HTMLElement>)];
+  const button = (name: string) => [...view.container.querySelectorAll<HTMLButtonElement>(".request-card-foot > button")]
+    .find((candidate) => (candidate.getAttribute("aria-label") ?? candidate.textContent) === name);
+  try {
+    assert.deepEqual(footer(view.container), ["More Choices", "Use Current Account (primary)"], "one phone row");
+    const more = button("More Choices")!;
+    assert.equal(more.hasAttribute("title"), false, "no button in the sign-in card has a title");
+    await act(async () => { more.click(); await tick(); });
+    assert.deepEqual(items().map((item) => item.querySelector(".menu-label")?.textContent ?? item.textContent),
+      ["Choose Another Account…", "Dismiss Recovery"]);
+    await act(async () => { items()[0]!.click(); await tick(); await tick(); });
+    assert.ok(view.container.querySelector(".auth-recovery-accounts"), "the menu item opens the other accounts");
+
+    // While a decision is sent, the menu's Choose Another Account… is unavailable, as the button is.
+    await act(async () => { button("Use Current Account")!.click(); await tick(); });
+    await act(async () => { more.click(); await tick(); });
+    if (items().length === 0) {
+      // The trigger refuses clicks while busy; a keyboard can still open the menu.
+      await act(async () => {
+        more.focus();
+        more.dispatchEvent(new domWindow.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }) as unknown as Event);
+        await tick();
+      });
+    }
+    const choose = items().find((item) => item.textContent?.startsWith("Choose Another Account…"));
+    assert.equal(choose?.getAttribute("aria-disabled"), "true");
+    await act(async () => { choose?.click(); await tick(); });
+    assert.ok(view.container.querySelector(".auth-recovery-accounts"), "still open: the click did nothing");
+    await act(async () => { settle(); await tick(); await tick(); });
+    await act(async () => { body().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await tick(); });
+
+    // Widening with focus in the open phone menu closes it and hands focus to Choose Another Account….
+    await act(async () => { more.click(); await tick(); });
+    if (items().length > 0) await act(async () => { items()[0]!.focus(); await tick(); });
+    await setViewport(1440);
+    assert.equal(items().length, 0, "the menu went with its trigger");
+    assert.deepEqual(footer(view.container), ["Dismiss Recovery", "Choose Another Account…", "Use Current Account (primary)"]);
+    assert.equal(domWindow.document.activeElement?.textContent, "Choose Another Account…");
+
+    // Narrowing with focus on a swapped control hands it to the ⋯.
+    await setViewport(390);
+    assert.equal(domWindow.document.activeElement?.getAttribute("aria-label"), "More Choices");
+    assert.deepEqual(decisions, [{ requestId: "provider-auth:card", optionId: "auth:accept-current" }]);
+  } finally {
+    await view.unmount();
+    await setViewport(1024);
+  }
+});
+
+test("crossing the phone breakpoint keeps focus in the card that held it, even while a decision is sent", async () => {
+  const setViewport = async (width: number) => {
+    await act(async () => { domWindow.happyDOM.setViewport({ width, height: 844 }); await tick(); });
+  };
+  const first = recovery([AUTH.acceptCurrent, AUTH.revalidate, AUTH.dismiss]);
+  const second = { ...recovery([AUTH.login, AUTH.revalidate, AUTH.dismiss]), requestId: "provider-auth:second" };
+  let settle: () => void = () => undefined;
+  await setViewport(390);
+  // The dock as SessionDetail renders it, beside a Requests panel card, under a parent that re-renders
+  // at the breakpoint (as SessionDetail does): each owns focus in its own menu.
+  function Page() {
+    const phone = useIsMobile();
+    return (
+      <div data-phone={phone}>
+        <RequestDock session={signInSession(first)} requests={[first]} runnerOnline />
+        <RequestCard session={signInSession(second, { id: "session-second" })} request={second} runnerOnline presentation="panel" />
+      </div>
+    );
+  }
+  const view = await renderWithRunner(<Page />, {},
+    { approve: async () => { await new Promise<void>((done) => { settle = done; }); return signInSession(first); } },
+  );
+  const cards = () => [...view.container.querySelectorAll<HTMLElement>(".request-card")];
+  const items = () => [...(domWindow.document.querySelectorAll('[data-request-card-menu] [role="menuitem"]') as unknown as NodeListOf<HTMLElement>)];
+  const more = (card: HTMLElement) => card.querySelector<HTMLButtonElement>('.request-card-foot > button[aria-label="More Choices"]')!;
+  try {
+    // Two sign-in cards: focus in the second card's menu stays with the second card when widening.
+    await act(async () => { more(cards()[1]!).click(); await tick(); });
+    await act(async () => { items()[0]!.focus(); await tick(); });
+    await setViewport(1440);
+    assert.ok(cards()[1]!.contains(domWindow.document.activeElement as unknown as Node),
+      "the other card does not take focus from this one's menu");
+    assert.equal(domWindow.document.activeElement?.textContent, "Choose Another Account…");
+
+    // Dismiss Recovery from the phone menu, still being sent: widening finds Choose Another Account…
+    // disabled, so the card's heading takes focus.
+    await setViewport(390);
+    await act(async () => { more(cards()[0]!).click(); await tick(); });
+    const dismiss = items().find((item) => item.textContent?.startsWith("Dismiss Recovery"))!;
+    await act(async () => { dismiss.click(); await tick(); });
+    await act(async () => { more(cards()[0]!).focus(); await tick(); });
+    await setViewport(1440);
+    assert.equal(domWindow.document.activeElement?.classList.contains("request-card-title"), true);
+    assert.ok(cards()[0]!.contains(domWindow.document.activeElement as unknown as Node));
+  } finally {
+    await act(async () => { settle(); await tick(); });
+    await view.unmount();
+    await setViewport(1024);
+  }
+});
+
+test("Choose Another Account… opens the Machine's other accounts in the card body", async () => {
+  const request = recovery([AUTH.acceptCurrent, AUTH.revalidate, AUTH.dismiss]);
+  const view = await renderWithRunner(
+    <RequestCard session={signInSession(request)} request={request} runnerOnline presentation="dock" />, {},
+  );
+  try {
+    const choose = [...view.container.querySelectorAll<HTMLButtonElement>(".request-card-foot button")]
+      .find((button) => button.textContent === "Choose Another Account…")!;
+    assert.equal(choose.getAttribute("aria-expanded"), "false");
+    assertNoDomNode(view.container.querySelector(".auth-recovery-accounts"), "closed until asked");
+    await act(async () => { choose.click(); await tick(); await tick(); });
+    assert.equal(choose.getAttribute("aria-expanded"), "true");
+    const list = domWindow.document.getElementById(choose.getAttribute("aria-controls")!);
+    assert.ok(list?.classList.contains("auth-recovery-accounts"));
+  } finally {
+    await view.unmount();
+  }
+});
+
+test("a sign-in agent's methods are choice rows with visible descriptions and one Start Sign-In", async () => {
+  const decisions: unknown[] = [];
+  const request = recovery([
+    { optionId: "auth_1_method_1", name: "OpenCode Zen", kind: "allow_once", description: "Sign in at opencode.ai." },
+    { optionId: "auth_1_method_2", name: "API key", kind: "allow_once", description: "Read the key from this machine." },
+    { optionId: "auth_1_cancel", name: "Cancel sign-in", kind: "reject_once" },
+  ], "Sign in to OpenCode");
+  const view = await render(
+    <RequestCard session={sessionWith(request, { driver: "acp" })} request={request} runnerOnline presentation="dock" />,
+    { approve: async (_id, body) => { decisions.push(body); return sessionWith(request); } },
+  );
+  try {
+    const group = view.container.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Sign-In Methods"]')!;
+    assert.ok(group);
+    assert.deepEqual([...group.querySelectorAll(".choice-row-title")].map((title) => title.textContent),
+      ["OpenCode Zen", "API Key"], "names in Title Case, acronyms kept");
+    assert.deepEqual([...group.querySelectorAll(".choice-row-desc")].map((desc) => desc.textContent),
+      ["Sign in at opencode.ai.", "Read the key from this machine."]);
+    assert.equal(group.querySelector("[title]")?.outerHTML ?? null, null, "descriptions are visible, not tooltips");
+    const radios = [...group.querySelectorAll<HTMLInputElement>('input[type="radio"]')];
+    assert.equal(radios[0]!.checked, true, "the first method is chosen until another is");
+    await act(async () => { radios[1]!.click(); await tick(); });
+    const start = view.container.querySelector<HTMLButtonElement>(".request-card-foot .primary")!;
+    assert.equal(start.textContent, "Start Sign-In");
+    await act(async () => { start.click(); await tick(); });
+    assert.deepEqual(decisions, [{ requestId: "provider-auth:card", optionId: "auth_1_method_2" }]);
+  } finally {
+    await view.unmount();
   }
 });
 

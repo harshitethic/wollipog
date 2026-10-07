@@ -11,7 +11,7 @@ import React, {
 import type { GovernancePolicy, PendingApproval, PermissionOption, SessionView } from "@wollipog/protocol";
 import { useApi } from "../../api-context.js";
 import type { ApiClient } from "../../api.js";
-import { relativeTime } from "../../format.js";
+import { relativeTime, titleCaseLabel } from "../../format.js";
 import { useOptionalStoreSelector } from "../../store.js";
 import { sessionCommandRefusal } from "../../session-command-permissions.js";
 import { useAccessibleMenu } from "../interactions.js";
@@ -19,9 +19,17 @@ import { MenuItem, MenuSurface } from "../Menu.js";
 import { ChevronRightIcon, MoreHorizontalIcon } from "../Icons.js";
 import { Notice } from "../Notice.js";
 import { BusyButton } from "../ui/BusyButton.js";
+import { ChoiceRows } from "../ui/ChoiceControls.js";
 import { CopyButton } from "../common.js";
 import { ProviderLoginCard } from "../ProviderLoginCard.js";
-import { AuthenticationRecoveryPanel, authenticationRecoveryPanelApplies } from "../AuthenticationRecoveryPanel.js";
+import { useIsMobile } from "../useIsMobile.js";
+import { useRemovedFocus } from "../useRemovedFocus.js";
+import {
+  AuthenticationRecoveryPanel,
+  SIGN_IN_COPY,
+  authenticationAccountChoiceApplies,
+  authenticationRecoveryPanelApplies,
+} from "../AuthenticationRecoveryPanel.js";
 import { EvidenceReviewBody, useEvidenceReview } from "./EvidenceReview.js";
 import { WorkflowDecisionSummary } from "./WorkflowDecisionSummary.js";
 import { claimDecision, decisionKey, useDecisionFailure, useDecisionInFlight } from "./request-reveal.js";
@@ -32,6 +40,8 @@ import {
   requestKindMeta,
   requestOptionForIntent,
   requestPolicyLine,
+  signInCardActions,
+  type SignInCardActions,
 } from "./request-meta.js";
 
 /** A one-key decision on the card: true when the card took the key, whether or not it could act. */
@@ -112,6 +122,7 @@ export function RequestCard({
   const reasonId = `${idPrefix}-reason`;
   const signInReasonId = `${idPrefix}-sign-in-reason`;
   const evidenceReasonId = `${idPrefix}-evidence-reason`;
+  const accountsId = `${idPrefix}-accounts`;
   const policyName = useGovernancePolicyName(api, request.governancePolicyId);
   const remaining = useCountdown(request.expiresAt);
 
@@ -166,19 +177,58 @@ export function RequestCard({
     };
   }, [intentRef, request.options]);
 
-  const { secondary, menu: menuOptions, primary } = requestCardActions(request.options);
+  const signIn = request.kind === "authentication";
+  const bodyRef = useMoreBelow(signIn);
+  const actions: SignInCardActions = signIn
+    ? signInCardActions(request.options)
+    : { ...requestCardActions(request.options), recheck: null, methods: [] };
+  const { tertiary, secondary, menu: menuOptions, primary, recheck, methods } = actions;
+  const recovery = authenticationRecoveryPanelApplies(session, request);
+  // Check Again lives on the recovery body's Last Checked fact. Where that body is not shown (a child's
+  // sign-in read under a parent of another driver) the recheck stays reachable as a secondary.
+  const footerSecondary = recheck && !recovery ? [...secondary, recheck] : secondary;
+  const canChooseAccount = authenticationAccountChoiceApplies(session, request, runner);
+  const [choosingAccount, setChoosingAccount] = useState(false);
+  // Dismiss Recovery, Choose Another Account… and a primary do not fit one phone row; there the first
+  // two overflow into ⋯ (§3.1) rather than wrap the footer and squeeze the body under the dock's cap.
+  // The layout comes from the phone query, so only one set of these controls exists at a time.
+  const isPhone = useIsMobile();
+  const phoneOverflow = signIn && tertiary !== null && canChooseAccount && isPhone;
+  const cardRef = useRef<HTMLElement | null>(null);
+  const chooseRef = useRef<HTMLButtonElement | null>(null);
+  // Only this card's own menu counts as its focus: another card's menu is that card's to hand back.
+  const removedFocus = useRemovedFocus(cardRef, `[id="${menu.menuId}"]`);
+  const wasPhoneOverflow = useRef(phoneOverflow);
+  useLayoutEffect(() => {
+    if (wasPhoneOverflow.current === phoneOverflow) return;
+    wasPhoneOverflow.current = phoneOverflow;
+    // Crossing 760px swaps Dismiss Recovery and Choose Another Account… for the ⋯ that holds them, or
+    // back. The ⋯'s menu goes with its trigger, and focus held by a swapped control (or the open menu)
+    // moves to the control that now offers the same choices, rather than to nowhere.
+    if (!phoneOverflow && menuOptions.length === 0) setMenuOpen(false);
+    if (!removedFocus()) return;
+    // The counterpart may be disabled while a decision is sent; the card's heading always takes focus.
+    const counterpart = phoneOverflow ? menu.triggerRef.current : chooseRef.current;
+    const target = counterpart && !counterpart.disabled
+      ? counterpart
+      : cardRef.current?.querySelector<HTMLElement>(".request-card-title");
+    target?.focus({ preventScroll: true });
+  });
+  // The sign-in method chosen among several; the first until the person picks another.
+  const [chosenMethod, setChosenMethod] = useState<string | null>(null);
+  const method = methods.find((option) => option.optionId === chosenMethod) ?? methods[0] ?? null;
   const keyHint = (option: PermissionOption): string | null => {
     if (!showKeyHints) return null;
     if (requestOptionForIntent(request.options, "approve") === option) return "A";
     if (requestOptionForIntent(request.options, "deny") === option) return "D";
     return null;
   };
-  const optionButton = (option: PermissionOption, primaryButton: boolean) => {
+  const optionButton = (option: PermissionOption, variant: "primary" | "secondary" | "tertiary") => {
     const hint = keyHint(option);
     return (
       <BusyButton
         key={option.optionId}
-        className={primaryButton ? "btn primary" : "btn"}
+        className={variant === "primary" ? "btn primary" : variant === "tertiary" ? "btn ghost request-card-tertiary" : "btn"}
         busy={busy === option.optionId}
         progress={REQUEST_CARD_COPY.sending}
         disabled={(busy !== null && busy !== option.optionId) || unavailable(option)}
@@ -186,7 +236,8 @@ export function RequestCard({
         data-session-request-control={`option:${option.optionId}`}
         onClick={() => void decide(option)}
       >
-        {option.name}
+        {/* An agent's own sign-in choices are its words, not Wollipog's: Title Case them as labels. */}
+        {methods.length > 0 ? titleCaseLabel(option.name) : option.name}
         {hint && <kbd aria-hidden="true">{hint}</kbd>}
       </BusyButton>
     );
@@ -211,11 +262,39 @@ export function RequestCard({
     remaining,
   );
   const body: ReactNode[] = [
-    request.kind === "authentication" && providerLogin
-      ? <ProviderLoginCard key="login" runnerId={session.runnerId} login={providerLogin} /> : null,
-    authenticationRecoveryPanelApplies(session, request)
-      ? <AuthenticationRecoveryPanel key="recovery" session={session} approval={request} runner={runner}
-        runnerOnline={runnerOnline} /> : null,
+    signIn && providerLogin && !recovery
+      ? <ProviderLoginCard key="login" runnerId={session.runnerId} login={providerLogin} embedded /> : null,
+    recovery ? (
+      <AuthenticationRecoveryPanel
+        key="recovery"
+        session={session}
+        approval={request}
+        runner={runner}
+        runnerOnline={runnerOnline}
+        recheck={recheck ? {
+          run: () => decide(recheck),
+          busy: busy === recheck.optionId,
+          disabled: (busy !== null && busy !== recheck.optionId) || unavailable(recheck),
+          describedBy: describedBy(recheck),
+        } : undefined}
+        choosingAccount={canChooseAccount && choosingAccount}
+        accountsId={accountsId}
+      />
+    ) : null,
+    methods.length > 0 ? (
+      <ChoiceRows
+        key="methods"
+        label={SIGN_IN_COPY.signInMethods}
+        value={method?.optionId ?? null}
+        onChange={setChosenMethod}
+        options={methods.map((option) => ({
+          value: option.optionId,
+          title: titleCaseLabel(option.name),
+          description: option.description ? <>{option.description}</> : undefined,
+        }))}
+        className="sign-in-methods"
+      />
+    ) : null,
     evidence ? <EvidenceReviewBody key="evidence" review={evidence} /> : null,
     workflowDecision && !evidence ? <WorkflowDecisionSummary key="decision" snapshot={workflowDecision.resourceSnapshot} /> : null,
     decisionDetails ? (
@@ -229,13 +308,26 @@ export function RequestCard({
         </div>
       </details>
     ) : null,
-    input ? (
+    // A sign-in's request details are the runner's guidance: where to sign in and with which command.
+    input && recovery ? (
+      <details key="input" className="disclosure">
+        <summary><ChevronRightIcon className="disclosure-chevron" />{REQUEST_CARD_COPY.requestDetails}</summary>
+        <div className="disclosure-body">
+          <div className="code-well">
+            <pre>{input}</pre>
+            <CopyButton text={input} iconOnly ariaLabel={REQUEST_CARD_COPY.copyDetails} className="icon-btn sm"
+              tooltip={false} />
+          </div>
+        </div>
+      </details>
+    ) : input ? (
       <div key="input" className="code-well">
         <pre>{input}</pre>
-        <CopyButton text={input} iconOnly ariaLabel={REQUEST_CARD_COPY.copyDetails} className="icon-btn sm" />
+        <CopyButton text={input} iconOnly ariaLabel={REQUEST_CARD_COPY.copyDetails} className="icon-btn sm"
+          tooltip={!signIn} />
       </div>
     ) : null,
-    facts.length > 0 ? (
+    facts.length > 0 && !signIn ? (
       <dl key="facts" className="facts" aria-label={REQUEST_CARD_COPY.policyMatch}>
         {facts.map((fact) => <div key={fact.label}><dt>{fact.label}</dt><dd>{fact.value}</dd></div>)}
       </dl>
@@ -244,6 +336,7 @@ export function RequestCard({
 
   return (
     <section
+      ref={cardRef}
       className="request-card"
       data-presentation={presentation}
       data-request-kind={meta.kind}
@@ -260,7 +353,7 @@ export function RequestCard({
         {evidence ? evidence.title : request.title}
       </h3>
       {policyLine && <p className="request-card-policy">{policyLine}</p>}
-      {body.length > 0 && <div className="request-card-body">{body}</div>}
+      {body.length > 0 && <div className="request-card-body" ref={bodyRef}>{body}</div>}
       {error && (
         <Notice tone="danger" compact role="alert">
           {REQUEST_CARD_COPY.notSent} {error}
@@ -275,15 +368,32 @@ export function RequestCard({
         </div>
       )}
       <div className="request-card-foot">
-        {secondary.map((option) => optionButton(option, false))}
-        {menuOptions.length > 0 && (
+        {tertiary && !phoneOverflow && optionButton(tertiary, "tertiary")}
+        {footerSecondary.map((option) => optionButton(option, "secondary"))}
+        {canChooseAccount && !phoneOverflow && (
+          // #2208 opens its Choose Another Account dialog from here; until then the card lists the
+          // Machine's other accounts in its body.
+          <button
+            type="button"
+            ref={chooseRef}
+            className="btn"
+            aria-expanded={choosingAccount}
+            aria-controls={choosingAccount ? accountsId : undefined}
+            disabled={busy !== null || reason !== null}
+            aria-describedby={reason !== null ? reasonId : undefined}
+            onClick={() => setChoosingAccount((open) => !open)}
+          >
+            {SIGN_IN_COPY.chooseAnotherAccount}
+          </button>
+        )}
+        {(menuOptions.length > 0 || phoneOverflow) && (
           <>
             <button
               ref={menu.triggerRef}
               type="button"
               className="icon-btn"
               aria-label={REQUEST_CARD_COPY.moreChoices}
-              title={REQUEST_CARD_COPY.moreChoices}
+              title={signIn ? undefined : REQUEST_CARD_COPY.moreChoices}
               aria-haspopup="menu"
               aria-expanded={menuOpen}
               aria-controls={menuOpen ? menu.menuId : undefined}
@@ -304,7 +414,9 @@ export function RequestCard({
                 align="end"
                 onDismiss={() => menu.close(true)}
                 onKeyDown={menu.onMenuKeyDown}
-                data-request-card-menu=""
+                // Its presentation, so the dock owns focus in its own cards' menus and not in a
+                // Requests panel card's beside it.
+                data-request-card-menu={presentation}
               >
                 {menuOptions.map((option) => (
                   <MenuItem
@@ -322,11 +434,53 @@ export function RequestCard({
                     {option.name}
                   </MenuItem>
                 ))}
+                {phoneOverflow && (
+                  <MenuItem
+                    aria-disabled={busy !== null || reason !== null || undefined}
+                    aria-describedby={reason !== null ? reasonId : undefined}
+                    onClick={() => {
+                      // As the footer's button: not while a decision is sent, nor when nobody can act.
+                      if (busy !== null || reason !== null) return;
+                      menu.close(true);
+                      setChoosingAccount((open) => !open);
+                    }}
+                  >
+                    {SIGN_IN_COPY.chooseAnotherAccount}
+                  </MenuItem>
+                )}
+                {phoneOverflow && tertiary && (
+                  <MenuItem
+                    description={tertiary.description}
+                    aria-disabled={unavailable(tertiary) || undefined}
+                    aria-describedby={describedBy(tertiary)}
+                    data-session-request-control={`option:${tertiary.optionId}`}
+                    onClick={() => {
+                      if (unavailable(tertiary)) return;
+                      menu.close(true);
+                      void decide(tertiary);
+                    }}
+                  >
+                    {tertiary.name}
+                  </MenuItem>
+                )}
               </MenuSurface>
             )}
           </>
         )}
-        {primary && optionButton(primary, true)}
+        {primary && optionButton(primary, "primary")}
+        {method && (
+          <BusyButton
+            className="btn primary"
+            busy={methods.some((option) => busy === option.optionId)}
+            progress={REQUEST_CARD_COPY.sending}
+            disabled={(busy !== null && !methods.some((option) => busy === option.optionId)) || unavailable(method)}
+            aria-describedby={describedBy(method)}
+            data-session-request-control="option:sign-in-method"
+            onClick={() => void decide(method)}
+          >
+            {SIGN_IN_COPY.startSignIn}
+          </BusyButton>
+        )}
       </div>
     </section>
   );
@@ -352,6 +506,34 @@ export function RequestCardHead({ kind, owner, time, trailing }: {
       {trailing && <span className="request-card-trailing">{trailing}</span>}
     </div>
   );
+}
+
+/**
+ * Marks a scrolling body `data-more-below` while content waits below its lower edge, which a sign-in
+ * card fades (#2198): a line the edge cuts then reads as more to scroll to, not as a stray mark. The
+ * mark follows the scroll position and the body's size, and every render re-measures, as `Tabs` does.
+ */
+function useMoreBelow(enabled: boolean): (node: HTMLDivElement | null) => void {
+  const [node, setNode] = useState<HTMLDivElement | null>(null);
+  const update = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    if (!node) return;
+    const measure = () => {
+      node.toggleAttribute("data-more-below", enabled && node.scrollTop + node.clientHeight < node.scrollHeight - 1);
+    };
+    update.current = measure;
+    measure();
+    node.addEventListener("scroll", measure, { passive: true });
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(node);
+    return () => {
+      node.removeEventListener("scroll", measure);
+      observer?.disconnect();
+      update.current = () => undefined;
+    };
+  }, [enabled, node]);
+  useEffect(() => { update.current(); });
+  return setNode;
 }
 
 /** Ticks once a second until `expiresAt`, as the milliseconds left; null without a deadline. */

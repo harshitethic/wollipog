@@ -15,7 +15,17 @@ function statusLabel(status: ProviderLoginView["status"]): string {
   return "Sign-In Failed";
 }
 
-export function ProviderLoginCard({ runnerId, login, revealScope = "" }: { runnerId: string; login: ProviderLoginView; revealScope?: string }) {
+/**
+ * A provider sign-in the runner is running. `embedded` is the sign-in Request Card's body (#2198):
+ * the card's facts name the account and its sentence the status, so this drops its heading (and its
+ * Cancel: the card's Cancel Sign-In is its only button), and Submit Code is not a second primary.
+ */
+export function ProviderLoginCard({ runnerId, login, revealScope = "", embedded = false }: {
+  runnerId: string;
+  login: ProviderLoginView;
+  revealScope?: string;
+  embedded?: boolean;
+}) {
   const privacy = useAccountEmailPrivacy();
   const api = useApi();
   const [code, setCode] = useState("");
@@ -66,9 +76,11 @@ export function ProviderLoginCard({ runnerId, login, revealScope = "" }: { runne
     <article
       className="provider-login-card"
       data-provider-login-status={login.status}
+      data-embedded={embedded || undefined}
       aria-label={`${accountLabelText(login.label, undefined, privacy.hide)} Provider Sign-In`}
     >
-      <div className="provider-login-head">
+      {/* Embedded, the sign-in card's facts already name the account and its sentence the status. */}
+      {!embedded && <div className="provider-login-head">
         <div>
           <strong><AccountIdentifier identity={JSON.stringify([runnerId, login.accountId, login.operationId, revealScope])} value={login.label} label="Account Email" /></strong>
           <span>{login.provider === "claude" ? "Claude" : "Codex"} · {statusLabel(login.status)}</span>
@@ -78,7 +90,7 @@ export function ProviderLoginCard({ runnerId, login, revealScope = "" }: { runne
             onClick={() => void dismiss()}>Dismiss</button>
         )}
         {active && <button type="button" className="btn ghost sm" disabled={busy} onClick={() => void cancel()}>Cancel</button>}
-      </div>
+      </div>}
       {login.verificationUrl && (
         <p>
           <a className="link" href={login.verificationUrl} target="_blank" rel="noreferrer">Open Provider Sign-In</a>
@@ -102,7 +114,7 @@ export function ProviderLoginCard({ runnerId, login, revealScope = "" }: { runne
               onChange={(event) => setCode(event.target.value)}
             />
           </label>
-          <button type="submit" className="btn primary sm" disabled={busy || !code.trim()}>
+          <button type="submit" className={embedded ? "btn sm" : "btn primary sm"} disabled={busy || !code.trim()}>
             {busy ? "Submitting…" : "Submit Code"}
           </button>
         </form>
