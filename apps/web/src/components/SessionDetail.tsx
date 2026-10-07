@@ -234,7 +234,7 @@ import {
 import { useSessionReadingKeys, type SessionReadingKeyActions } from "../useSessionReadingKeys.js";
 import { VIRTUAL_VIEWPORT_INTENT_EVENT, virtualViewportIntentDirection } from "../viewport-intent.js";
 import { inTypingContext, isMacPlatform, matchesShortcut, shortcutDisplay, shortcutLayerActive } from "../shortcuts.js";
-import { useIsMobile, useIsTouchPhone } from "./useIsMobile.js";
+import { useIsCompact, useIsMobile, useIsTouchPhone } from "./useIsMobile.js";
 import {
   usePreviewNavigationRegistration,
   type PreviewNavigationControls,
@@ -972,6 +972,9 @@ function SessionDetailLoaded({
   const isMobile = useIsMobile();
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
+  const isCompact = useIsCompact();
+  const isCompactRef = useRef(isCompact);
+  isCompactRef.current = isCompact;
   const projectsSupported = useStoreSelector((state) => state.projectsSupported);
   const projects = useStoreSelector((state) => state.projects);
   const instanceScope = useInstanceScope();
@@ -1379,38 +1382,44 @@ function SessionDetailLoaded({
   const retitleReceiptRef = useRef<HTMLDivElement>(null);
   const rightPanelRef = useRef(rightPanel);
   rightPanelRef.current = rightPanel;
-  // An attention link naming one of the dock's requests (the Sessions list's top request, an Inbox
-  // card) expands that request and moves focus to it; App leaves the Agents panel closed for it.
+  // Resolve attention only against this generation's known requests. Cold links stay on the
+  // transcript while hydration catches up; they never guess an Agents overview first.
   const handledAttentionRef = useRef<string | null>(null);
-  const dockedRequestIds = dockedRequests.map((request) => request.requestId).join("\n");
-  useEffect(() => {
-    const requestId = attentionTarget?.requestId;
-    if (!requestId || attentionTarget.eventEpoch !== (session.eventEpoch ?? 0) ||
-        !dockedRequestIds.split("\n").includes(requestId)) return;
-    const key = JSON.stringify([session.id, attentionTarget.eventEpoch, requestId, attentionTarget.activationId ?? 0]);
+  const preparedAttentionRef = useRef<string | null>(null);
+  const closeRequestOverlay = useCallback(() => {
+    const panel = rightPanelRef.current;
+    // Requests also overlays the transcript in the compact desktop tier (#2206).
+    if (panel.open && (isMobileRef.current || panel.mode === "subagents" ||
+        (isCompactRef.current && panel.mode === "requests"))) panel.close();
+  }, []);
+  const attentionRequest = attentionTarget && attentionTarget.eventEpoch === (session.eventEpoch ?? 0)
+    ? attentionTarget.requestId === undefined ? prioritizedRequests[0]
+      : prioritizedRequests.find((request) => request.requestId === attentionTarget.requestId)
+    : undefined;
+  const resolvedAttentionTarget = attentionTarget && attentionRequest
+    ? { ...attentionTarget, requestId: attentionRequest.requestId } : attentionTarget;
+  useLayoutEffect(() => {
+    if (mode !== "expanded" || !attentionTarget || !attentionRequest) return;
+    const requestId = attentionRequest.requestId;
+    const key = JSON.stringify([session.id, attentionTarget.eventEpoch, attentionTarget.requestId, attentionTarget.activationId ?? 0]);
     if (handledAttentionRef.current === key) return;
+    if (attentionRequest.ownerToolUseId) {
+      handledAttentionRef.current = key;
+      rightPanelRef.current.show("subagents");
+      return;
+    }
+    // Close an obstructing panel before paint, then let the mounted dock reveal the exact card.
+    if (preparedAttentionRef.current !== key) {
+      preparedAttentionRef.current = key;
+      closeRequestOverlay();
+    }
     // After the dock has mounted; a re-render before the frame reschedules it.
     const frame = window.requestAnimationFrame(() => {
       if (!focusSessionRequest(session.id, requestId)) return;
       handledAttentionRef.current = key;
-      // A cold deep link opens the Agents panel before the session has loaded; it is not needed for
-      // a docked request, and on a phone it would cover the card.
-      if (rightPanelRef.current.open && rightPanelRef.current.mode === "subagents") rightPanelRef.current.close();
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [attentionTarget, dockedRequestIds, session.eventEpoch, session.id]);
-  const attentionEntryScope = useRef<string | null>(null);
-  useEffect(() => {
-    if (mode !== "expanded") return;
-    const scope = `${session.id}:${session.eventEpoch ?? 0}`;
-    if (attentionEntryScope.current === scope) return;
-    attentionEntryScope.current = scope;
-    // The Agents panel answers a worker's request and lists an async question beside the others;
-    // the session's own requests are on the dock.
-    if (pendingRequests(session.pendingApproval).some((request) => request.ownerToolUseId || request.async)) {
-      rightPanelRef.current.show("subagents");
-    }
-  }, [mode, session.id, session.eventEpoch, session.pendingApproval]);
+  }, [mode, attentionTarget, attentionRequest, session.id, closeRequestOverlay]);
   const backgroundInventoryRequestRef = useRef<string | null>(null);
   const [backgroundInventoryError, setBackgroundInventoryError] = useState<string | null>(null);
   const [backgroundInventoryAttempt, setBackgroundInventoryAttempt] = useState(0);
@@ -4613,10 +4622,12 @@ function SessionDetailLoaded({
   // into view: on the request dock (or the notice slot holding its place), else in the Agents panel,
   // which lists every pending request (a worker's beside an async question).
   const reviewPendingRequest = useCallback((requestId: string) => {
-    if (focusSessionRequest(session.id, requestId)) return;
-    rightPanel.show("subagents");
+    if (dockedRequests.some((request) => request.requestId === requestId)) {
+      if (mode === "expanded") closeRequestOverlay();
+      if (focusSessionRequest(session.id, requestId)) return;
+    }
     navigate({ name: "session", id: session.id, attention: { eventEpoch: session.eventEpoch ?? 0, requestId } });
-  }, [navigate, rightPanel, session.eventEpoch, session.id]);
+  }, [navigate, session.eventEpoch, session.id, dockedRequests, mode, closeRequestOverlay]);
 
   // The pending questions, whose transcript rows are markers (#2205): the dock's, and a worker's,
   // whose Jump to Question opens the Agents panel. Keyed by their ids, so heartbeats that replace the
@@ -6375,10 +6386,12 @@ function SessionDetailLoaded({
           onOpenAttention={() => {
             // The top request is answered on the dock when it is the session's own.
             const top = prioritizedRequests[0];
-            if (top && dockedRequests.includes(top) && focusSessionRequest(session.id, top.requestId)) return;
+            if (top && dockedRequests.includes(top)) {
+              reviewPendingRequest(top.requestId);
+              return;
+            }
             const requests = pendingRequests(session.pendingApproval);
             if (requests.length > 1) {
-              rightPanel.show("subagents");
               navigate({ name: "session", id: session.id, attention: {
                 eventEpoch: session.eventEpoch ?? 0,
               } });
@@ -6388,9 +6401,7 @@ function SessionDetailLoaded({
               openChildRequests();
               return;
             }
-            // Navigation makes the target reload-safe; the direct state transition also makes a
-            // repeat press reopen a panel that was closed while the route stayed unchanged.
-            rightPanel.show("subagents");
+            // Each activation is handled against the known request, including a repeated press.
             navigate({ name: "session", id: session.id, attention: {
               eventEpoch: session.eventEpoch ?? 0,
               ...(requests.length === 1 ? { requestId: requests[0]!.requestId } : {}),
@@ -7250,7 +7261,7 @@ function SessionDetailLoaded({
           session={session}
           earlierActivityUnloaded={isPartialHistory(eventWindow)}
           sourceLocation={sourceLocation}
-          attentionTarget={attentionTarget}
+          attentionTarget={resolvedAttentionTarget}
           onOpenSourceLocation={openSourceLocation}
           onClearSourceLocation={clearSourceLocation}
           runnerOnline={runnerOnline}
