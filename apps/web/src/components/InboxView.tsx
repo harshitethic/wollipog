@@ -59,13 +59,12 @@ import { SnoozeDialog } from "./SnoozeDialog.js";
 import { SessionContextMenu, type SessionContextMenuState } from "./SessionContextMenu.js";
 import { RenameSessionDialog } from "./RenameSessionDialog.js";
 import type { NewSessionPreset } from "./NewSessionDialog.js";
-import { BoardIcon, ListIcon, SearchIcon } from "./Icons.js";
+import { BoardIcon, ListIcon } from "./Icons.js";
 import { PageHeader } from "./PageHeader.js";
 import { shortcutDisplay } from "../shortcuts.js";
 import { sessionDisplayTitle } from "../session-title.js";
 import { Board } from "./Board.js";
 import type { SessionsViewMode } from "../sessions-view-mode.js";
-import { sessionAgentLabel } from "./agent-options.js";
 import { dispatchVirtualViewportIntent } from "../viewport-intent.js";
 import { virtualTargetScrollAdjustment } from "./MeasuredVirtualList.js";
 import type { PreviewNavigationControls } from "./usePreviewNavigationRegistration.js";
@@ -75,8 +74,13 @@ import { ProviderLoginCard } from "./ProviderLoginCard.js";
 import { RecommendedSkillsNotice } from "./RecommendedSkillsNotice.js";
 import { ProjectSetupSuggestion } from "./WorktreeSetupNotice.js";
 import { SessionGroupTabs } from "./SessionGroupTabs.js";
-import { sessionGroupLabels, sessionGroupRunnerId } from "../session-groups.js";
+import { sessionGroupFullName, sessionGroupLabels, sessionGroupRunnerId } from "../session-groups.js";
 import { runnerDisplay } from "../runners.js";
+import { normalizeSessionsQuery, searchInboxSplits, sessionMatchesQuery } from "../sessions-search.js";
+import { SessionsNoMatches, SessionsSearchField } from "./SessionsSearch.js";
+import { useOpenSearchPalette } from "./search-palette-context.js";
+import { useSnapshotState } from "./State.js";
+import { useRemovedFocus } from "./useRemovedFocus.js";
 
 const PROJECT_PIN_KEY = "wollipog.projects.pinned";
 const SEEN_DWELL_MS = 1_500;
@@ -110,21 +114,6 @@ export function filterInboxSplitsForReminderMode(
       stalledCount: visibleSessions.reduce((total, session) => total + Number(stalledSessionIds.has(session.id)), 0),
     };
   });
-}
-
-export function inboxSessionMatchesQuery(
-  session: SessionView,
-  normalizedQuery: string,
-  projectName: string,
-): boolean {
-  if (!normalizedQuery) return true;
-  return [
-    session.title,
-    session.preview,
-    sessionAgentLabel(session.agentName, session.driver, session.agentId),
-    session.agentName,
-    projectName,
-  ].some((value) => value?.toLocaleLowerCase().includes(normalizedQuery));
 }
 
 export function pageInboxPreview(
@@ -261,6 +250,7 @@ export function InboxView({
   // Enter may arrive before the deferred filter has committed. Keep the request in React state so
   // the handoff uses the rows for the exact query the input displays, never the previous result set.
   const [searchFocusPending, setSearchFocusPending] = useState(false);
+  const openSearchPalette = useOpenSearchPalette();
   const [creatingProject, setCreatingProject] = useState(false);
   const [reminderMode, setReminderMode] = useState<ReminderInboxMode>("ordinary");
   const [snoozeSessionId, setSnoozeSessionId] = useState<string | null>(null);
@@ -377,7 +367,12 @@ export function InboxView({
   useEffect(() => {
     if (!exitPending || query !== "" || deferredQuery !== "") return;
     setExitPending(false);
-    (listRef.current ?? viewRef.current?.querySelector<HTMLElement>(".inbox-zero"))?.focus();
+    // The board has no grid to hand focus to, so it takes it only when No Matches' Clear Search
+    // left with it (#2200); Escape in the field keeps it there, as before.
+    const active = document.activeElement;
+    const focusLost = !active || active === document.body || !active.isConnected;
+    (listRef.current ?? viewRef.current?.querySelector<HTMLElement>(".inbox-zero") ??
+      (focusLost ? viewRef.current?.querySelector<HTMLElement>(".board-wrap") : null))?.focus();
   }, [exitPending, query, deferredQuery]);
 
   const exitSearch = useCallback(() => {
@@ -505,9 +500,16 @@ export function InboxView({
     }
   }, [activeSplit, expandedSessionId, inbox.selectedSessionId, inbox.splitKey, repairedSelection, selectSession, selectSplit, sessions, snapshotLoaded]);
 
-  const normalizedQuery = deferredQuery.trim().toLocaleLowerCase();
+  const normalizedQuery = normalizeSessionsQuery(deferredQuery);
+  // While a query is set, every tab counts its matches (#2200, §10.1).
+  const searchedSplits = useMemo(() => searchInboxSplits(
+    splits,
+    normalizedQuery,
+    (session) => inboxProjectName(session, projectsSupported ? projects : undefined),
+    stalledSessionIds,
+  ), [normalizedQuery, projects, projectsSupported, splits, stalledSessionIds]);
   const liveEntries = useMemo<InboxListEntry[]>(() => (activeSplit?.sessions ?? [])
-    .filter((session) => inboxSessionMatchesQuery(
+    .filter((session) => sessionMatchesQuery(
       session,
       normalizedQuery,
       inboxProjectName(session, projectsSupported ? projects : undefined),
@@ -518,6 +520,29 @@ export function InboxView({
       unread: isUnread(seen, session.id, session.lastEventAt),
       reminder: reminders.get(session.id),
     })), [activeSplit?.sessions, normalizedQuery, projects, projectsSupported, reminders, seen]);
+  // A query that matches nothing replaces both panes with No Matches (#2200, §6.1), after the
+  // offline and loading states it never claims to know better than (§12).
+  const snapshot = useSnapshotState();
+  const noMatches = normalizedQuery !== "" && liveEntries.length === 0 && expandedSessionId === null &&
+    !snapshot.offline && !snapshot.loading;
+  // A live update can take the selected session out of the results, or the last match away, while
+  // the list or preview holds focus. What replaces the focused pane takes focus rather than <body>:
+  // No Matches, the reader of the result the preview moved to, or the list.
+  const noMatchesRef = useRef<HTMLDivElement>(null);
+  const previewPaneRef = useRef<HTMLDivElement>(null);
+  const removedFocus = useRemovedFocus(viewRef);
+  const removedPreviewFocus = useRemovedFocus(previewPaneRef);
+  useLayoutEffect(() => {
+    const fromPreview = removedPreviewFocus();
+    if (!removedFocus() || normalizedQuery === "" || expandedSessionId !== null) return;
+    // The list zone's own chain (§16.1): the grid, the state in its place, or the board.
+    const listZone = () => listRef.current ??
+      viewRef.current?.querySelector<HTMLElement>(".inbox-zero") ??
+      viewRef.current?.querySelector<HTMLElement>(".board-wrap");
+    if (noMatches) noMatchesRef.current?.focus();
+    else if (fromPreview) (previewPaneRef.current?.querySelector<HTMLElement>(".detail-scroll") ?? listZone())?.focus();
+    else listZone()?.focus();
+  });
   const liveIds = useMemo(() => liveEntries.map((entry) => entry.session.id), [liveEntries]);
   const pinnedAncestorSessionIds = useMemo(
     () => inboxPinnedAncestorIds(liveEntries.map((entry) => entry.session), pinnedSessions),
@@ -584,7 +609,7 @@ export function InboxView({
   // the child) lands on its nearest displayed ancestor, so a row is always active and Enter, F2,
   // and the rest keep a target. The persisted selection itself is untouched: expanding the thread
   // again brings the child back as the selected row.
-  const displayedSelection = useMemo(() => {
+  const projectedSelection = useMemo(() => {
     if (!repairedSelection) return null;
     const displayed = new Set(displayedIds);
     const seen = new Set<string>();
@@ -595,17 +620,26 @@ export function InboxView({
     }
     return id && displayed.has(id) ? id : null;
   }, [displayedIds, repairedSelection, sessions]);
+  // A search that leaves the selection out of its results selects the first result, as archiving
+  // the selection does (#2200), so the preview never shows a session the list excludes. An open
+  // session owns the selection, and the board and a phone show no preview.
+  const searchSelection = normalizedQuery !== "" && projectedSelection === null &&
+    expandedSessionId === null && !boardMode && !isMobile ? displayedIds[0] ?? null : null;
+  const displayedSelection = projectedSelection ?? searchSelection;
+  useEffect(() => {
+    if (searchSelection !== null) selectSession(searchSelection, activeSplit?.key ?? null);
+  }, [activeSplit?.key, searchSelection, selectSession]);
   const displayedSelectedSession = displayedSelection ? sessions.get(displayedSelection) ?? null : null;
   // The preview surface, the seen-dwell, and the row highlight must agree on ONE session. When the
   // persisted selection was projected onto a visible ancestor above, that ancestor is the session
-  // the preview shows and the preview's own actions act on; otherwise (a search hid the row and
-  // nothing visible stands in for it) the preview keeps following the persisted selection as before.
+  // the preview shows and the preview's own actions act on; otherwise (no displayed row stands in
+  // for it) the preview keeps following the persisted selection as before.
   const selectedSession = displayedSelectedSession ??
     (repairedSelection ? sessions.get(repairedSelection) ?? null : null);
   // The dwell marks the session the reader is actually looking at: the expanded one when the view
   // is expanded (a deep link can open a child whose thread is collapsed, and the projection above
-  // would otherwise name its parent), else the selected preview.
-  const seenSession = expandedSessionId ? sessions.get(expandedSessionId) ?? null : selectedSession;
+  // would otherwise name its parent), else the selected preview, which No Matches hides.
+  const seenSession = expandedSessionId ? sessions.get(expandedSessionId) ?? null : noMatches ? null : selectedSession;
 
   useEffect(() => {
     if (seenTimerRef.current !== null) window.clearTimeout(seenTimerRef.current);
@@ -1428,7 +1462,7 @@ export function InboxView({
         primary={{ label: "New Session", shortcut: shortcutDisplay("new-session"), onClick: newSession }}
         tabs={(
           <SessionGroupTabs
-            splits={splits}
+            splits={searchedSplits}
             labels={groupLabels}
             activeKey={activeSplit?.key ?? null}
             snoozed={reminderMode === "snoozed"}
@@ -1445,7 +1479,9 @@ export function InboxView({
                 (split.project.kind === "durable" && split.project.legacyKeys.some((key) => pinnedProjects.has(key))));
               return (
                 <ProjectSplitMenu
-                  split={split}
+                  // The tab counts a search's matches; the group's actions (Archive All Sessions)
+                  // still act on the whole group.
+                  split={splits.find((candidate) => candidate.key === split.key) ?? split}
                   unfilteredSplit={baseSplits.find((candidate) => candidate.key === split.key)}
                   active={active}
                   tabMenu={request}
@@ -1474,29 +1510,23 @@ export function InboxView({
                     Apply New Order
                   </button>
                 )}
-                <label className={`inbox-search${query ? " has-query" : ""}`}>
-                  <span className="sr-only">Search Sessions</span>
-                  <SearchIcon size={16} />
-                  <input
-                    value={query}
-                    onChange={(event) => changeQuery(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey &&
-                          !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229 && !isMobile && !boardMode) {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        setSearchFocusPending(true);
-                        return;
-                      }
-                      if (event.key !== "Escape") return;
+                <SessionsSearchField
+                  value={query}
+                  onChange={changeQuery}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey &&
+                        !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229 && !isMobile && !boardMode) {
                       event.preventDefault();
                       event.stopPropagation();
-                      exitSearch();
-                    }}
-                    placeholder="Search sessions"
-                  />
-                  <kbd className="inbox-search-key" aria-hidden="true">/</kbd>
-                </label>
+                      setSearchFocusPending(true);
+                      return;
+                    }
+                    if (event.key !== "Escape") return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    exitSearch();
+                  }}
+                />
               </>
             )}
           />
@@ -1506,7 +1536,7 @@ export function InboxView({
     <div className={`inbox-view${expanded ? " expanded" : ""}${boardMode ? " board-mode" : ""}`} ref={viewRef} data-focus-zone={expanded ? "main" : "list"}>
       <section
         className="inbox-list-pane"
-        style={{ height: isMobile || boardMode ? "100%" : `${ratio * 100}%` }}
+        style={{ height: isMobile || boardMode || noMatches ? "100%" : `${ratio * 100}%` }}
         aria-label="Sessions"
         aria-hidden={expanded || undefined}
         inert={expanded || undefined}
@@ -1523,7 +1553,20 @@ export function InboxView({
           <ProjectSetupSuggestion key={activeSetupSession.id} session={activeSetupSession}
             projectName={activeDurableProject.name} onGenerated={openGeneratedWorktreeSetup} />
         )}
-        {boardMode ? (
+        {noMatches ? (
+          // The list zone's landing spot while the list is replaced (F6, §16.1).
+          <div className="inbox-no-matches" tabIndex={-1} ref={noMatchesRef}>
+            <SessionsNoMatches
+              query={deferredQuery}
+              group={{
+                kind: activeSplit?.kind ?? "all",
+                name: activeSplit ? sessionGroupFullName(groupLabels.get(activeSplit.key) ?? { name: activeSplit.name }) : "",
+              }}
+              onClearSearch={exitSearch}
+              {...(openSearchPalette ? { onSearchTranscripts: () => openSearchPalette(deferredQuery.trim()) } : {})}
+            />
+          </div>
+        ) : boardMode ? (
           <Board
             sessions={boardSessions}
             pinnedSessionIds={pinnedSessions}
@@ -1605,7 +1648,7 @@ export function InboxView({
         )}
       </section>
 
-      {!boardMode && (!isMobile || expanded) && (
+      {!boardMode && !noMatches && (!isMobile || expanded) && (
         <>
           <div
             className="inbox-splitter"
@@ -1632,7 +1675,7 @@ export function InboxView({
               event.preventDefault();
             }}
           />
-          <div className="inbox-preview-pane" style={{ height: expanded ? "100%" : `${(1 - ratio) * 100}%` }} data-focus-zone="main">
+          <div className="inbox-preview-pane" ref={previewPaneRef} style={{ height: expanded ? "100%" : `${(1 - ratio) * 100}%` }} data-focus-zone="main">
             {surfaceSessionId ? (
               <SessionDetail
                 key={surfaceSessionId}
