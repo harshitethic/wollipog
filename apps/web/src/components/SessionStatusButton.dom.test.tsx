@@ -180,6 +180,31 @@ test("in the compact tier a renamed title re-measures the dot without a change t
   }
 });
 
+test("in the compact tier a badge count that arrives or leaves re-measures the dot", async () => {
+  await act(async () => { domWindow.happyDOM.setViewport({ width: 900, height: 900 }); });
+  const one = { status: "input_required" as const, pendingApproval: approval };
+  const two = { ...one, pendingApproval: { ...approval, additionalRequests: [{ ...approval, requestId: "approval-2" }] } };
+  const { root, rerender } = await renderHeader(one);
+  try {
+    // Happy DOM has no layout: a long title, and a count on the badge takes the title under 200px.
+    const title = body().querySelector<HTMLElement>("header.session-bar h1")!;
+    Object.defineProperty(title, "clientWidth", { configurable: true, get: () => trigger().querySelector(".status-count") ? 190 : 205 });
+    Object.defineProperty(title, "scrollWidth", { configurable: true, get: () => 400 });
+    await rerender(one);
+    assert.equal(trigger().hasAttribute("data-dot"), false);
+
+    // The label, the "+N", the title and the bar are unchanged; only the count is new.
+    await rerender(two);
+    assert.equal(trigger().querySelector(".status-count")?.textContent, "2");
+    assert.equal(trigger().hasAttribute("data-dot"), true, "the count's width takes the title under 200px");
+
+    await rerender(one);
+    assert.equal(trigger().hasAttribute("data-dot"), false, "without the count the label fits again");
+  } finally {
+    await cleanUp(root);
+  }
+});
+
 test("an approval and an answer request show the breakdown's first kind with +1", async () => {
   const pendingApproval = { ...question, additionalRequests: [approval] };
   const { root } = await renderHeader({ status: "input_required", pendingApproval });

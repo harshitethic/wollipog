@@ -137,6 +137,7 @@ export function SessionStatusButton({
 
   // The attribute and tooltip are written straight to the DOM inside one layout pass, as DetailBar
   // does: React does not own them, and nothing paints between taking them off and putting them back.
+  // It runs again when what sizes the badge changes: its label and "+N" (the tooltip) and its count.
   useLayoutEffect(() => {
     const trigger = popover.triggerRef.current;
     if (!trigger) return;
@@ -177,7 +178,7 @@ export function SessionStatusButton({
       observer?.disconnect();
       renamed?.disconnect();
     };
-  }, [compact, tooltip, popover.triggerRef, titleRef]);
+  }, [compact, tooltip, primary.count, popover.triggerRef, titleRef]);
 
   // A popover with nothing to act on holds focus itself, so Escape and Tab still work from it.
   useLayoutEffect(() => {
