@@ -160,13 +160,22 @@ export function SessionStatusButton({
     void document.fonts?.ready.then(() => {
       if (!cancelled) measure();
     });
-    // The bar's width is set by the pane, never by the badge, so a collapse cannot re-trigger it.
+    // The title's room changes with the bar and with what sits beside it (#2765). Neither is sized by
+    // the badge, so a collapse cannot re-trigger the observer; the title and this button are, so
+    // they are left out.
     const bar = trigger.parentElement;
     const observer = typeof ResizeObserver === "undefined" || !bar ? null : new ResizeObserver(measure);
-    if (bar) observer?.observe(bar);
+    if (bar && observer) {
+      observer.observe(bar);
+      for (const child of bar.children) if (child !== trigger && child !== title) observer.observe(child);
+    }
+    // A renamed title resizes none of those, so its text is watched instead.
+    const renamed = typeof MutationObserver === "undefined" ? null : new MutationObserver(measure);
+    renamed?.observe(title, { characterData: true, childList: true, subtree: true });
     return () => {
       cancelled = true;
       observer?.disconnect();
+      renamed?.disconnect();
     };
   }, [compact, tooltip, popover.triggerRef, titleRef]);
 

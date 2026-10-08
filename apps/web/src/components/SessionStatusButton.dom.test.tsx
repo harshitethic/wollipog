@@ -22,6 +22,7 @@ for (const [name, value] of Object.entries({
   Event: domWindow.Event,
   MouseEvent: domWindow.MouseEvent,
   KeyboardEvent: domWindow.KeyboardEvent,
+  MutationObserver: domWindow.MutationObserver,
   getComputedStyle: domWindow.getComputedStyle.bind(domWindow),
   React,
   IS_REACT_ACT_ENVIRONMENT: true,
@@ -118,9 +119,10 @@ function rowButton(label: string): HTMLButtonElement {
 test("status title measurement reuses its observer across unrelated re-renders", async () => {
   const previousObserver = (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver;
   let observerCreations = 0;
+  const observed: Element[] = [];
   class TrackingResizeObserver {
     constructor(_callback: ResizeObserverCallback) { observerCreations += 1; }
-    observe() {}
+    observe(target: Element) { observed.push(target); }
     disconnect() {}
     unobserve() {}
   }
@@ -131,12 +133,15 @@ test("status title measurement reuses its observer across unrelated re-renders",
   });
   const { root, rerender } = await renderHeader({ status: "running" });
   try {
-    const initial = observerCreations;
-    assert.ok(initial > 0, "the initial title measurement installs a resize observer");
+    assert.equal(observerCreations, 1, "the mounted button installs one resize observer");
+    assert.ok(observed.includes(trigger().parentElement!), "the bar is observed");
+    // A collapse resizes the title and the button, so observing either would re-trigger itself.
+    assert.ok(!observed.includes(trigger()), "the button is not observed");
+    assert.ok(!observed.includes(body().querySelector("header.session-bar h1")!), "the title is not observed");
     for (let i = 0; i < 3; i++) {
       await rerender({ status: "running" });
     }
-    assert.equal(observerCreations, initial, "unrelated renders must not reconstruct the observer");
+    assert.equal(observerCreations, 1, "unrelated renders must not reconstruct the observer");
   } finally {
     await cleanUp(root);
     if (previousObserver === undefined) {
@@ -148,6 +153,30 @@ test("status title measurement reuses its observer across unrelated re-renders",
         value: previousObserver,
       });
     }
+  }
+});
+
+test("in the compact tier a renamed title re-measures the dot without a change to the badge", async () => {
+  await act(async () => { domWindow.happyDOM.setViewport({ width: 900, height: 900 }); });
+  const { root, rerender } = await renderHeader({ status: "running", title: "Fix it" });
+  try {
+    // Happy DOM has no layout: the title gets 150px of room and a text 10px per character wide.
+    const title = body().querySelector<HTMLElement>("header.session-bar h1")!;
+    Object.defineProperty(title, "clientWidth", { configurable: true, get: () => 150 });
+    Object.defineProperty(title, "scrollWidth", { configurable: true, get: () => (title.textContent ?? "").length * 10 });
+    assert.equal(trigger().hasAttribute("data-compact"), true);
+    assert.equal(trigger().hasAttribute("data-dot"), false);
+
+    // Neither the bar nor the badge changes size, and the effect's inputs are unchanged.
+    await rerender({ status: "running", title: "Fix the flaky merge queue retry in the scheduler" });
+    assert.equal(trigger().hasAttribute("data-dot"), true, "a title truncated under 200px takes the dot");
+    assert.equal(trigger().title, "Running");
+
+    await rerender({ status: "running", title: "Fix it" });
+    assert.equal(trigger().hasAttribute("data-dot"), false, "a title that fits again gives the label back");
+    assert.equal(trigger().hasAttribute("title"), false);
+  } finally {
+    await cleanUp(root);
   }
 });
 
