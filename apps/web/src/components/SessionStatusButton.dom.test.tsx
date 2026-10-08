@@ -115,6 +115,42 @@ function rowButton(label: string): HTMLButtonElement {
   return match;
 }
 
+test("status title measurement reuses its observer across unrelated re-renders", async () => {
+  const previousObserver = (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver;
+  let observerCreations = 0;
+  class TrackingResizeObserver {
+    constructor(_callback: ResizeObserverCallback) { observerCreations += 1; }
+    observe() {}
+    disconnect() {}
+    unobserve() {}
+  }
+  Object.defineProperty(globalThis, "ResizeObserver", {
+    configurable: true,
+    writable: true,
+    value: TrackingResizeObserver,
+  });
+  const { root, rerender } = await renderHeader({ status: "running" });
+  try {
+    const initial = observerCreations;
+    assert.ok(initial > 0, "the initial title measurement installs a resize observer");
+    for (let i = 0; i < 3; i++) {
+      await rerender({ status: "running" });
+    }
+    assert.equal(observerCreations, initial, "unrelated renders must not reconstruct the observer");
+  } finally {
+    await cleanUp(root);
+    if (previousObserver === undefined) {
+      Reflect.deleteProperty(globalThis, "ResizeObserver");
+    } else {
+      Object.defineProperty(globalThis, "ResizeObserver", {
+        configurable: true,
+        writable: true,
+        value: previousObserver,
+      });
+    }
+  }
+});
+
 test("an approval and an answer request show the breakdown's first kind with +1", async () => {
   const pendingApproval = { ...question, additionalRequests: [approval] };
   const { root } = await renderHeader({ status: "input_required", pendingApproval });

@@ -168,7 +168,7 @@ export function SessionStatusButton({
       cancelled = true;
       observer?.disconnect();
     };
-  });
+  }, [compact, tooltip, popover.triggerRef, titleRef]);
 
   // A popover with nothing to act on holds focus itself, so Escape and Tab still work from it.
   useLayoutEffect(() => {
