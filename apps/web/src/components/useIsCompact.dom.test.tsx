@@ -58,3 +58,49 @@ test("useIsCompact() is true from 761px through 1099px and false at 760px and 11
     container.remove();
   }
 });
+
+
+test("unrelated renders reuse a single media query and change listener", async () => {
+  const originalMatchMedia = domWindow.matchMedia.bind(domWindow);
+  let matches = 0;
+  let added = 0;
+  let removed = 0;
+  const windowWithMatchMedia = domWindow as unknown as { matchMedia: typeof window.matchMedia };
+  windowWithMatchMedia.matchMedia = (query: string) => {
+    if (query !== COMPACT_QUERY) return originalMatchMedia(query);
+    matches += 1;
+    const mq = originalMatchMedia(query);
+    const add = mq.addEventListener.bind(mq);
+    const remove = mq.removeEventListener.bind(mq);
+    mq.addEventListener = ((...args: Parameters<typeof mq.addEventListener>) => {
+      if (args[0] === "change") added += 1;
+      return add(...args);
+    }) as typeof mq.addEventListener;
+    mq.removeEventListener = ((...args: Parameters<typeof mq.removeEventListener>) => {
+      if (args[0] === "change") removed += 1;
+      return remove(...args);
+    }) as typeof mq.removeEventListener;
+    return mq;
+  };
+
+  const container = domWindow.document.createElement("div") as unknown as HTMLDivElement;
+  domWindow.document.body.append(container as never);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(<Probe />));
+    assert.equal(matches, 1, "matchMedia is called once per mounted query");
+    assert.equal(added, 1);
+    for (let i = 0; i < 5; i++) await act(async () => root.render(<Probe />));
+    assert.equal(matches, 1, "unrelated renders do not recreate the MediaQueryList");
+    assert.equal(added, 1, "unrelated renders do not re-subscribe");
+    assert.equal(removed, 0);
+    await act(async () => domWindow.happyDOM.setWindowSize({ width: 950, height: 900 }));
+    assert.equal(container.textContent, "compact", "resize notifications still update the hook");
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    windowWithMatchMedia.matchMedia = originalMatchMedia;
+    await act(async () => domWindow.happyDOM.setWindowSize({ width: 1440, height: 900 }));
+  }
+  assert.equal(removed, 1, "the listener is removed on unmount");
+});

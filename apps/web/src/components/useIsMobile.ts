@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { TOUCH_PHONE_MEDIA } from "../mobile-viewport.js";
 
 /**
@@ -40,18 +40,27 @@ const SHORT_QUERY =`(max-height: ${SHORT_VIEWPORT_PX}px)`;
  * the snapshot is a boolean, so useSyncExternalStore ignores same-value notifications).
  * `resize` is subscribed as well: emulated/automated viewports can deliver the resize before
  * the MediaQueryList change event, and the flag must track the layout the CSS already shows. */
-function useMediaQuery(query: string): boolean {
+function useMediaQuery(query: string, includeResize = true): boolean {
+  // Both the MediaQueryList and the subscription callback must survive
+  // unrelated renders, otherwise useSyncExternalStore tears listeners down
+  // and re-attaches them on every update.
+  const mq = useMemo(
+    () => (typeof window === "undefined" ? null : window.matchMedia(query)),
+    [query],
+  );
+  const subscribe = useCallback((onChange: () => void) => {
+    if (!mq) return () => {};
+    mq.addEventListener("change", onChange);
+    if (includeResize) window.addEventListener("resize", onChange);
+    return () => {
+      mq.removeEventListener("change", onChange);
+      if (includeResize) window.removeEventListener("resize", onChange);
+    };
+  }, [mq, includeResize]);
+  const getSnapshot = useCallback(() => mq?.matches ?? false, [mq]);
   return useSyncExternalStore(
-    (onChange) => {
-      const mq = window.matchMedia(query);
-      mq.addEventListener("change", onChange);
-      window.addEventListener("resize", onChange);
-      return () => {
-        mq.removeEventListener("change", onChange);
-        window.removeEventListener("resize", onChange);
-      };
-    },
-    () => window.matchMedia(query).matches,
+    subscribe,
+    getSnapshot,
     // A server render has no viewport; it renders the desktop layout.
     () => false,
   );
@@ -87,12 +96,5 @@ export function useIsShortViewport(): boolean {
  * Distinct from useIsMobile: a narrow desktop window is mobile-wide but has a hardware keyboard,
  * so copy and behavior keyed on the SOFTWARE keyboard must not follow width alone. */
 export function useIsTouchPhone(): boolean {
-  return useSyncExternalStore(
-    (onChange) => {
-      const mq = window.matchMedia(TOUCH_PHONE_MEDIA);
-      mq.addEventListener("change", onChange);
-      return () => mq.removeEventListener("change", onChange);
-    },
-    () => window.matchMedia(TOUCH_PHONE_MEDIA).matches,
-  );
+  return useMediaQuery(TOUCH_PHONE_MEDIA, false);
 }
